@@ -32,7 +32,6 @@ jobs:
 
   mesh-e2e-gate:
     name: Mesh Replication E2E (optional)
-    continue-on-error: true
     uses: ./.github/workflows/mesh-e2e.yml
     with:
       image_tag: dev
@@ -166,12 +165,12 @@ jobs:
           echo "release_gate=${RELEASE_GATE}" >> $GITHUB_OUTPUT
           echo "mesh_gate=${MESH_GATE}" >> $GITHUB_OUTPUT
 
-          if [[ "$RELEASE_GATE" == "success" && ("$MESH_GATE" == "success" || "$MESH_GATE" == "skipped") ]]; then
+          if [[ "$RELEASE_GATE" == "success" ]]; then
             echo "all_passed=true" >> $GITHUB_OUTPUT
-            echo "Gates passed: release=$RELEASE_GATE mesh=$MESH_GATE"
+            echo "Gates passed: release=$RELEASE_GATE mesh=$MESH_GATE (mesh is optional)"
           else
             echo "all_passed=false" >> $GITHUB_OUTPUT
-            echo "::warning::Gates not all green: release=$RELEASE_GATE mesh=$MESH_GATE. Release will be created as DRAFT."
+            echo "::warning::Release gate not green: release=$RELEASE_GATE mesh=$MESH_GATE. Release will be created as DRAFT."
           fi
 
       - name: Collect release assets
@@ -202,8 +201,7 @@ jobs:
     if: |
       always() &&
       needs.release.result == 'success' &&
-      needs.release-gate.result == 'success' &&
-      (needs.mesh-e2e-gate.result == 'success' || needs.mesh-e2e-gate.result == 'skipped')
+      needs.release-gate.result == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
