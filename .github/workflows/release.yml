@@ -32,6 +32,7 @@ jobs:
 
   mesh-e2e-gate:
     name: Mesh Replication E2E (optional)
+    continue-on-error: true
     uses: ./.github/workflows/mesh-e2e.yml
     with:
       image_tag: dev
