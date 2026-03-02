@@ -57,7 +57,8 @@ jobs:
 
             echo "Waiting for $app to sync..."
             # Wait for the sync to complete (check .status.sync.status)
-            for i in $(seq 1 60); do
+            # Allow up to 10 minutes: first deploy includes DB init + image pulls
+            for i in $(seq 1 120); do
               SYNC_STATUS=$(kubectl -n argocd get application "$app" \
                 -o jsonpath='{.status.sync.status}' 2>/dev/null)
               HEALTH_STATUS=$(kubectl -n argocd get application "$app" \
@@ -66,7 +67,7 @@ jobs:
                 echo "$app is Synced and Healthy"
                 break
               fi
-              echo "  $app: sync=$SYNC_STATUS health=$HEALTH_STATUS (attempt $i/60)"
+              echo "  $app: sync=$SYNC_STATUS health=$HEALTH_STATUS (attempt $i/120)"
               sleep 5
             done
 
@@ -79,19 +80,26 @@ jobs:
         run: |
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
             echo "Waiting for $app to be healthy..."
-            for i in $(seq 1 60); do
+            for i in $(seq 1 120); do
               HEALTH=$(kubectl -n argocd get application "$app" \
                 -o jsonpath='{.status.health.status}' 2>/dev/null)
               if [ "$HEALTH" = "Healthy" ]; then
                 echo "$app is Healthy"
                 break
               fi
-              echo "  $app: health=$HEALTH (attempt $i/60)"
+              echo "  $app: health=$HEALTH (attempt $i/120)"
               sleep 5
             done
 
             if [ "$HEALTH" != "Healthy" ]; then
-              echo "::error::$app is not healthy after 5 minutes (health=$HEALTH)"
+              echo "::error::$app is not healthy after 10 minutes (health=$HEALTH)"
+              # Dump diagnostics before failing
+              echo "--- Pod status for $app ---"
+              NS=$(kubectl -n argocd get application "$app" -o jsonpath='{.spec.destination.namespace}' 2>/dev/null || true)
+              if [ -n "$NS" ]; then
+                kubectl get pods -n "$NS" 2>/dev/null || true
+                kubectl describe pods -n "$NS" --field-selector=status.phase!=Running 2>/dev/null | head -50 || true
+              fi
               exit 1
             fi
           done
