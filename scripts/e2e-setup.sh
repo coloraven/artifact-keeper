@@ -41,7 +41,8 @@ for format in \
   "test-helm:Test Helm:helm" \
   "test-conda:Test Conda:conda" \
   "test-docker:Test Docker:docker" \
-  "test-protobuf:Test Protobuf:protobuf"
+  "test-protobuf:Test Protobuf:protobuf" \
+  "test-hex:Test Hex:hex"
 do
   KEY=$(echo "$format" | cut -d: -f1)
   NAME=$(echo "$format" | cut -d: -f2)
@@ -58,7 +59,8 @@ echo "==> Creating remote (proxy) repositories..."
 for remote in \
   "npm-proxy:NPM Proxy:npm:https://registry.npmjs.org" \
   "pypi-proxy:PyPI Proxy:pypi:https://pypi.org" \
-  "maven-proxy:Maven Proxy:maven:https://repo1.maven.org/maven2"
+  "maven-proxy:Maven Proxy:maven:https://repo1.maven.org/maven2" \
+  "hex-proxy:Hex Proxy:hex:https://repo.hex.pm"
 do
   KEY=$(echo "$remote" | cut -d: -f1)
   NAME=$(echo "$remote" | cut -d: -f2)
@@ -75,7 +77,8 @@ done
 echo "==> Creating local repos for virtual members..."
 for local in \
   "npm-local-e2e:NPM Local E2E:npm" \
-  "pypi-local-e2e:PyPI Local E2E:pypi"
+  "pypi-local-e2e:PyPI Local E2E:pypi" \
+  "hex-local-e2e:Hex Local E2E:hex"
 do
   KEY=$(echo "$local" | cut -d: -f1)
   NAME=$(echo "$local" | cut -d: -f2)
@@ -91,7 +94,8 @@ done
 echo "==> Creating virtual repositories..."
 for virtual in \
   "npm-virtual:NPM Virtual:npm" \
-  "pypi-virtual:PyPI Virtual:pypi"
+  "pypi-virtual:PyPI Virtual:pypi" \
+  "hex-virtual:Hex Virtual:hex"
 do
   KEY=$(echo "$virtual" | cut -d: -f1)
   NAME=$(echo "$virtual" | cut -d: -f2)
@@ -109,7 +113,9 @@ for member in \
   "npm-virtual:npm-local-e2e:1" \
   "npm-virtual:npm-proxy:2" \
   "pypi-virtual:pypi-local-e2e:1" \
-  "pypi-virtual:pypi-proxy:2"
+  "pypi-virtual:pypi-proxy:2" \
+  "hex-virtual:hex-local-e2e:1" \
+  "hex-virtual:hex-proxy:2"
 do
   VKEY=$(echo "$member" | cut -d: -f1)
   MKEY=$(echo "$member" | cut -d: -f2)

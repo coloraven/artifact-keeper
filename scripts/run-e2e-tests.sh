@@ -16,7 +16,7 @@
 # Profiles:
 #   smoke  - Quick tests: Playwright E2E + PyPI, NPM, Cargo native clients (default)
 #   all    - All tests: Playwright E2E + all native clients
-#   pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker - Individual native client tests
+#   pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, hex - Individual native client tests
 #
 
 set -e
@@ -76,7 +76,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --profile PROFILE  Test profile to run (smoke, all, proxy, redteam, storage-gc, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker)"
+            echo "  --profile PROFILE  Test profile to run (smoke, all, proxy, redteam, storage-gc, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, hex)"
             echo "  --build            Force rebuild all containers"
             echo "  --clean            Clean up containers and volumes after tests"
             echo "  --stress           Run stress tests after E2E tests"
@@ -177,7 +177,7 @@ PLAYWRIGHT_EXIT=$?
 
 # Run native client tests if profile is smoke or all
 NATIVE_EXIT=0
-if [ "$PROFILE" = "smoke" ] || [ "$PROFILE" = "all" ] || [ "$PROFILE" = "proxy" ] || [[ "$PROFILE" =~ ^(pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker)$ ]]; then
+if [ "$PROFILE" = "smoke" ] || [ "$PROFILE" = "all" ] || [ "$PROFILE" = "proxy" ] || [[ "$PROFILE" =~ ^(pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|hex)$ ]]; then
     echo ""
     echo -e "${BLUE}Running native client tests (profile: $PROFILE)...${NC}"
     docker compose -f docker-compose.test.yml --profile "$PROFILE" up \

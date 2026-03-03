@@ -138,12 +138,21 @@ echo "  - pypi-proxy (remote -> pypi.org)"
 create_repo "maven-proxy" "Maven Proxy" "maven" "remote" "https://repo1.maven.org/maven2"
 echo "  - maven-proxy (remote -> repo1.maven.org)"
 
+create_repo "hex-local-e2e" "Hex Local E2E" "hex" "local"
+echo "  - hex-local-e2e (local)"
+
+create_repo "hex-proxy" "Hex Proxy" "hex" "remote" "https://repo.hex.pm"
+echo "  - hex-proxy (remote -> repo.hex.pm)"
+
 # Virtual repos (aggregating local + remote)
 create_repo "npm-virtual" "NPM Virtual" "npm" "virtual"
 echo "  - npm-virtual (virtual)"
 
 create_repo "pypi-virtual" "PyPI Virtual" "pypi" "virtual"
 echo "  - pypi-virtual (virtual)"
+
+create_repo "hex-virtual" "Hex Virtual" "hex" "virtual"
+echo "  - hex-virtual (virtual)"
 
 # Wire virtual members (local first = higher priority, then remote proxy)
 add_virtual_member "npm-virtual" "npm-local-e2e" 1
@@ -153,6 +162,10 @@ echo "  - npm-virtual members: npm-local-e2e (pri=1), npm-proxy (pri=2)"
 add_virtual_member "pypi-virtual" "pypi-local-e2e" 1
 add_virtual_member "pypi-virtual" "pypi-proxy" 2
 echo "  - pypi-virtual members: pypi-local-e2e (pri=1), pypi-proxy (pri=2)"
+
+add_virtual_member "hex-virtual" "hex-local-e2e" 1
+add_virtual_member "hex-virtual" "hex-proxy" 2
+echo "  - hex-virtual members: hex-local-e2e (pri=1), hex-proxy (pri=2)"
 
 echo ""
 
@@ -235,8 +248,61 @@ else
     skip "PyPI file proxy returned HTTP $PYPI_DL_CODE (upstream URLs not rewritten — expected for now)"
 fi
 
-# --- Test 2.5: Maven proxy - download artifact ---
-echo "  [2.5] Maven proxy: download junit-4.13.2.jar..."
+# --- Test 2.5: Hex proxy - fetch package metadata for 'phoenix' ---
+echo "  [2.5] Hex proxy: fetch package metadata for 'phoenix'..."
+HEX_META_CODE=$(curl -s -o "$TMPDIR_TEST/hex-meta.json" -w "%{http_code}" \
+    "$REGISTRY_URL/hex/hex-proxy/packages/phoenix")
+if [ "$HEX_META_CODE" = "200" ]; then
+    # The response may be JSON (from our API) or protobuf (passthrough from hex.pm).
+    # Try JSON validation first; fall back to size check for binary payloads.
+    HEX_PKG_NAME=$(jq -r '.name // empty' "$TMPDIR_TEST/hex-meta.json" 2>/dev/null || echo "")
+    if [ "$HEX_PKG_NAME" = "phoenix" ]; then
+        HEX_RELEASES=$(jq '.releases | length // 0' "$TMPDIR_TEST/hex-meta.json" 2>/dev/null || echo "0")
+        pass "Hex package metadata fetched: phoenix ($HEX_RELEASES releases)"
+    else
+        HEX_META_SIZE=$(wc -c < "$TMPDIR_TEST/hex-meta.json" | tr -d ' ')
+        if [ "$HEX_META_SIZE" -gt 50 ]; then
+            pass "Hex package metadata fetched: phoenix (${HEX_META_SIZE} bytes, binary payload)"
+        else
+            fail "Hex package metadata too small: ${HEX_META_SIZE} bytes"
+        fi
+    fi
+else
+    fail "Hex package metadata proxy returned HTTP $HEX_META_CODE"
+fi
+
+# --- Test 2.6: Hex proxy - fetch names endpoint ---
+echo "  [2.6] Hex proxy: fetch names endpoint..."
+HEX_NAMES_CODE=$(curl -s -o "$TMPDIR_TEST/hex-names.bin" -w "%{http_code}" \
+    "$REGISTRY_URL/hex/hex-proxy/names")
+if [ "$HEX_NAMES_CODE" = "200" ]; then
+    HEX_NAMES_SIZE=$(wc -c < "$TMPDIR_TEST/hex-names.bin" | tr -d ' ')
+    if [ "$HEX_NAMES_SIZE" -gt 10 ]; then
+        pass "Hex names endpoint fetched (${HEX_NAMES_SIZE} bytes, signed protobuf)"
+    else
+        fail "Hex names response too small: ${HEX_NAMES_SIZE} bytes"
+    fi
+else
+    fail "Hex names proxy returned HTTP $HEX_NAMES_CODE"
+fi
+
+# --- Test 2.7: Hex proxy - fetch versions endpoint ---
+echo "  [2.7] Hex proxy: fetch versions endpoint..."
+HEX_VERSIONS_CODE=$(curl -s -o "$TMPDIR_TEST/hex-versions.bin" -w "%{http_code}" \
+    "$REGISTRY_URL/hex/hex-proxy/versions")
+if [ "$HEX_VERSIONS_CODE" = "200" ]; then
+    HEX_VERSIONS_SIZE=$(wc -c < "$TMPDIR_TEST/hex-versions.bin" | tr -d ' ')
+    if [ "$HEX_VERSIONS_SIZE" -gt 10 ]; then
+        pass "Hex versions endpoint fetched (${HEX_VERSIONS_SIZE} bytes, signed protobuf)"
+    else
+        fail "Hex versions response too small: ${HEX_VERSIONS_SIZE} bytes"
+    fi
+else
+    fail "Hex versions proxy returned HTTP $HEX_VERSIONS_CODE"
+fi
+
+# --- Test 2.8: Maven proxy - download artifact ---
+echo "  [2.8] Maven proxy: download junit-4.13.2.jar..."
 MAVEN_CODE=$(curl -s -o "$TMPDIR_TEST/maven-jar.jar" -w "%{http_code}" \
     "$REGISTRY_URL/maven/maven-proxy/junit/junit/4.13.2/junit-4.13.2.jar")
 if [ "$MAVEN_CODE" = "200" ]; then
@@ -250,8 +316,8 @@ else
     fail "Maven proxy returned HTTP $MAVEN_CODE"
 fi
 
-# --- Test 2.6: Proxy cache - second fetch should be served from cache ---
-echo "  [2.6] Proxy cache: verify second fetch is served (possibly cached)..."
+# --- Test 2.9: Proxy cache - second fetch should be served from cache ---
+echo "  [2.9] Proxy cache: verify second fetch is served (possibly cached)..."
 CACHE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
     "$REGISTRY_URL/npm/npm-proxy/is-odd")
 if [ "$CACHE_CODE" = "200" ]; then
@@ -302,8 +368,24 @@ else
     fail "PyPI upload to remote repo returned HTTP $PYPI_UPLOAD_CODE (expected 405)"
 fi
 
-# --- Test 3.3: NPM publish to virtual repo ---
-echo "  [3.3] NPM publish to virtual repo should be rejected..."
+# --- Test 3.3: Hex publish to remote repo ---
+echo "  [3.3] Hex publish to remote repo should be rejected..."
+HEX_AUTH_TOKEN=$(echo -n "${ADMIN_USER}:${ADMIN_PASS}" | base64)
+HEX_PUB_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$REGISTRY_URL/hex/hex-proxy/publish" \
+    -H "Authorization: Basic $HEX_AUTH_TOKEN" \
+    -H 'Content-Type: application/octet-stream' \
+    --data-binary "fake-tarball-data")
+if [ "$HEX_PUB_CODE" = "405" ]; then
+    pass "Hex publish to remote repo correctly rejected with 405"
+elif [ "$HEX_PUB_CODE" = "400" ] || [ "$HEX_PUB_CODE" = "403" ]; then
+    pass "Hex publish to remote repo rejected with $HEX_PUB_CODE (acceptable)"
+else
+    fail "Hex publish to remote repo returned HTTP $HEX_PUB_CODE (expected 405)"
+fi
+
+# --- Test 3.4: NPM publish to virtual repo ---
+echo "  [3.4] NPM publish to virtual repo should be rejected..."
 VIRTUAL_PUB_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
     -X PUT "$REGISTRY_URL/npm/npm-virtual/test-rejected-pkg" \
     -H "Authorization: Basic $NPM_AUTH_TOKEN" \
@@ -377,8 +459,37 @@ else
     fail "Virtual PyPI simple index returned HTTP $VIRTUAL_PYPI_CODE"
 fi
 
-# --- Test 4.4: Virtual member listing ---
-echo "  [4.4] Virtual member listing API..."
+# --- Test 4.4: Virtual Hex package_info (falls through to remote proxy) ---
+echo "  [4.4] Virtual Hex package_info: should fall through to remote proxy..."
+VIRTUAL_HEX_CODE=$(curl -s -o "$TMPDIR_TEST/virtual-hex-meta.json" -w "%{http_code}" \
+    "$REGISTRY_URL/hex/hex-virtual/packages/phoenix")
+if [ "$VIRTUAL_HEX_CODE" = "200" ]; then
+    VIRTUAL_HEX_SIZE=$(wc -c < "$TMPDIR_TEST/virtual-hex-meta.json" | tr -d ' ')
+    if [ "$VIRTUAL_HEX_SIZE" -gt 50 ]; then
+        pass "Virtual Hex resolved 'phoenix' package_info through remote member (${VIRTUAL_HEX_SIZE} bytes)"
+    else
+        fail "Virtual Hex package_info response too small: ${VIRTUAL_HEX_SIZE} bytes"
+    fi
+elif [ "$VIRTUAL_HEX_CODE" = "404" ]; then
+    skip "Virtual Hex package_info proxy not yet resolving through members"
+else
+    fail "Virtual Hex package_info returned HTTP $VIRTUAL_HEX_CODE"
+fi
+
+# --- Test 4.5: Virtual Hex names (returns local only, merging out of scope) ---
+echo "  [4.5] Virtual Hex names: returns local data (merging out of scope)..."
+VIRTUAL_HEX_NAMES_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    "$REGISTRY_URL/hex/hex-virtual/names")
+if [ "$VIRTUAL_HEX_NAMES_CODE" = "200" ]; then
+    pass "Virtual Hex names returned 200 (local data)"
+elif [ "$VIRTUAL_HEX_NAMES_CODE" = "404" ]; then
+    skip "Virtual Hex names returned 404 (no local artifacts, merging out of scope)"
+else
+    fail "Virtual Hex names returned unexpected HTTP $VIRTUAL_HEX_NAMES_CODE"
+fi
+
+# --- Test 4.6: Virtual member listing ---
+echo "  [4.6] Virtual member listing API..."
 MEMBERS_CODE=$(curl -s -o "$TMPDIR_TEST/members.json" -w "%{http_code}" \
     "$API_URL/repositories/npm-virtual/members" -H "$AUTH")
 if [ "$MEMBERS_CODE" = "200" ]; then

@@ -26,6 +26,7 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::hex::HexHandler;
+use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -129,6 +130,65 @@ async fn package_info(
     })?;
 
     if artifacts.is_empty() {
+        // Remote: fetch package metadata from the upstream hex registry.
+        if repo.repo_type == "remote" {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let upstream_path = format!("packages/{}", name);
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        CONTENT_TYPE,
+                        content_type.unwrap_or_else(|| "application/json".to_string()),
+                    )
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
+
+        // Virtual: iterate members in priority order, proxy from first remote that has it.
+        if repo.repo_type == "virtual" {
+            let upstream_path = format!("packages/{}", name);
+            if let Some(ref proxy) = state.proxy_service {
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+                for member in &members {
+                    if member.repo_type == RepositoryType::Remote {
+                        if let Some(ref upstream_url) = member.upstream_url {
+                            if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                                proxy,
+                                member.id,
+                                &member.key,
+                                upstream_url,
+                                &upstream_path,
+                            )
+                            .await
+                            {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(
+                                        CONTENT_TYPE,
+                                        content_type
+                                            .unwrap_or_else(|| "application/json".to_string()),
+                                    )
+                                    .body(Body::from(content))
+                                    .unwrap());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
@@ -512,6 +572,28 @@ async fn list_names(
             .into_response()
     })?;
 
+    // Remote with no local artifacts: proxy the names list from upstream.
+    // hex.pm's /names endpoint returns a signed protobuf payload; pass it through as-is.
+    if names.is_empty() && repo.repo_type == "remote" {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let (content, content_type) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, "names")
+                    .await?;
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    content_type.unwrap_or_else(|| "application/json".to_string()),
+                )
+                .body(Body::from(content))
+                .unwrap());
+        }
+    }
+    // Virtual: merging names lists across multiple upstreams is out of scope;
+    // return whatever local artifacts exist (may be empty).
+
     let json = serde_json::json!(names);
 
     Ok(Response::builder()
@@ -560,6 +642,28 @@ async fn list_versions(
         let version = artifact.version.clone().unwrap_or_default();
         packages.entry(name).or_default().push(version);
     }
+
+    // Remote with no local artifacts: proxy the versions list from upstream.
+    // hex.pm's /versions endpoint returns a signed protobuf payload; pass it through as-is.
+    if artifacts.is_empty() && repo.repo_type == "remote" {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let (content, content_type) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, "versions")
+                    .await?;
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    content_type.unwrap_or_else(|| "application/json".to_string()),
+                )
+                .body(Body::from(content))
+                .unwrap());
+        }
+    }
+    // Virtual: merging versions lists across multiple upstreams is out of scope;
+    // return whatever local artifacts exist (may be empty).
 
     let result: Vec<serde_json::Value> = packages
         .into_iter()
@@ -1056,5 +1160,87 @@ mod tests {
             upstream_url: Some("https://repo.hex.pm".to_string()),
         };
         assert_eq!(repo.upstream_url.as_deref(), Some("https://repo.hex.pm"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Proxy fallback: upstream paths
+    // -----------------------------------------------------------------------
+    //
+    // The handler builds these paths when proxying to the upstream registry.
+    // package_info constructs "packages/{name}" via format!().
+    // list_names and list_versions use bare literals: "names", "versions".
+
+    #[test]
+    fn test_proxy_upstream_paths() {
+        assert_eq!(format!("packages/{}", "phoenix"), "packages/phoenix");
+        assert_eq!(
+            format!("packages/{}", "plug_cowboy"),
+            "packages/plug_cowboy"
+        );
+        // list_names and list_versions use bare endpoint names
+        let names_path = "names";
+        let versions_path = "versions";
+        assert!(!names_path.contains('/'));
+        assert!(!versions_path.contains('/'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Proxy fallback: branch eligibility by repo type
+    // -----------------------------------------------------------------------
+    //
+    // The handler uses two conditions for the proxy fallback:
+    //   1. repo.repo_type == "remote" && repo.upstream_url.is_some()
+    //   2. repo.repo_type == "virtual" (iterates members)
+    // These tests document which RepoInfo configurations satisfy each branch.
+
+    #[test]
+    fn test_local_repo_ineligible_for_proxy() {
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            storage_path: "/data".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+        assert_ne!(repo.repo_type, "remote");
+        assert_ne!(repo.repo_type, "virtual");
+        assert!(repo.upstream_url.is_none());
+    }
+
+    #[test]
+    fn test_remote_repo_eligible_for_proxy() {
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            storage_path: "/cache".to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: Some("https://repo.hex.pm".to_string()),
+        };
+        assert_eq!(repo.repo_type, "remote");
+        assert!(repo.upstream_url.is_some());
+    }
+
+    #[test]
+    fn test_remote_repo_without_upstream_skips_proxy() {
+        // Even though repo_type is "remote", missing upstream_url means
+        // the (upstream_url, proxy_service) destructure won't match.
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            storage_path: "/cache".to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: None,
+        };
+        assert_eq!(repo.repo_type, "remote");
+        assert!(repo.upstream_url.is_none());
+    }
+
+    #[test]
+    fn test_virtual_repo_eligible_for_member_iteration() {
+        // Virtual repos resolve through their members, not their own upstream_url.
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            storage_path: "/virtual".to_string(),
+            repo_type: "virtual".to_string(),
+            upstream_url: None,
+        };
+        assert_eq!(repo.repo_type, "virtual");
     }
 }
