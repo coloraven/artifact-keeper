@@ -161,6 +161,39 @@ impl StorageBackend for FilesystemBackend {
     }
 }
 
+/// Generate a StorageBackend wrapper that delegates to an inner backend.
+///
+/// Both the `crate::storage::StorageBackend` trait (put/get/exists/delete) and
+/// the extended methods (list/copy/size) are forwarded to the inner type.
+macro_rules! impl_storage_wrapper {
+    ($wrapper:ident, $inner_ty:ty) => {
+        #[async_trait]
+        impl StorageBackend for $wrapper {
+            async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+                crate::storage::StorageBackend::put(&self.inner, key, content).await
+            }
+            async fn get(&self, key: &str) -> Result<Bytes> {
+                crate::storage::StorageBackend::get(&self.inner, key).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                crate::storage::StorageBackend::exists(&self.inner, key).await
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                crate::storage::StorageBackend::delete(&self.inner, key).await
+            }
+            async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+                self.inner.list(prefix).await
+            }
+            async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+                self.inner.copy(source, dest).await
+            }
+            async fn size(&self, key: &str) -> Result<u64> {
+                self.inner.size(key).await
+            }
+        }
+    };
+}
+
 /// S3 storage backend (wrapper for integration with StorageService)
 pub struct S3BackendWrapper {
     inner: crate::storage::s3::S3Backend,
@@ -182,36 +215,26 @@ impl S3BackendWrapper {
     }
 }
 
-#[async_trait]
-impl StorageBackend for S3BackendWrapper {
-    async fn put(&self, key: &str, content: Bytes) -> Result<()> {
-        crate::storage::StorageBackend::put(&self.inner, key, content).await
-    }
+impl_storage_wrapper!(S3BackendWrapper, crate::storage::s3::S3Backend);
 
-    async fn get(&self, key: &str) -> Result<Bytes> {
-        crate::storage::StorageBackend::get(&self.inner, key).await
-    }
+/// GCS storage backend (wrapper for integration with StorageService).
+///
+/// Thin wrapper that delegates the `StorageBackend` trait to the inner
+/// `crate::storage` trait and the extra `list`/`copy`/`size` methods to
+/// `GcsBackend`'s inherent methods.
+pub struct GcsBackendWrapper {
+    inner: crate::storage::gcs::GcsBackend,
+}
 
-    async fn exists(&self, key: &str) -> Result<bool> {
-        crate::storage::StorageBackend::exists(&self.inner, key).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<()> {
-        crate::storage::StorageBackend::delete(&self.inner, key).await
-    }
-
-    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
-        self.inner.list(prefix).await
-    }
-
-    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
-        self.inner.copy(source, dest).await
-    }
-
-    async fn size(&self, key: &str) -> Result<u64> {
-        self.inner.size(key).await
+impl GcsBackendWrapper {
+    pub async fn from_config(_config: &Config) -> crate::error::Result<Self> {
+        let gcs_config = crate::storage::gcs::GcsConfig::from_env()?;
+        let inner = crate::storage::gcs::GcsBackend::new(gcs_config).await?;
+        Ok(Self { inner })
     }
 }
+
+impl_storage_wrapper!(GcsBackendWrapper, crate::storage::gcs::GcsBackend);
 
 /// Storage service facade
 pub struct StorageService {
@@ -230,6 +253,10 @@ impl StorageService {
             "s3" => {
                 let s3_backend = S3BackendWrapper::from_config(config).await?;
                 Arc::new(s3_backend)
+            }
+            "gcs" => {
+                let wrapper = GcsBackendWrapper::from_config(config).await?;
+                Arc::new(wrapper)
             }
             other => {
                 return Err(AppError::Config(format!(
@@ -688,5 +715,109 @@ mod tests {
         // And we can read it back via the same key
         let content = backend.get("../../escape.txt").await.unwrap();
         assert_eq!(content, Bytes::from("should stay inside"));
+    }
+
+    // -----------------------------------------------------------------------
+    // StorageService::from_config() backend selection
+    // -----------------------------------------------------------------------
+
+    // Serialize env-var tests to avoid cross-test interference.
+    // Uses tokio::sync::Mutex so the guard can be held across .await points
+    // without triggering clippy::await_holding_lock.
+    static GCS_ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn gcs_env_lock() -> &'static tokio::sync::Mutex<()> {
+        GCS_ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    fn minimal_config(storage_backend: &str) -> crate::config::Config {
+        crate::config::Config {
+            database_url: "postgresql://test/test".to_string(),
+            bind_address: "0.0.0.0:8080".to_string(),
+            log_level: "info".to_string(),
+            storage_backend: storage_backend.to_string(),
+            storage_path: "/tmp/test-storage".to_string(),
+            s3_bucket: None,
+            gcs_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "test-secret".to_string(),
+            jwt_expiration_secs: 86400,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".to_string(),
+            meilisearch_url: None,
+            meilisearch_api_key: None,
+            scan_workspace_path: "/scan-workspace".to_string(),
+            demo_mode: false,
+            peer_instance_name: "test".to_string(),
+            peer_public_endpoint: "http://localhost:8080".to_string(),
+            peer_api_key: "test-api-key".to_string(),
+            dependency_track_url: None,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "artifact-keeper".to_string(),
+            gc_schedule: "0 0 * * * *".to_string(),
+            lifecycle_check_interval_secs: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_from_config_rejects_unknown_backend() {
+        let config = minimal_config("bogus");
+        let result = StorageService::from_config(&config).await;
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("bogus"),
+            "Error should mention the unknown backend name, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gcs_backend_wrapper_from_config_fields() {
+        let _guard = gcs_env_lock().lock().await;
+        std::env::set_var("GCS_BUCKET", "wrapper-test-bucket");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("GCS_PROJECT_ID");
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
+
+        let config = minimal_config("gcs");
+        let result = GcsBackendWrapper::from_config(&config).await;
+        std::env::remove_var("GCS_BUCKET");
+
+        assert!(
+            result.is_ok(),
+            "GcsBackendWrapper should construct without error in ADC mode"
+        );
+        let wrapper = result.unwrap();
+        assert_eq!(wrapper.inner.bucket(), "wrapper-test-bucket");
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_from_config_gcs_arm_reached() {
+        let _guard = gcs_env_lock().lock().await;
+        std::env::set_var("GCS_BUCKET", "service-test-bucket");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("GCS_PROJECT_ID");
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
+
+        let config = minimal_config("gcs");
+        let result = StorageService::from_config(&config).await;
+        std::env::remove_var("GCS_BUCKET");
+
+        assert!(
+            result.is_ok(),
+            "StorageService::from_config should succeed with storage_backend=gcs"
+        );
     }
 }
