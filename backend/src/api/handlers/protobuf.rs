@@ -682,6 +682,7 @@ async fn save_label_index(
     let artifact_id = match existing_id {
         Some(id) => id,
         None => {
+            crate::api::handlers::cleanup_soft_deleted_artifact(db, repo_id, &label_path).await;
             // Create label index artifact
             let row = sqlx::query(
                 r#"INSERT INTO artifacts (
@@ -1127,6 +1128,8 @@ async fn upload(
         })?;
 
         let artifact_path = format!("modules/{}/commits/{}", module_name, commit_digest);
+
+        super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
         // Insert artifact record
         let row = sqlx::query(
