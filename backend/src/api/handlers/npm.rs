@@ -10,14 +10,13 @@
 //!   PUT  /npm/{repo_key}/{package}                    - Publish package
 //!   PUT  /npm/{repo_key}/{@scope}/{package}           - Publish scoped package
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::Extension;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
@@ -26,8 +25,8 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers;
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::services::auth_service::AuthService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -52,75 +51,7 @@ pub fn router() -> Router<SharedState> {
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
-// ---------------------------------------------------------------------------
-// Auth helpers
-// ---------------------------------------------------------------------------
-
-fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|s| {
-            let mut parts = s.splitn(2, ':');
-            let user = parts.next()?.to_string();
-            let pass = parts.next()?.to_string();
-            Some((user, pass))
-        })
-}
-
-/// Extract credentials from Bearer token (npm sends base64-encoded user:pass as token).
-fn extract_bearer_credentials(headers: &HeaderMap) -> Option<(String, String)> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or(v.strip_prefix("bearer ")))
-        .and_then(|token| {
-            base64::engine::general_purpose::STANDARD
-                .decode(token)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .and_then(|s| {
-                    let mut parts = s.splitn(2, ':');
-                    let user = parts.next()?.to_string();
-                    let pass = parts.next()?.to_string();
-                    Some((user, pass))
-                })
-        })
-}
-
-/// Authenticate via Basic auth or Bearer token, returning user_id on success.
-async fn authenticate(
-    db: &PgPool,
-    config: &crate::config::Config,
-    headers: &HeaderMap,
-) -> Result<uuid::Uuid, Response> {
-    let (username, password) = extract_basic_credentials(headers)
-        .or_else(|| extract_bearer_credentials(headers))
-        .ok_or_else(|| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Basic realm=\"npm\"")
-                .body(Body::from("Authentication required"))
-                .unwrap()
-        })?;
-
-    let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-    let (user, _tokens) = auth_service
-        .authenticate(&username, &password)
-        .await
-        .map_err(|_| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Basic realm=\"npm\"")
-                .body(Body::from("Invalid credentials"))
-                .unwrap()
-        })?;
-
-    Ok(user.id)
-}
+use crate::api::middleware::auth::require_auth_with_bearer_fallback;
 
 // ---------------------------------------------------------------------------
 // Repository resolution
@@ -593,21 +524,23 @@ async fn serve_tarball(
 
 async fn publish(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    publish_package(&state, &repo_key, &package, &headers, body).await
+    publish_package(&state, auth, &repo_key, &package, &headers, body).await
 }
 
 async fn publish_scoped(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, package)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     let full_name = format!("@{}/{}", scope, package);
-    publish_package(&state, &repo_key, &full_name, &headers, body).await
+    publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
 }
 
 /// Parsed and validated npm publish payload ready for storage.
@@ -867,12 +800,14 @@ async fn store_npm_version(
 /// Handle npm publish. The request body is JSON with versions and base64-encoded attachments.
 async fn publish_package(
     state: &SharedState,
+    auth: Option<AuthExtension>,
     repo_key: &str,
     package_name: &str,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = authenticate(&state.db, &state.config, headers).await?;
+    let user_id =
+        require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -957,7 +892,6 @@ fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_k
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)
@@ -1070,115 +1004,6 @@ mod tests {
         );
 
         version_obj
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_basic_credentials
-    // -----------------------------------------------------------------------
-
-    fn make_basic_header(user: &str, pass: &str) -> HeaderMap {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
-        );
-        headers
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_valid() {
-        let headers = make_basic_header("npm-user", "npm-pass");
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("npm-user".to_string(), "npm-pass".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_lowercase() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("basic {}", encoded)).unwrap(),
-        );
-        assert_eq!(
-            extract_basic_credentials(&headers),
-            Some(("user".to_string(), "pass".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_missing() {
-        assert!(extract_basic_credentials(&HeaderMap::new()).is_none());
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_bearer_ignored() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer some-token"),
-        );
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_bearer_credentials
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_bearer_credentials_valid() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("npmuser:npmpass");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", encoded)).unwrap(),
-        );
-        let result = extract_bearer_credentials(&headers);
-        assert_eq!(result, Some(("npmuser".to_string(), "npmpass".to_string())));
-    }
-
-    #[test]
-    fn test_extract_bearer_credentials_lowercase() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("bearer {}", encoded)).unwrap(),
-        );
-        let result = extract_bearer_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_extract_bearer_credentials_not_base64() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer not-valid-base64!!!!"),
-        );
-        // Invalid base64 should return None
-        assert!(extract_bearer_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_extract_bearer_credentials_missing() {
-        assert!(extract_bearer_credentials(&HeaderMap::new()).is_none());
-    }
-
-    #[test]
-    fn test_extract_bearer_credentials_no_colon() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("justtoken");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", encoded)).unwrap(),
-        );
-        assert!(extract_bearer_credentials(&headers).is_none());
     }
 
     // -----------------------------------------------------------------------

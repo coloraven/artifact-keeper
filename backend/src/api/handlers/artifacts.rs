@@ -6,14 +6,37 @@
 use axum::{
     extract::{Path, State},
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::Serialize;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+
+/// Deny access to private repo artifacts for unauthenticated users.
+async fn check_artifact_visibility(
+    auth: &Option<AuthExtension>,
+    artifact_id: Uuid,
+    db: &sqlx::PgPool,
+) -> Result<()> {
+    if auth.is_some() {
+        return Ok(());
+    }
+    let is_public: Option<bool> = sqlx::query_scalar(
+        "SELECT r.is_public FROM repositories r JOIN artifacts a ON a.repository_id = r.id WHERE a.id = $1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if is_public == Some(false) {
+        return Err(AppError::NotFound("Artifact not found".to_string()));
+    }
+    Ok(())
+}
 
 /// Create artifact routes
 pub fn router() -> Router<SharedState> {
@@ -73,6 +96,7 @@ pub struct ArtifactStatsResponse {
 )]
 pub async fn get_artifact(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactResponse>> {
     let artifact = sqlx::query!(
@@ -92,6 +116,8 @@ pub async fn get_artifact(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+
+    check_artifact_visibility(&auth, id, &state.db).await?;
 
     Ok(Json(ArtifactResponse {
         id: artifact.id,
@@ -126,6 +152,7 @@ pub async fn get_artifact(
 )]
 pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactMetadataResponse>> {
     let exists = sqlx::query_scalar!(
@@ -139,6 +166,8 @@ pub async fn get_artifact_metadata(
     if exists != Some(true) {
         return Err(AppError::NotFound("Artifact not found".to_string()));
     }
+
+    check_artifact_visibility(&auth, id, &state.db).await?;
 
     let metadata = sqlx::query!(
         r#"
@@ -177,6 +206,7 @@ pub async fn get_artifact_metadata(
 )]
 pub async fn get_artifact_stats(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactStatsResponse>> {
     let exists = sqlx::query_scalar!(
@@ -190,6 +220,8 @@ pub async fn get_artifact_stats(
     if exists != Some(true) {
         return Err(AppError::NotFound("Artifact not found".to_string()));
     }
+
+    check_artifact_visibility(&auth, id, &state.db).await?;
 
     let stats = sqlx::query!(
         r#"

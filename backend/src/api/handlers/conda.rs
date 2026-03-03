@@ -36,13 +36,14 @@ use axum::http::header::{
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::Extension;
 use axum::Router;
-use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers;
+use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::conda_native::CondaNativeHandler;
 use crate::services::auth_service::AuthService;
@@ -874,77 +875,6 @@ pub fn token_router() -> Router<SharedState> {
 }
 
 // ---------------------------------------------------------------------------
-// Auth helpers
-// ---------------------------------------------------------------------------
-
-fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|s| {
-            let mut parts = s.splitn(2, ':');
-            let user = parts.next()?.to_string();
-            let pass = parts.next()?.to_string();
-            Some((user, pass))
-        })
-}
-
-async fn authenticate(
-    db: &sqlx::PgPool,
-    config: &crate::config::Config,
-    headers: &HeaderMap,
-) -> Result<uuid::Uuid, Response> {
-    let (username, password) = extract_basic_credentials(headers).ok_or_else(|| {
-        Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("WWW-Authenticate", "Basic realm=\"conda\"")
-            .body(Body::from("Authentication required"))
-            .unwrap()
-    })?;
-
-    let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-    let (user, _tokens) = auth_service
-        .authenticate(&username, &password)
-        .await
-        .map_err(|_| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Basic realm=\"conda\"")
-                .body(Body::from("Invalid credentials"))
-                .unwrap()
-        })?;
-
-    Ok(user.id)
-}
-
-/// Authenticate using a URL path token.
-///
-/// The token is treated as an API token/access token. It's passed as the
-/// password in a pseudo-Basic auth flow (the username is "token").
-async fn authenticate_with_token(
-    db: &sqlx::PgPool,
-    config: &crate::config::Config,
-    token: &str,
-) -> Result<uuid::Uuid, Response> {
-    let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-    let (user, _tokens) = auth_service
-        .authenticate("token", token)
-        .await
-        .map_err(|_| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Basic realm=\"conda\"")
-                .body(Body::from("Invalid token"))
-                .unwrap()
-        })?;
-
-    Ok(user.id)
-}
-
-// ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
 
@@ -991,12 +921,11 @@ async fn resolve_conda_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInf
 /// Check that the caller has read access to a repository.
 ///
 /// Public repositories allow unauthenticated access. Private repositories
-/// require valid Basic credentials (username:password or __token__:jwt).
+/// require valid credentials via the middleware-provided auth extension.
 /// Returns 401 with `WWW-Authenticate: Basic` if access is denied.
 async fn check_read_access(
     db: &sqlx::PgPool,
-    config: &crate::config::Config,
-    headers: &HeaderMap,
+    auth: Option<AuthExtension>,
     repo: &RepoInfo,
 ) -> Result<(), Response> {
     // Use a runtime query (not the sqlx::query! macro) to avoid offline cache changes
@@ -1012,7 +941,31 @@ async fn check_read_access(
         return Ok(());
     }
     // Private repo: require authentication
-    authenticate(db, config, headers).await.map(|_| ())
+    require_auth_basic(auth, "conda").map(|_| ())
+}
+
+/// Authenticate using a URL path token.
+///
+/// The token is treated as an API token/access token. It's passed as the
+/// password in a pseudo-Basic auth flow (the username is "token").
+async fn authenticate_with_token(
+    db: &sqlx::PgPool,
+    config: &crate::config::Config,
+    token: &str,
+) -> Result<uuid::Uuid, Response> {
+    let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
+    let (user, _tokens) = auth_service
+        .authenticate("token", token)
+        .await
+        .map_err(|_| {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("WWW-Authenticate", "Basic realm=\"conda\"")
+                .body(Body::from("Invalid token"))
+                .unwrap()
+        })?;
+
+    Ok(user.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,12 +1097,13 @@ fn extract_upload_filename(headers: &HeaderMap) -> Result<String, Response> {
 
 async fn channeldata_json(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
 
-    check_read_access(&state.db, &state.config, &headers, &repo).await?;
+    check_read_access(&state.db, auth.clone(), &repo).await?;
 
     // Virtual repos: merge channeldata from all members
     if repo.repo_type == "virtual" {
@@ -1464,17 +1418,63 @@ async fn patch_instructions_json(
 }
 
 // ---------------------------------------------------------------------------
-// GET /conda/{repo_key}/{subdir}/repodata.json
+// Repodata encoding helpers
 // ---------------------------------------------------------------------------
 
-async fn repodata_json(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    Path((repo_key, subdir)): Path<(String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+enum RepodataEncoding {
+    Json,
+    Bz2,
+    Zst,
+}
 
-    check_read_access(&state.db, &state.config, &headers, &repo).await?;
+impl RepodataEncoding {
+    fn content_type(&self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::Bz2 => "application/x-bzip2",
+            Self::Zst => "application/zstd",
+        }
+    }
+
+    fn upstream_filename(&self) -> &'static str {
+        match self {
+            Self::Json => "repodata.json",
+            Self::Bz2 => "repodata.json.bz2",
+            Self::Zst => "repodata.json.zst",
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn encode(&self, repodata: &serde_json::Value) -> Result<Vec<u8>, Response> {
+        match self {
+            Self::Json => Ok(serde_json::to_string_pretty(repodata).unwrap().into_bytes()),
+            Self::Bz2 => {
+                let json_bytes = serde_json::to_vec(repodata).unwrap();
+                Ok(bzip2_compress(&json_bytes))
+            }
+            Self::Zst => {
+                let json_bytes = serde_json::to_vec(repodata).unwrap();
+                zstd_compress(&json_bytes).map_err(|e| {
+                    tracing::error!("zstd compression error for repodata: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+                })
+            }
+        }
+    }
+}
+
+async fn serve_repodata(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    headers: &HeaderMap,
+    repo_key: &str,
+    subdir: &str,
+    encoding: RepodataEncoding,
+) -> Result<Response, Response> {
+    let repo = resolve_conda_repo(&state.db, repo_key).await?;
+    check_read_access(&state.db, auth, &repo).await?;
+
+    let ct = encoding.content_type();
 
     // Virtual repos: merge repodata from all members
     if repo.repo_type == "virtual" {
@@ -1482,52 +1482,58 @@ async fn repodata_json(
             &state.db,
             state.proxy_service.as_deref(),
             repo.id,
-            &repo_key,
-            &subdir,
+            repo_key,
+            subdir,
         )
         .await?;
-        let body = serde_json::to_string_pretty(&repodata)
-            .unwrap()
-            .into_bytes();
-        return Ok(cacheable_response(body, "application/json", &headers));
+        let body = encoding.encode(&repodata)?;
+        return Ok(cacheable_response(body, ct, headers));
     }
 
     // For remote repos, proxy repodata from upstream
     if repo.repo_type == "remote" {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
-                let upstream_path = format!("{}/repodata.json", subdir);
-                match proxy_helpers::proxy_fetch(
+                let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
+                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
                     proxy,
                     repo.id,
-                    &repo_key,
+                    repo_key,
                     upstream_url,
                     &upstream_path,
                 )
                 .await
                 {
-                    Ok((content, _ct)) => {
-                        return Ok(cacheable_response(
-                            content.to_vec(),
-                            "application/json",
-                            &headers,
-                        ));
-                    }
-                    Err(_) => {
-                        // Upstream unavailable, fall through to local DB
-                    }
+                    return Ok(cacheable_response(content.to_vec(), ct, headers));
                 }
             }
         }
     }
 
-    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
+    let repodata = build_repodata(&state.db, repo.id, repo_key, subdir, false).await?;
+    let body = encoding.encode(&repodata)?;
+    Ok(cacheable_response(body, ct, headers))
+}
 
-    let body = serde_json::to_string_pretty(&repodata)
-        .unwrap()
-        .into_bytes();
+// ---------------------------------------------------------------------------
+// GET /conda/{repo_key}/{subdir}/repodata.json
+// ---------------------------------------------------------------------------
 
-    Ok(cacheable_response(body, "application/json", &headers))
+async fn repodata_json(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    headers: HeaderMap,
+    Path((repo_key, subdir)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    serve_repodata(
+        &state,
+        auth,
+        &headers,
+        &repo_key,
+        &subdir,
+        RepodataEncoding::Json,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,66 +1542,19 @@ async fn repodata_json(
 
 async fn repodata_json_bz2(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-
-    check_read_access(&state.db, &state.config, &headers, &repo).await?;
-
-    // Virtual repos: merge repodata from all members
-    if repo.repo_type == "virtual" {
-        let repodata = build_virtual_repodata(
-            &state.db,
-            state.proxy_service.as_deref(),
-            repo.id,
-            &repo_key,
-            &subdir,
-        )
-        .await?;
-        let json_bytes = serde_json::to_vec(&repodata).unwrap();
-        let compressed = bzip2_compress(&json_bytes);
-        return Ok(cacheable_response(
-            compressed,
-            "application/x-bzip2",
-            &headers,
-        ));
-    }
-
-    // For remote repos, proxy compressed repodata from upstream
-    if repo.repo_type == "remote" {
-        if let Some(ref upstream_url) = repo.upstream_url {
-            if let Some(ref proxy) = state.proxy_service {
-                let upstream_path = format!("{}/repodata.json.bz2", subdir);
-                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &upstream_path,
-                )
-                .await
-                {
-                    return Ok(cacheable_response(
-                        content.to_vec(),
-                        "application/x-bzip2",
-                        &headers,
-                    ));
-                }
-            }
-        }
-    }
-
-    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
-
-    let json_bytes = serde_json::to_vec(&repodata).unwrap();
-    let compressed = bzip2_compress(&json_bytes);
-
-    Ok(cacheable_response(
-        compressed,
-        "application/x-bzip2",
+    serve_repodata(
+        &state,
+        auth,
         &headers,
-    ))
+        &repo_key,
+        &subdir,
+        RepodataEncoding::Bz2,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1655,63 +1614,19 @@ async fn repodata_json_sig(
 /// Modern conda/mamba clients prefer zstd over bz2 for faster decompression.
 async fn repodata_json_zst(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-
-    check_read_access(&state.db, &state.config, &headers, &repo).await?;
-
-    // Virtual repos: merge repodata from all members
-    if repo.repo_type == "virtual" {
-        let repodata = build_virtual_repodata(
-            &state.db,
-            state.proxy_service.as_deref(),
-            repo.id,
-            &repo_key,
-            &subdir,
-        )
-        .await?;
-        let json_bytes = serde_json::to_vec(&repodata).unwrap();
-        let compressed = zstd_compress(&json_bytes).map_err(|e| {
-            tracing::error!("zstd compression error for virtual repodata: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        })?;
-        return Ok(cacheable_response(compressed, "application/zstd", &headers));
-    }
-
-    // For remote repos, proxy compressed repodata from upstream
-    if repo.repo_type == "remote" {
-        if let Some(ref upstream_url) = repo.upstream_url {
-            if let Some(ref proxy) = state.proxy_service {
-                let upstream_path = format!("{}/repodata.json.zst", subdir);
-                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &upstream_path,
-                )
-                .await
-                {
-                    return Ok(cacheable_response(
-                        content.to_vec(),
-                        "application/zstd",
-                        &headers,
-                    ));
-                }
-            }
-        }
-    }
-
-    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
-    let json_bytes = serde_json::to_vec(&repodata).unwrap();
-    let compressed = zstd_compress(&json_bytes).map_err(|e| {
-        tracing::error!("zstd compression error for repodata: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
-
-    Ok(cacheable_response(compressed, "application/zstd", &headers))
+    serve_repodata(
+        &state,
+        auth,
+        &headers,
+        &repo_key,
+        &subdir,
+        RepodataEncoding::Zst,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,17 +1797,11 @@ async fn current_repodata_json(
 ///
 /// Clients fetch this to discover which shards they need, then fetch
 /// individual shards only for packages they care about.
-async fn sharded_repodata_index(
-    State(state): State<SharedState>,
-    Path((repo_key, subdir)): Path<(String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
-    let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
-
-    // Group artifacts by package name
+fn group_artifacts_by_name<'a>(
+    artifacts: &[&'a CondaArtifact],
+) -> BTreeMap<String, Vec<&'a CondaArtifact>> {
     let mut by_name: BTreeMap<String, Vec<&CondaArtifact>> = BTreeMap::new();
-    for artifact in &subdir_artifacts {
+    for artifact in artifacts {
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
         if !is_conda_package(filename) {
             continue;
@@ -1904,6 +1813,17 @@ async fn sharded_repodata_index(
             .unwrap_or(&artifact.name);
         by_name.entry(name.to_string()).or_default().push(artifact);
     }
+    by_name
+}
+
+async fn sharded_repodata_index(
+    State(state): State<SharedState>,
+    Path((repo_key, subdir)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
+    let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
+    let by_name = group_artifacts_by_name(&subdir_artifacts);
 
     // Build shard for each package name and compute content hash
     let mut shards_map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -1954,21 +1874,7 @@ async fn sharded_repodata_shard(
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
-
-    // Group by package name and find the matching shard by hash
-    let mut by_name: BTreeMap<String, Vec<&CondaArtifact>> = BTreeMap::new();
-    for artifact in &subdir_artifacts {
-        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-        if !is_conda_package(filename) {
-            continue;
-        }
-        let name = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("name").and_then(|v| v.as_str()))
-            .unwrap_or(&artifact.name);
-        by_name.entry(name.to_string()).or_default().push(artifact);
-    }
+    let by_name = group_artifacts_by_name(&subdir_artifacts);
 
     // Find the shard matching the requested hash
     for artifacts in by_name.values() {
@@ -2441,12 +2347,12 @@ async fn build_virtual_channeldata(
 
 async fn download_package(
     State(state): State<SharedState>,
-    headers: HeaderMap,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
 
-    check_read_access(&state.db, &state.config, &headers, &repo).await?;
+    check_read_access(&state.db, auth.clone(), &repo).await?;
 
     // Look up artifact by path
     let artifact_path = format!("{}/{}", subdir, filename);
@@ -2594,11 +2500,11 @@ async fn download_package(
 
 async fn upload_package_put(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let user_id = require_auth_basic(auth, "conda")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -2619,11 +2525,12 @@ async fn upload_package_put(
 
 async fn upload_post(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let user_id = require_auth_basic(auth, "conda")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -2654,13 +2561,13 @@ async fn upload_post(
 /// PUT upload using URL path token: /conda/t/<TOKEN>/<repo_key>/<subdir>/<filename>
 async fn upload_package_put_with_token(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    // Try Basic auth first (if present), fall back to URL token
-    let user_id = if extract_basic_credentials(&headers).is_some() {
-        authenticate(&state.db, &state.config, &headers).await?
+    // Try middleware auth first (if present), fall back to URL token
+    let user_id = if auth.is_some() {
+        require_auth_basic(auth, "conda")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -2682,12 +2589,14 @@ async fn upload_package_put_with_token(
 /// POST upload using URL path token: /conda/t/<TOKEN>/<repo_key>/upload
 async fn upload_post_with_token(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = if extract_basic_credentials(&headers).is_some() {
-        authenticate(&state.db, &state.config, &headers).await?
+    // Try middleware auth first (if present), fall back to URL token
+    let user_id = if auth.is_some() {
+        require_auth_basic(auth, "conda")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -3051,11 +2960,11 @@ async fn fetch_attestation(
 /// PUT /conda/{repo_key}/{subdir}/{filename}/attestation
 async fn put_attestation(
     State(state): State<SharedState>,
-    headers: HeaderMap,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let _user_id = require_auth_basic(auth, "conda")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
 }
@@ -3065,13 +2974,13 @@ async fn put_attestation(
 /// Requires authentication to match the repository's read-auth posture.
 async fn get_attestation(
     State(state): State<SharedState>,
-    headers: HeaderMap,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     // Attestations follow the repo's auth requirements. If the repo is
     // public the authenticate call will succeed with anonymous access
     // via the optional auth middleware on the outer router.
-    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let _user_id = require_auth_basic(auth, "conda")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     fetch_attestation(&state, &repo, &subdir, &filename).await
 }
@@ -3079,12 +2988,12 @@ async fn get_attestation(
 /// PUT /conda/t/{token}/{repo_key}/{subdir}/{filename}/attestation
 async fn put_attestation_with_token(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let _user_id = if extract_basic_credentials(&headers).is_some() {
-        authenticate(&state.db, &state.config, &headers).await?
+    let _user_id = if auth.is_some() {
+        require_auth_basic(auth, "conda")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -3095,11 +3004,11 @@ async fn put_attestation_with_token(
 /// GET /conda/t/{token}/{repo_key}/{subdir}/{filename}/attestation
 async fn get_attestation_with_token(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
 ) -> Result<Response, Response> {
-    let _user_id = if extract_basic_credentials(&headers).is_some() {
-        authenticate(&state.db, &state.config, &headers).await?
+    let _user_id = if auth.is_some() {
+        require_auth_basic(auth, "conda")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -4384,34 +4293,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // extract_basic_credentials
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_basic_credentials_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Basic dXNlcjpwYXNz".parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_no_header() {
-        let headers = HeaderMap::new();
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_bearer_ignored() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer token".parse().unwrap(),
-        );
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
     // =======================================================================
     // Conda compliance tests (maps to GitHub issue #282)
     // =======================================================================
@@ -5494,163 +5375,6 @@ mod tests {
     // Authentication compliance tests (bead: artifact-keeper-seq)
     // Maps to conda/conda#9973 and Artifactory plugin#200
     // =======================================================================
-
-    #[test]
-    fn test_basic_auth_standard_format() {
-        // user:pass -> base64 "dXNlcjpwYXNz"
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Basic dXNlcjpwYXNz".parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_basic_auth_case_insensitive_prefix() {
-        // conda clients may send "basic" (lowercase) instead of "Basic"
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "basic dXNlcjpwYXNz".parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_basic_auth_token_in_password_field() {
-        // Common pattern: use API token as the password with a dummy username
-        // token: "ak_myapitoken123"
-        // "token:ak_myapitoken123" -> base64
-        let encoded = base64::engine::general_purpose::STANDARD.encode("token:ak_myapitoken123");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "ak_myapitoken123".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_basic_auth_conda_condarc_style() {
-        // .condarc uses: channel_alias with user:token@ in URL, which gets
-        // converted to Basic auth by conda client
-        let encoded = base64::engine::general_purpose::STANDARD.encode("myuser:mypassword");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("myuser".to_string(), "mypassword".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_basic_auth_password_with_colon() {
-        // Passwords containing colons should work (split only on first colon)
-        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass:with:colons");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pass:with:colons".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_basic_auth_special_characters() {
-        // Passwords with special chars should be handled
-        let encoded = base64::engine::general_purpose::STANDARD.encode("admin:P@$$w0rd!#%");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("admin".to_string(), "P@$$w0rd!#%".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_no_auth_header_returns_none() {
-        let headers = HeaderMap::new();
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_bearer_auth_not_accepted_for_basic() {
-        // Bearer tokens should NOT be parsed as basic credentials
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer eyJhbGciOiJIUzI1NiJ9".parse().unwrap(),
-        );
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_invalid_base64_returns_none() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Basic !!!not-base64!!!".parse().unwrap(),
-        );
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_basic_auth_no_colon_returns_none() {
-        // base64 of just "username" (no colon separator)
-        let encoded = base64::engine::general_purpose::STANDARD.encode("username");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_basic_auth_empty_password() {
-        // Some systems allow empty passwords
-        let encoded = base64::engine::general_purpose::STANDARD.encode("user:");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "".to_string())));
-    }
-
-    #[test]
-    fn test_basic_auth_empty_username() {
-        // Token-only auth: empty username with token as password
-        let encoded = base64::engine::general_purpose::STANDARD.encode(":ak_token_value");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("".to_string(), "ak_token_value".to_string())));
-    }
-
     // -----------------------------------------------------------------------
     // URL path token authentication (bead: artifact-keeper-gdm)
     // -----------------------------------------------------------------------
@@ -5663,36 +5387,6 @@ mod tests {
         let _token = token_router();
         // Both compile and produce valid routers
     }
-
-    #[test]
-    fn test_token_auth_basic_auth_takes_priority() {
-        // When both Basic auth header and URL token are present,
-        // Basic auth should take priority (tested via extract_basic_credentials)
-        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        // extract_basic_credentials should return the Basic auth creds
-        let result = extract_basic_credentials(&headers);
-        assert!(
-            result.is_some(),
-            "Basic auth should be extracted even with token in URL"
-        );
-    }
-
-    #[test]
-    fn test_token_auth_falls_back_to_url_token() {
-        // When no Basic auth header is present, token from URL should be used
-        let headers = HeaderMap::new();
-        let result = extract_basic_credentials(&headers);
-        assert!(
-            result.is_none(),
-            "No Basic auth means fallback to URL token"
-        );
-    }
-
     #[test]
     fn test_token_url_format_condarc() {
         // Verify the expected .condarc format is supported by our URL structure

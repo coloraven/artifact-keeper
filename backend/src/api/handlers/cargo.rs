@@ -11,7 +11,6 @@
 //!   GET  /cargo/{repo_key}/index/*path                             - Sparse index lookup
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -19,16 +18,16 @@ use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
+use axum::Extension;
 use axum::Router;
-use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers;
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::services::auth_service::AuthService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -58,72 +57,7 @@ pub fn router() -> Router<SharedState> {
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
-// ---------------------------------------------------------------------------
-// Auth helpers
-// ---------------------------------------------------------------------------
-
-fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|s| {
-            let mut parts = s.splitn(2, ':');
-            let user = parts.next()?.to_string();
-            let pass = parts.next()?.to_string();
-            Some((user, pass))
-        })
-}
-
-/// Also support Bearer token auth (cargo uses token-based auth).
-fn extract_token(headers: &HeaderMap) -> Option<(String, String)> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or(v.strip_prefix("bearer ")))
-        .map(|token| {
-            // Cargo sends the token directly; treat it as password with "cargo" username
-            ("cargo".to_string(), token.to_string())
-        })
-}
-
-/// Authenticate via Basic auth or Bearer token, returning user_id on success.
-async fn authenticate(
-    db: &PgPool,
-    config: &crate::config::Config,
-    headers: &HeaderMap,
-) -> Result<uuid::Uuid, Response> {
-    let (username, password) = extract_basic_credentials(headers)
-        .or_else(|| extract_token(headers))
-        .ok_or_else(|| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Basic realm=\"cargo\"")
-                .body(Body::from(
-                    serde_json::json!({"errors": [{"detail": "Authentication required"}]})
-                        .to_string(),
-                ))
-                .unwrap()
-        })?;
-
-    let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-    let (user, _tokens) = auth_service
-        .authenticate(&username, &password)
-        .await
-        .map_err(|_| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Basic realm=\"cargo\"")
-                .body(Body::from(
-                    serde_json::json!({"errors": [{"detail": "Invalid credentials"}]}).to_string(),
-                ))
-                .unwrap()
-        })?;
-
-    Ok(user.id)
-}
+use crate::api::middleware::auth::require_auth_with_bearer_fallback;
 
 // ---------------------------------------------------------------------------
 // Repository resolution
@@ -517,11 +451,14 @@ async fn store_crate_artifact(
 
 async fn publish(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let user_id =
+        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "cargo")
+            .await?;
     let repo = resolve_cargo_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -1007,7 +944,6 @@ fn cargo_sparse_index_path(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -1093,166 +1029,6 @@ mod tests {
         assert_eq!(
             cargo_sparse_index_path("tokio_util"),
             "index/to/ki/tokio_util"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_basic_credentials
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_basic_credentials_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_lowercase() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("basic dXNlcjpwYXNz"),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_no_header() {
-        let headers = HeaderMap::new();
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_invalid_base64() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Basic !!!invalid!!!"),
-        );
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_no_colon() {
-        let mut headers = HeaderMap::new();
-        // "nocolon" base64 = "bm9jb2xvbg=="
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Basic bm9jb2xvbg=="),
-        );
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_password_with_colon() {
-        let mut headers = HeaderMap::new();
-        // "user:pa:ss" base64 = "dXNlcjpwYTpzcw=="
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Basic dXNlcjpwYTpzcw=="),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "pa:ss".to_string())));
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_empty_password() {
-        let mut headers = HeaderMap::new();
-        // "user:" base64 = "dXNlcjo="
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Basic dXNlcjo="),
-        );
-        let result = extract_basic_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "".to_string())));
-    }
-
-    #[test]
-    fn test_extract_basic_credentials_bearer_ignored() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer some-token"),
-        );
-        assert!(extract_basic_credentials(&headers).is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_token (Bearer auth)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_token_valid_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer my-api-token"),
-        );
-        let result = extract_token(&headers);
-        assert_eq!(
-            result,
-            Some(("cargo".to_string(), "my-api-token".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_extract_token_lowercase_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("bearer my-token"),
-        );
-        let result = extract_token(&headers);
-        assert_eq!(result, Some(("cargo".to_string(), "my-token".to_string())));
-    }
-
-    #[test]
-    fn test_extract_token_no_header() {
-        let headers = HeaderMap::new();
-        assert!(extract_token(&headers).is_none());
-    }
-
-    #[test]
-    fn test_extract_token_basic_auth_returns_none() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
-        );
-        assert!(extract_token(&headers).is_none());
-    }
-
-    #[test]
-    fn test_extract_token_empty_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer "),
-        );
-        let result = extract_token(&headers);
-        assert_eq!(result, Some(("cargo".to_string(), "".to_string())));
-    }
-
-    #[test]
-    fn test_extract_token_with_complex_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer cio_abcdef1234567890ABCDEF"),
-        );
-        let result = extract_token(&headers);
-        assert_eq!(
-            result,
-            Some((
-                "cargo".to_string(),
-                "cio_abcdef1234567890ABCDEF".to_string()
-            ))
         );
     }
 
