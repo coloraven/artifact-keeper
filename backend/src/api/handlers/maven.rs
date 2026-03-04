@@ -92,8 +92,12 @@ async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 // Pure (non-async) helper functions for testability
 // ---------------------------------------------------------------------------
 
-/// Determine if a Maven path is for metadata (groupId/artifactId level, no version).
-/// Returns (groupId, artifactId) if the path ends with maven-metadata.xml
+/// Determine if a Maven path is for artifact-level metadata (groupId/artifactId level).
+/// Returns (groupId, artifactId) if the path ends with maven-metadata.xml AND the
+/// segment before it is an artifactId (not a version).
+///
+/// Version-level metadata (groupId/artifactId/version/maven-metadata.xml) returns None
+/// so the caller can serve it from storage instead of generating it dynamically.
 fn parse_metadata_path(path: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     // Minimum: groupSegment/artifactId/maven-metadata.xml
@@ -104,9 +108,22 @@ fn parse_metadata_path(path: &str) -> Option<(String, String)> {
     if filename != "maven-metadata.xml" {
         return None;
     }
-    let artifact_id = parts[parts.len() - 2].to_string();
+    let candidate = parts[parts.len() - 2];
+    // If the segment before maven-metadata.xml looks like a version, this is
+    // version-level metadata (e.g. .../1.0.0-SNAPSHOT/maven-metadata.xml).
+    // Return None so the download handler serves it from storage.
+    if looks_like_maven_version(candidate) {
+        return None;
+    }
+    let artifact_id = candidate.to_string();
     let group_id = parts[..parts.len() - 2].join(".");
     Some((group_id, artifact_id))
+}
+
+/// Heuristic: Maven versions start with a digit (1.0.0, 2.0-rc1, 3.12.0-SNAPSHOT).
+/// Artifact IDs practically never start with a digit.
+fn looks_like_maven_version(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Check if a path is a checksum request. Returns the base path and checksum type.
@@ -148,38 +165,80 @@ async fn download(
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
+    let storage = state.storage_for_repo(&repo.storage_path);
 
     // 1. Check if this is a checksum request for metadata
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
-        if let Some((group_id, artifact_id)) = parse_metadata_path(base_path) {
-            let xml =
-                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await?;
-            let checksum = compute_checksum(xml.as_bytes(), checksum_type);
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from(checksum))
-                .unwrap());
+        if MavenHandler::is_metadata(base_path) {
+            // Try stored checksum file first
+            let checksum_storage_key = format!("maven/{}", path);
+            if let Ok(content) = storage.get(&checksum_storage_key).await {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+
+            // Try stored metadata file and compute checksum from it
+            let meta_storage_key = format!("maven/{}", base_path);
+            if let Ok(content) = storage.get(&meta_storage_key).await {
+                let checksum = compute_checksum(&content, checksum_type);
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(checksum))
+                    .unwrap());
+            }
+
+            // Fall back to dynamic generation for artifact-level metadata
+            if let Some((group_id, artifact_id)) = parse_metadata_path(base_path) {
+                let xml =
+                    generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id)
+                        .await?;
+                let checksum = compute_checksum(xml.as_bytes(), checksum_type);
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(checksum))
+                    .unwrap());
+            }
         }
     }
 
     // 2. Check if this is a maven-metadata.xml request
-    if let Some((group_id, artifact_id)) = parse_metadata_path(&path) {
-        let xml =
-            generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await?;
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/xml")
-            .header(CONTENT_LENGTH, xml.len().to_string())
-            .body(Body::from(xml))
-            .unwrap());
+    if MavenHandler::is_metadata(&path) {
+        // Try stored metadata file first (handles version-level metadata)
+        let meta_storage_key = format!("maven/{}", path);
+        if let Ok(content) = storage.get(&meta_storage_key).await {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/xml")
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .body(Body::from(content))
+                .unwrap());
+        }
+
+        // Fall back to dynamic generation for artifact-level metadata
+        if let Some((group_id, artifact_id)) = parse_metadata_path(&path) {
+            let xml =
+                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await?;
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/xml")
+                .header(CONTENT_LENGTH, xml.len().to_string())
+                .body(Body::from(xml))
+                .unwrap());
+        }
+
+        // Metadata not found anywhere
+        return Err((StatusCode::NOT_FOUND, "Metadata not found").into_response());
     }
 
     // 3. Check if this is a checksum request for a stored file
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
         // First try to find a stored checksum file
         let checksum_storage_key = format!("maven/{}", path);
-        let storage = state.storage_for_repo(&repo.storage_path);
         if let Ok(content) = storage.get(&checksum_storage_key).await {
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -684,6 +743,35 @@ mod tests {
         // groupSegment/artifactId/maven-metadata.xml minimum
         let result = parse_metadata_path("com/my-lib/maven-metadata.xml");
         assert_eq!(result, Some(("com".to_string(), "my-lib".to_string())));
+    }
+
+    #[test]
+    fn test_parse_metadata_path_version_level_snapshot() {
+        let result = parse_metadata_path("com/test/artifacthub/0.0.1-SNAPSHOT/maven-metadata.xml");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_metadata_path_version_level_release() {
+        let result = parse_metadata_path("com/example/my-lib/1.0.0/maven-metadata.xml");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_metadata_path_version_level_complex() {
+        let result = parse_metadata_path(
+            "org/apache/commons/commons-lang3/3.12.0-SNAPSHOT/maven-metadata.xml",
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_metadata_path_artifact_level_still_works() {
+        let result = parse_metadata_path("com/example/my-lib/maven-metadata.xml");
+        assert_eq!(
+            result,
+            Some(("com.example".to_string(), "my-lib".to_string())),
+        );
     }
 
     // -----------------------------------------------------------------------
