@@ -27,6 +27,7 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::pypi::PypiHandler;
+use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -217,7 +218,7 @@ async fn simple_project(
 
     if artifacts.is_empty() {
         // For remote repos, proxy the simple index from upstream
-        if repo.repo_type == "remote" {
+        if repo.repo_type == RepositoryType::Remote {
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
@@ -242,29 +243,13 @@ async fn simple_project(
             }
         }
         // For virtual repos, iterate through members and try proxy for remote members
-        if repo.repo_type == "virtual" {
+        if repo.repo_type == RepositoryType::Virtual {
             if let Some(ref proxy) = state.proxy_service {
-                let members = sqlx::query!(
-                    r#"SELECT r.id, r.key, r.repo_type::text as "repo_type!", r.upstream_url
-                    FROM repositories r
-                    INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
-                    WHERE vrm.virtual_repo_id = $1
-                    ORDER BY vrm.priority"#,
-                    repo.id
-                )
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to resolve virtual members: {}", e),
-                    )
-                        .into_response()
-                })?;
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
                 for member in &members {
                     // Try proxy for remote members
-                    if member.repo_type == "remote" {
+                    if member.repo_type == RepositoryType::Remote {
                         if let Some(ref upstream_url) = member.upstream_url {
                             let upstream_path = format!("simple/{}/", normalized);
                             if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
@@ -450,7 +435,7 @@ async fn serve_file(
     let artifact = match artifact {
         Some(a) => a,
         None => {
-            if repo.repo_type == "remote" {
+            if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
@@ -486,7 +471,7 @@ async fn serve_file(
                 }
             }
             // Virtual repo: try each member in priority order
-            if repo.repo_type == "virtual" {
+            if repo.repo_type == RepositoryType::Virtual {
                 let db = state.db.clone();
                 let fname = filename.to_string();
                 let normalized = PypiHandler::normalize_name(project);

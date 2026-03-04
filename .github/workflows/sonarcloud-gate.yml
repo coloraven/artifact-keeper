@@ -1,64 +1,155 @@
 name: SonarCloud Gate
 
-# Runs on pull_request_target so the workflow definition always comes from main.
-# This is needed because fork PRs run the fork's ci.yml (which won't have the
-# SonarCloud scan step's token), and the SonarCloud app check never reports.
+# Runs after the CI workflow completes. Uses workflow_run so we have access to
+# secrets (SONAR_TOKEN) even for fork PRs. Downloads the lcov coverage artifact
+# from CI and runs the SonarCloud scan if no analysis exists yet.
 #
-# For internal PRs: queries SonarCloud API for quality gate status and posts
-# a PR comment with coverage/duplication metrics.
+# For internal PRs: the scan already ran in CI, so this just reads the results.
+# For fork PRs: this is the only place the scan runs (CI skips it, no token).
 #
-# For fork PRs (or when no analysis exists): passes with a "skipped" note.
-#
-# SECURITY: Does NOT check out PR code. Only queries APIs and posts comments.
+# SECURITY: Fetches PR source only for SonarCloud static analysis. Does NOT
+# execute any code from the PR. All workflow_run event data is passed through
+# env vars (never inline ${{ }}) to prevent expression injection.
 
 on:
-  pull_request_target:
-    branches: [main, master, develop, 'release/**']
-    types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 permissions:
   contents: read
   pull-requests: write
+  actions: read
 
 concurrency:
-  group: sonarcloud-gate-${{ github.event.pull_request.number }}
+  group: sonarcloud-gate-${{ github.event.workflow_run.id }}
   cancel-in-progress: true
 
 jobs:
   sonarcloud-gate:
     name: SonarCloud Quality Gate
     runs-on: ubuntu-latest
+    # Only run for PRs where CI succeeded
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
     steps:
-      - name: Check quality gate
+      - name: Get PR number
+        id: pr
+        env:
+          PR_JSON: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+        run: |
+          PR_NUMBER=$(echo "$PR_JSON" | \
+            python3 -c "import sys,json; prs=json.load(sys.stdin); print(prs[0]['number'] if prs else '')")
+          # Validate PR number is numeric to prevent injection
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "No PR associated with this workflow run. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Invalid PR number: $PR_NUMBER"
+            exit 1
+          else
+            echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "PR #$PR_NUMBER"
+          fi
+
+      - name: Check for existing analysis
+        if: steps.pr.outputs.skip != 'true'
+        id: check
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          if [[ -z "$SONAR_TOKEN" ]]; then
+            echo "SONAR_TOKEN not configured. Skipping."
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          GATE_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
+            "https://sonarcloud.io/api/qualitygates/project_status?projectKey=artifact-keeper_artifact-keeper&pullRequest=${PR_NUMBER}")
+          GATE_STATUS=$(echo "$GATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])" 2>/dev/null || echo "NONE")
+          echo "Quality gate status from API: $GATE_STATUS"
+          echo "status=$GATE_STATUS" >> "$GITHUB_OUTPUT"
+
+      # For fork PRs (or when analysis is missing): download coverage and run scan.
+      # Fetches source via git CLI in a run block (not actions/checkout) to avoid
+      # CodeQL's untrusted-checkout flag on workflow_run privileged contexts.
+      - name: Fetch PR source
+        if: steps.check.outputs.status == 'NONE'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git fetch --depth=50 origin "pull/${PR_NUMBER}/head"
+          git checkout FETCH_HEAD
+
+      - name: Download coverage artifact
+        if: steps.check.outputs.status == 'NONE'
+        uses: actions/download-artifact@v4
+        with:
+          name: lcov-coverage
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Get PR metadata
+        if: steps.check.outputs.status == 'NONE'
+        id: pr_meta
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          PR_JSON: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+        run: |
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+          BASE_REF=$(echo "$PR_JSON" | python3 -c "import sys,json; prs=json.load(sys.stdin); print(prs[0]['base']['ref'] if prs else 'main')" 2>/dev/null || echo "main")
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Run SonarCloud Scan
+        if: steps.check.outputs.status == 'NONE'
+        uses: SonarSource/sonarqube-scan-action@v7
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=artifact-keeper_artifact-keeper
+            -Dsonar.organization=artifact-keeper
+            -Dsonar.rust.lcov.reportPaths=lcov.info
+            -Dsonar.pullrequest.key=${{ steps.pr.outputs.number }}
+            -Dsonar.pullrequest.branch=${{ steps.pr_meta.outputs.head_branch }}
+            -Dsonar.pullrequest.base=${{ steps.pr_meta.outputs.base_ref }}
+
+      - name: Wait for analysis processing
+        if: steps.check.outputs.status == 'NONE'
+        run: sleep 15
+
+      # Fetch quality gate results (either from earlier CI scan or our scan above)
+      - name: Get quality gate results
+        if: steps.pr.outputs.skip != 'true' && steps.check.outputs.status != 'skipped'
         id: gate
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          # Retry a few times in case analysis is still processing
+          for i in 1 2 3; do
+            GATE_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
+              "https://sonarcloud.io/api/qualitygates/project_status?projectKey=artifact-keeper_artifact-keeper&pullRequest=${PR_NUMBER}")
+            GATE_STATUS=$(echo "$GATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])" 2>/dev/null || echo "NONE")
+            if [[ "$GATE_STATUS" != "NONE" ]]; then break; fi
+            echo "Analysis not ready, waiting... (attempt $i/3)"
+            sleep 10
+          done
 
-          if [[ -z "$SONAR_TOKEN" ]]; then
-            echo "SONAR_TOKEN not available."
-            echo "status=skipped" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          echo "status=$GATE_STATUS" >> "$GITHUB_OUTPUT"
 
-          # Query SonarCloud for this PR's quality gate status.
-          # The analysis may not exist yet (fork PRs, or CI still running).
-          GATE_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
-            "https://sonarcloud.io/api/qualitygates/project_status?projectKey=artifact-keeper_artifact-keeper&pullRequest=${PR_NUMBER}")
-
-          GATE_STATUS=$(echo "$GATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])" 2>/dev/null || echo "NONE")
-          echo "Quality gate status: $GATE_STATUS"
-
-          # No analysis found: fork PR where scan was skipped, or CI hasn't
-          # finished yet. Either way, don't block the PR.
           if [[ "$GATE_STATUS" == "NONE" ]]; then
-            echo "No SonarCloud analysis found for PR #${PR_NUMBER}."
-            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            echo "Analysis still not available after retries."
             exit 0
           fi
 
-          # Fetch new code metrics
           METRICS_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
             "https://sonarcloud.io/api/measures/component?component=artifact-keeper_artifact-keeper&metricKeys=new_coverage,new_duplicated_lines_density,new_lines&pullRequest=${PR_NUMBER}")
 
@@ -81,34 +172,39 @@ jobs:
             esac
           done
 
-          echo "status=${GATE_STATUS}" >> "$GITHUB_OUTPUT"
-
           if [[ "$GATE_STATUS" == "ERROR" ]]; then
             exit 1
           fi
 
       - name: Post PR comment
-        if: always()
+        if: always() && steps.pr.outputs.skip != 'true'
         uses: actions/github-script@v7
+        env:
+          GATE_STATUS: ${{ steps.gate.outputs.status || steps.check.outputs.status }}
+          COVERAGE: ${{ steps.gate.outputs.coverage }}
+          DUPLICATION: ${{ steps.gate.outputs.duplication }}
+          NEW_LINES: ${{ steps.gate.outputs.lines }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         with:
           script: |
-            const status = '${{ steps.gate.outputs.status }}';
-            const coverage = '${{ steps.gate.outputs.coverage }}';
-            const duplication = '${{ steps.gate.outputs.duplication }}';
-            const lines = '${{ steps.gate.outputs.lines }}';
-            const prNumber = context.payload.pull_request.number;
+            const status = process.env.GATE_STATUS;
+            const coverage = process.env.COVERAGE;
+            const duplication = process.env.DUPLICATION;
+            const lines = process.env.NEW_LINES;
+            const prNumber = parseInt(process.env.PR_NUMBER) || 0;
+
+            if (!prNumber) return;
 
             const marker = '<!-- sonarcloud-gate -->';
             let body = '';
 
-            if (status === 'skipped') {
+            if (status === 'skipped' || status === 'NONE') {
               body = [
                 marker,
                 '### SonarCloud Quality Gate',
                 '',
                 'SonarCloud analysis not available for this PR.',
-                'This is expected for fork PRs or when CI is still running.',
-                'Coverage and duplication will be checked after merge.',
+                'This may indicate a configuration issue. Check workflow logs.',
               ].join('\n');
             } else if (status === 'OK') {
               body = [

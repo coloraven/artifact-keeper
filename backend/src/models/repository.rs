@@ -90,6 +90,16 @@ pub enum RepositoryType {
 }
 
 impl RepositoryType {
+    /// Return the lowercase string representation matching the database enum.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+            Self::Virtual => "virtual",
+            Self::Staging => "staging",
+        }
+    }
+
     /// Check if this is a staging repository (requires promotion to release)
     pub fn is_staging(&self) -> bool {
         matches!(self, RepositoryType::Staging)
@@ -100,6 +110,23 @@ impl RepositoryType {
         matches!(self, RepositoryType::Local | RepositoryType::Staging)
     }
 }
+
+macro_rules! impl_repo_type_eq {
+    ($($T:ty),+) => { $(
+        impl PartialEq<RepositoryType> for $T {
+            fn eq(&self, other: &RepositoryType) -> bool {
+                AsRef::<str>::as_ref(self) == other.as_str()
+            }
+        }
+        impl PartialEq<$T> for RepositoryType {
+            fn eq(&self, other: &$T) -> bool {
+                self.as_str() == AsRef::<str>::as_ref(other)
+            }
+        }
+    )+ };
+}
+
+impl_repo_type_eq!(str, &str, String);
 
 /// Replication priority for Borg replication policies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -162,5 +189,30 @@ mod tests {
         assert!(RepositoryType::Staging.is_hosted());
         assert!(!RepositoryType::Remote.is_hosted());
         assert!(!RepositoryType::Virtual.is_hosted());
+    }
+
+    #[test]
+    fn test_repository_type_as_str() {
+        assert_eq!(RepositoryType::Local.as_str(), "local");
+        assert_eq!(RepositoryType::Remote.as_str(), "remote");
+        assert_eq!(RepositoryType::Virtual.as_str(), "virtual");
+        assert_eq!(RepositoryType::Staging.as_str(), "staging");
+    }
+
+    #[test]
+    fn test_repository_type_string_eq() {
+        let s = String::from("remote");
+        assert!(s == RepositoryType::Remote);
+        assert!(RepositoryType::Remote == s);
+        assert!(s != RepositoryType::Local);
+    }
+
+    #[test]
+    fn test_repository_type_str_eq() {
+        assert!("remote" == RepositoryType::Remote);
+        assert!("virtual" == RepositoryType::Virtual);
+        assert!(RepositoryType::Local == "local");
+        assert!(RepositoryType::Staging == "staging");
+        assert!("remote" != RepositoryType::Local);
     }
 }
