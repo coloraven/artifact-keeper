@@ -11,6 +11,7 @@
 //!   GET  /cargo/{repo_key}/index/*path                             - Sparse index lookup
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -26,9 +27,39 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers;
-use crate::api::middleware::auth::AuthExtension;
+use crate::api::middleware::auth::{require_auth_with_bearer_fallback, AuthExtension};
 use crate::api::SharedState;
+use crate::api::{CachedRepo, IndexCache, RepoCache, REPO_CACHE_TTL_SECS};
 use crate::models::repository::RepositoryType;
+
+// ---------------------------------------------------------------------------
+// In-process index entry cache
+// ---------------------------------------------------------------------------
+
+const INDEX_CACHE_TTL_SECS: u64 = 300;
+
+fn index_cache_get(cache: &IndexCache, key: &str) -> Option<Bytes> {
+    let c = cache.read().ok()?;
+    let (bytes, at) = c.get(key)?;
+    if at.elapsed().as_secs() < INDEX_CACHE_TTL_SECS {
+        Some(bytes.clone())
+    } else {
+        None
+    }
+}
+
+fn index_cache_set(cache: &IndexCache, key: String, bytes: Bytes) {
+    if let Ok(mut c) = cache.write() {
+        c.retain(|_, (_, at)| at.elapsed().as_secs() < INDEX_CACHE_TTL_SECS);
+        c.insert(key, (bytes, Instant::now()));
+    }
+}
+
+fn index_cache_invalidate(cache: &IndexCache, key: &str) {
+    if let Ok(mut c) = cache.write() {
+        c.remove(key);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -68,8 +99,6 @@ pub fn router() -> Router<SharedState> {
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
-use crate::api::middleware::auth::require_auth_with_bearer_fallback;
-
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
@@ -86,12 +115,52 @@ struct RepoInfo {
     index_upstream_url: Option<String>,
 }
 
-async fn resolve_cargo_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        r#"SELECT id, storage_path, format::text as "format!", repo_type::text as "repo_type!", upstream_url
-        FROM repositories WHERE key = $1"#,
-        repo_key
+async fn resolve_cargo_repo(
+    db: &PgPool,
+    repo_key: &str,
+    repo_cache: &RepoCache,
+) -> Result<RepoInfo, Response> {
+    // Check the shared repo cache first.  The repo_visibility_middleware
+    // populates this cache before handlers run, so on most requests this
+    // returns immediately with 0 DB queries.
+    if let Ok(cache) = repo_cache.read() {
+        if let Some((entry, at)) = cache.get(repo_key) {
+            if at.elapsed().as_secs() < REPO_CACHE_TTL_SECS {
+                let fmt = entry.format.to_lowercase();
+                if fmt != "cargo" {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Repository '{}' is not a Cargo repository (format: {})",
+                            repo_key, fmt
+                        ),
+                    )
+                        .into_response());
+                }
+                return Ok(RepoInfo {
+                    id: entry.id,
+                    storage_path: entry.storage_path.clone(),
+                    repo_type: entry.repo_type.clone(),
+                    upstream_url: entry.upstream_url.clone(),
+                    index_upstream_url: entry.index_upstream_url.clone(),
+                });
+            }
+        }
+    }
+
+    // Cache miss (e.g. direct access bypassing the middleware): fall back to
+    // a DB lookup and populate the cache for next time.  Uses sqlx::query()
+    // (not the macro) so no offline-cache update is needed.
+    use sqlx::Row;
+    let repo = sqlx::query(
+        "SELECT id, storage_path, format::text as format, repo_type::text as repo_type, \
+         upstream_url, is_public, \
+         (SELECT value FROM repository_config \
+          WHERE repository_id = repositories.id \
+          AND key = 'index_upstream_url') AS index_upstream_url \
+         FROM repositories WHERE key = $1",
     )
+    .bind(repo_key)
     .fetch_optional(db)
     .await
     .map_err(|e| {
@@ -103,7 +172,8 @@ async fn resolve_cargo_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
 
-    let fmt = repo.format.to_lowercase();
+    let fmt: String = repo.get("format");
+    let fmt = fmt.to_lowercase();
     if fmt != "cargo" {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -115,26 +185,38 @@ async fn resolve_cargo_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
             .into_response());
     }
 
-    let index_upstream_url: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'index_upstream_url'",
-    )
-    .bind(repo.id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .flatten();
+    let id: uuid::Uuid = repo.get("id");
+    let storage_path: String = repo.get("storage_path");
+    let repo_type: String = repo.get("repo_type");
+    let upstream_url: Option<String> = repo.get("upstream_url");
+    let is_public: bool = repo.get("is_public");
+    let index_upstream_url: Option<String> = repo.get("index_upstream_url");
+
+    // Populate cache so subsequent requests from this handler path are fast.
+    if let Ok(mut cache) = repo_cache.write() {
+        cache.retain(|_, (_, at)| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
+        cache.insert(
+            repo_key.to_string(),
+            (
+                CachedRepo {
+                    id,
+                    format: fmt.clone(),
+                    repo_type: repo_type.clone(),
+                    upstream_url: upstream_url.clone(),
+                    storage_path: storage_path.clone(),
+                    is_public,
+                    index_upstream_url: index_upstream_url.clone(),
+                },
+                Instant::now(),
+            ),
+        );
+    }
 
     Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
+        id,
+        storage_path,
+        repo_type,
+        upstream_url,
         index_upstream_url,
     })
 }
@@ -148,7 +230,15 @@ async fn config_json(
     Path(repo_key): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
-    let _repo = resolve_cargo_repo(&state.db, &repo_key).await?;
+    let _repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
+
+    // Check repo visibility from the cache (populated by resolve_cargo_repo).
+    let is_private = !state
+        .repo_cache
+        .read()
+        .ok()
+        .and_then(|c| c.get(&repo_key).map(|(r, _)| r.is_public))
+        .unwrap_or(true);
 
     // Determine the host from the request headers or fall back to config
     let host = headers
@@ -166,6 +256,12 @@ async fn config_json(
     let config = serde_json::json!({
         "dl": format!("{}/cargo/{}/api/v1/crates", base_url, repo_key),
         "api": format!("{}/cargo/{}", base_url, repo_key),
+        // For private repos, tell cargo to send credentials on all requests
+        // (index fetches included).  Without this flag cargo only sends auth
+        // after a 401 challenge, but it does not retry 401s on index entries.
+        // Public repos must NOT set this, otherwise anonymous users need a
+        // credential provider configured even though the server allows access.
+        "auth-required": is_private,
     });
 
     Ok(Response::builder()
@@ -185,7 +281,7 @@ async fn search_crates(
     Path(repo_key): Path<String>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Response, Response> {
-    let repo = resolve_cargo_repo(&state.db, &repo_key).await?;
+    let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     let query = params.get("q").cloned().unwrap_or_default();
     let per_page: i64 = params
@@ -493,7 +589,7 @@ async fn publish(
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "cargo")
             .await?;
-    let repo = resolve_cargo_repo(&state.db, &repo_key).await?;
+    let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let parsed = parse_publish_payload(&body)?;
@@ -527,6 +623,24 @@ async fn publish(
     )
     .await?;
 
+    // Invalidate the index cache for this crate so the next fetch sees the new version.
+    index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower));
+
+    // Also invalidate any virtual repos that include this hosted repo.
+    let virtual_keys: Vec<String> = sqlx::query_scalar(
+        "SELECT r.key FROM repositories r \
+         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
+         WHERE vrm.member_repo_id = $1",
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    for vkey in &virtual_keys {
+        index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower));
+    }
+
     info!(
         "Cargo publish: {} {} ({} bytes) to repo {}",
         name_lower, parsed.crate_version, size_bytes, repo_key
@@ -556,7 +670,7 @@ async fn download(
     State(state): State<SharedState>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    let repo = resolve_cargo_repo(&state.db, &repo_key).await?;
+    let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
 
     let artifact = sqlx::query!(
@@ -612,6 +726,7 @@ async fn download(
                             format!("attachment; filename=\"{}\"", filename),
                         )
                         .header(CONTENT_LENGTH, content.len().to_string())
+                        .header("cache-control", "public, max-age=31536000, immutable")
                         .body(Body::from(content))
                         .unwrap());
                 }
@@ -660,6 +775,7 @@ async fn download(
                         format!("attachment; filename=\"{}\"", filename),
                     )
                     .header(CONTENT_LENGTH, content.len().to_string())
+                    .header("cache-control", "public, max-age=31536000, immutable")
                     .body(Body::from(content))
                     .unwrap());
             }
@@ -694,6 +810,9 @@ async fn download(
             format!("attachment; filename=\"{}\"", filename),
         )
         .header(CONTENT_LENGTH, content.len().to_string())
+        // .crate files are content-addressed and immutable: same name+version
+        // always has the same bytes.  Cargo can cache them indefinitely.
+        .header("cache-control", "public, max-age=31536000, immutable")
         .body(Body::from(content))
         .unwrap())
 }
@@ -803,7 +922,7 @@ fn index_response(content: impl Into<Body>, content_type: Option<String>) -> Res
             CONTENT_TYPE,
             content_type.unwrap_or_else(|| "application/json".to_string()),
         )
-        .header("cache-control", "max-age=60")
+        .header("cache-control", "max-age=300")
         .body(content.into())
         .unwrap()
 }
@@ -814,6 +933,8 @@ async fn try_remote_index(
     repo: &RepoInfo,
     repo_key: &str,
     name_lower: &str,
+    index_cache: &IndexCache,
+    cache_key: &str,
 ) -> Option<Result<Response, Response>> {
     if repo.repo_type != "remote" {
         return None;
@@ -828,7 +949,10 @@ async fn try_remote_index(
     let index_path = cargo_sparse_index_path_upstream(name_lower);
     let result = proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, &index_path).await;
 
-    Some(result.map(|(content, content_type)| index_response(content, content_type)))
+    Some(result.map(|(content, content_type)| {
+        index_cache_set(index_cache, cache_key.to_string(), content.clone());
+        index_response(content, content_type)
+    }))
 }
 
 /// Try to resolve a crate index from a virtual repo's member repositories.
@@ -840,8 +964,9 @@ async fn try_virtual_index(
     state: &SharedState,
     repo: &RepoInfo,
     name_lower: &str,
+    index_cache: &IndexCache,
+    cache_key: &str,
 ) -> Option<Result<Response, Response>> {
-    use crate::models::repository::RepositoryType;
     use sqlx::Row;
 
     if repo.repo_type != "virtual" {
@@ -914,9 +1039,10 @@ async fn try_virtual_index(
                     build_index_entry(name_lower, vers, &cksum, meta.as_ref())
                 })
                 .collect();
-            let body = lines.join("\n");
+            let body = bytes::Bytes::from(lines.join("\n"));
+            index_cache_set(index_cache, cache_key.to_string(), body.clone());
             return Some(Ok(index_response(
-                bytes::Bytes::from(body),
+                body,
                 Some("application/json".to_string()),
             )));
         }
@@ -939,6 +1065,7 @@ async fn try_virtual_index(
                 )
                 .await
                 {
+                    index_cache_set(index_cache, cache_key.to_string(), content.clone());
                     return Some(Ok(index_response(content, content_type)));
                 }
             }
@@ -958,8 +1085,42 @@ async fn serve_index(
     repo_key: &str,
     crate_name: &str,
 ) -> Result<Response, Response> {
-    let repo = resolve_cargo_repo(&state.db, repo_key).await?;
+    let repo = resolve_cargo_repo(&state.db, repo_key, &state.repo_cache).await?;
     let name_lower = crate_name.to_lowercase();
+
+    let cache_key = format!("{}:{}", repo_key, name_lower);
+
+    // Fast path: serve from in-process index cache (no storage I/O, no SHA-256).
+    if let Some(cached) = index_cache_get(&state.index_cache, &cache_key) {
+        return Ok(index_response(cached, Some("application/json".to_string())));
+    }
+
+    // Remote and virtual repos never have directly-published artifacts — publishes
+    // are rejected by reject_write_if_not_hosted.  Skip the artifacts DB query and
+    // go straight to the appropriate upstream/member lookup.
+    if repo.repo_type == "remote" {
+        return match try_remote_index(
+            state,
+            &repo,
+            repo_key,
+            &name_lower,
+            &state.index_cache,
+            &cache_key,
+        )
+        .await
+        {
+            Some(result) => result,
+            None => Err((StatusCode::NOT_FOUND, "Crate not found in index").into_response()),
+        };
+    }
+    if repo.repo_type == "virtual" {
+        return match try_virtual_index(state, &repo, &name_lower, &state.index_cache, &cache_key)
+            .await
+        {
+            Some(result) => result,
+            None => Err((StatusCode::NOT_FOUND, "Crate not found in index").into_response()),
+        };
+    }
 
     // Fetch all versions of this crate with their metadata
     let versions = sqlx::query!(
@@ -987,10 +1148,21 @@ async fn serve_index(
     })?;
 
     if versions.is_empty() {
-        if let Some(result) = try_remote_index(state, &repo, repo_key, &name_lower).await {
+        if let Some(result) = try_remote_index(
+            state,
+            &repo,
+            repo_key,
+            &name_lower,
+            &state.index_cache,
+            &cache_key,
+        )
+        .await
+        {
             return result;
         }
-        if let Some(result) = try_virtual_index(state, &repo, &name_lower).await {
+        if let Some(result) =
+            try_virtual_index(state, &repo, &name_lower, &state.index_cache, &cache_key).await
+        {
             return result;
         }
         return Err((StatusCode::NOT_FOUND, "Crate not found in index").into_response());
@@ -1005,8 +1177,8 @@ async fn serve_index(
         })
         .collect();
 
-    let body = lines.join("\n");
-
+    let body = bytes::Bytes::from(lines.join("\n"));
+    index_cache_set(&state.index_cache, cache_key, body.clone());
     Ok(index_response(body, Some("application/json".to_string())))
 }
 
@@ -1523,7 +1695,7 @@ mod tests {
             resp.headers().get(CONTENT_TYPE).unwrap(),
             "application/json"
         );
-        assert_eq!(resp.headers().get("cache-control").unwrap(), "max-age=60");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "max-age=300");
     }
 
     #[test]
@@ -1547,7 +1719,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(cache, "max-age=60");
+        assert_eq!(cache, "max-age=300");
     }
 
     // -----------------------------------------------------------------------
@@ -2022,5 +2194,230 @@ mod tests {
     fn test_invalid_credentials_error_json() {
         let error = serde_json::json!({"errors": [{"detail": "Invalid credentials"}]});
         assert_eq!(error["errors"][0]["detail"], "Invalid credentials");
+    }
+
+    // -----------------------------------------------------------------------
+    // index_cache_get / index_cache_set / index_cache_invalidate
+    // -----------------------------------------------------------------------
+
+    fn make_index_cache() -> IndexCache {
+        use std::sync::{Arc, RwLock};
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    #[test]
+    fn test_index_cache_get_empty_cache_returns_none() {
+        let cache = make_index_cache();
+        assert!(index_cache_get(&cache, "myrepo:serde").is_none());
+    }
+
+    #[test]
+    fn test_index_cache_get_unknown_key_returns_none() {
+        let cache = make_index_cache();
+        let data = Bytes::from_static(b"some index data");
+        index_cache_set(&cache, "myrepo:tokio".to_string(), data);
+        assert!(index_cache_get(&cache, "myrepo:serde").is_none());
+    }
+
+    #[test]
+    fn test_index_cache_set_and_get_roundtrip() {
+        let cache = make_index_cache();
+        let data = Bytes::from_static(b"{\"name\":\"serde\",\"vers\":\"1.0.0\"}");
+        index_cache_set(&cache, "myrepo:serde".to_string(), data.clone());
+        let result = index_cache_get(&cache, "myrepo:serde").expect("should be in cache");
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_index_cache_set_overwrites_existing_entry() {
+        let cache = make_index_cache();
+        let v1 = Bytes::from_static(b"version 1 data");
+        let v2 = Bytes::from_static(b"version 2 data");
+        index_cache_set(&cache, "repo:crate".to_string(), v1);
+        index_cache_set(&cache, "repo:crate".to_string(), v2.clone());
+        let result = index_cache_get(&cache, "repo:crate").expect("should be in cache");
+        assert_eq!(result, v2);
+    }
+
+    #[test]
+    fn test_index_cache_invalidate_removes_key() {
+        let cache = make_index_cache();
+        let data = Bytes::from_static(b"data");
+        index_cache_set(&cache, "repo:serde".to_string(), data);
+        assert!(index_cache_get(&cache, "repo:serde").is_some());
+        index_cache_invalidate(&cache, "repo:serde");
+        assert!(index_cache_get(&cache, "repo:serde").is_none());
+    }
+
+    #[test]
+    fn test_index_cache_invalidate_missing_key_is_noop() {
+        let cache = make_index_cache();
+        // Should not panic on a cache miss.
+        index_cache_invalidate(&cache, "repo:nonexistent");
+        assert!(index_cache_get(&cache, "repo:nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_index_cache_invalidate_leaves_other_keys_intact() {
+        let cache = make_index_cache();
+        index_cache_set(
+            &cache,
+            "repo:serde".to_string(),
+            Bytes::from_static(b"serde"),
+        );
+        index_cache_set(
+            &cache,
+            "repo:tokio".to_string(),
+            Bytes::from_static(b"tokio"),
+        );
+        index_cache_invalidate(&cache, "repo:serde");
+        assert!(index_cache_get(&cache, "repo:serde").is_none());
+        assert!(index_cache_get(&cache, "repo:tokio").is_some());
+    }
+
+    #[test]
+    fn test_index_cache_key_format() {
+        // The key is "{repo_key}:{crate_name_lowercase}".
+        let repo_key = "cargo-proxy";
+        let crate_name = "serde_json";
+        let key = format!("{}:{}", repo_key, crate_name.to_lowercase());
+        assert_eq!(key, "cargo-proxy:serde_json");
+    }
+
+    #[test]
+    fn test_index_cache_key_uses_lowercase_crate_name() {
+        // Verify that upper-case input is folded before building the key,
+        // matching what serve_index does with `crate_name.to_lowercase()`.
+        let cache = make_index_cache();
+        let data = Bytes::from_static(b"data");
+        let lower_key = "repo:serde".to_string();
+        index_cache_set(&cache, lower_key, data.clone());
+        // A lookup with the pre-lowercased key must hit.
+        assert!(index_cache_get(&cache, "repo:serde").is_some());
+        // A lookup with a mixed-case key does NOT hit (the caller is responsible
+        // for lowercasing before building the key).
+        assert!(index_cache_get(&cache, "repo:Serde").is_none());
+    }
+
+    #[test]
+    fn test_index_cache_set_lazy_eviction_preserves_fresh_entries() {
+        // After a set+get cycle the entry must still be retrievable: the
+        // lazy eviction in index_cache_set only removes *expired* entries,
+        // never fresh ones.
+        let cache = make_index_cache();
+        let data = Bytes::from_static(b"fresh");
+        index_cache_set(&cache, "repo:crate-a".to_string(), data.clone());
+        // Trigger eviction pass by setting another entry.
+        index_cache_set(&cache, "repo:crate-b".to_string(), Bytes::from_static(b"b"));
+        // The first entry must still be present.
+        assert_eq!(
+            index_cache_get(&cache, "repo:crate-a").expect("should still be cached"),
+            data
+        );
+    }
+
+    #[test]
+    fn test_index_cache_multiple_repos_isolated() {
+        // Entries for different repo keys must not collide.
+        let cache = make_index_cache();
+        let data_a = Bytes::from_static(b"repo-a data");
+        let data_b = Bytes::from_static(b"repo-b data");
+        index_cache_set(&cache, "repo-a:serde".to_string(), data_a.clone());
+        index_cache_set(&cache, "repo-b:serde".to_string(), data_b.clone());
+        assert_eq!(index_cache_get(&cache, "repo-a:serde").unwrap(), data_a);
+        assert_eq!(index_cache_get(&cache, "repo-b:serde").unwrap(), data_b);
+        index_cache_invalidate(&cache, "repo-a:serde");
+        assert!(index_cache_get(&cache, "repo-a:serde").is_none());
+        assert!(index_cache_get(&cache, "repo-b:serde").is_some());
+    }
+
+    #[test]
+    fn test_index_cache_ttl_matches_http_max_age() {
+        // INDEX_CACHE_TTL_SECS must equal the numeric value in the HTTP
+        // Cache-Control header that index_response() sets.  If someone changes
+        // one without the other, cargo clients will either hold stale data
+        // longer than the in-process cache, or re-request before the in-process
+        // cache has expired.
+        assert_eq!(INDEX_CACHE_TTL_SECS, 300);
+        let resp = index_response("", None);
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cache_control, &format!("max-age={}", INDEX_CACHE_TTL_SECS));
+    }
+
+    #[test]
+    fn test_index_cache_concurrent_access() {
+        // Arc<RwLock<HashMap>> must allow concurrent reads and writes from
+        // multiple threads without panicking or losing data.
+        use std::thread;
+        let cache = make_index_cache();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let c = cache.clone();
+                thread::spawn(move || {
+                    let key = format!("repo:crate-{}", i);
+                    let data = Bytes::from(format!("data-{}", i).into_bytes());
+                    index_cache_set(&c, key.clone(), data.clone());
+                    let result = index_cache_get(&c, &key);
+                    assert!(result.is_some());
+                    assert_eq!(result.unwrap(), data);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_virtual_repo_invalidation_pattern() {
+        // Simulates the multi-key invalidation that publish performs:
+        // invalidate the hosted repo's entry AND each virtual repo that
+        // aggregates it.
+        let cache = make_index_cache();
+        let crate_name = "serde";
+        let hosted_key = "hosted-repo";
+        let virtual_keys = ["virtual-a", "virtual-b"];
+
+        // Populate all keys (as if serve_index has warmed them).
+        index_cache_set(
+            &cache,
+            format!("{}:{}", hosted_key, crate_name),
+            Bytes::from_static(b"hosted-index"),
+        );
+        for vk in &virtual_keys {
+            index_cache_set(
+                &cache,
+                format!("{}:{}", vk, crate_name),
+                Bytes::from_static(b"virtual-index"),
+            );
+        }
+
+        // Invalidate (mirrors the publish handler).
+        index_cache_invalidate(&cache, &format!("{}:{}", hosted_key, crate_name));
+        for vk in &virtual_keys {
+            index_cache_invalidate(&cache, &format!("{}:{}", vk, crate_name));
+        }
+
+        // All three entries must be gone.
+        assert!(index_cache_get(&cache, &format!("{}:{}", hosted_key, crate_name)).is_none());
+        for vk in &virtual_keys {
+            assert!(index_cache_get(&cache, &format!("{}:{}", vk, crate_name)).is_none());
+        }
+    }
+
+    #[test]
+    fn test_index_cache_binary_content_round_trip() {
+        // The cache stores raw Bytes; arbitrary byte sequences (not just UTF-8
+        // JSON) must be returned unchanged.
+        let cache = make_index_cache();
+        let binary_data = Bytes::from(vec![0u8, 1, 2, 127, 128, 255, b'"', b'\n']);
+        index_cache_set(&cache, "repo:binary-crate".to_string(), binary_data.clone());
+        let result = index_cache_get(&cache, "repo:binary-crate").unwrap();
+        assert_eq!(result, binary_data);
     }
 }

@@ -2,12 +2,15 @@
 //!
 //! Handles user authentication, JWT token management, and password hashing.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
 
 use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -77,12 +80,22 @@ pub struct TokenPair {
     pub expires_in: u64,
 }
 
+/// How long a validated API token result is kept in the in-memory cache before
+/// the full DB + bcrypt verification is repeated.  Five minutes balances
+/// performance (cargo makes ~40 authenticated requests per build) against
+/// revocation latency (a revoked token remains valid at most this long).
+const API_TOKEN_CACHE_TTL_SECS: u64 = 300;
+
 /// Authentication service
 pub struct AuthService {
     db: PgPool,
     config: Arc<Config>,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
+    /// In-memory cache of recently validated API tokens.  Avoids repeating the
+    /// expensive bcrypt verification on every request (cargo sends credentials
+    /// on every index and download request).
+    token_cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>>,
 }
 
 impl AuthService {
@@ -94,6 +107,7 @@ impl AuthService {
             config,
             encoding_key: EncodingKey::from_secret(secret.as_bytes()),
             decoding_key: DecodingKey::from_secret(secret.as_bytes()),
+            token_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -266,6 +280,23 @@ impl AuthService {
 
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
+        // Hash the raw token before using it as cache key so plaintext tokens
+        // are never stored in memory.
+        let cache_key = format!("{:x}", Sha256::digest(token.as_bytes()));
+
+        // Check in-memory cache before the expensive bcrypt verification.
+        // Package managers like cargo send credentials on every request (index
+        // lookups, downloads, etc.), so without caching every request pays the
+        // full bcrypt cost (~100-500 ms), which compounds across the many
+        // parallel requests in a single build.
+        if let Ok(cache) = self.token_cache.read() {
+            if let Some((cached, cached_at)) = cache.get(&cache_key) {
+                if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
         // API tokens have format: prefix_secret
         // We store hash of full token and prefix for lookup
         let dummy = Self::dummy_bcrypt_hash();
@@ -386,11 +417,19 @@ impl AuthService {
             }
         };
 
-        Ok(ApiTokenValidation {
+        let validation = ApiTokenValidation {
             user,
             scopes: stored_token.scopes,
             allowed_repo_ids,
-        })
+        };
+
+        // Populate cache; evict stale entries on write to keep memory bounded.
+        if let Ok(mut cache) = self.token_cache.write() {
+            cache.retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
+            cache.insert(cache_key, (validation.clone(), Instant::now()));
+        }
+
+        Ok(validation)
     }
 
     /// Generate a new API token
@@ -1601,5 +1640,142 @@ mod tests {
             "Expected revocation error, got: {}",
             err
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // API token cache key hashing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_cache_key_is_sha256_hex() {
+        let token = "ak_12345678_secret_token_value";
+        let key = format!("{:x}", Sha256::digest(token.as_bytes()));
+        // SHA-256 hex output is always 64 characters
+        assert_eq!(key.len(), 64);
+        // Must be lowercase hex
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_token_cache_key_deterministic() {
+        let token = "ak_abcdefgh_my_token";
+        let k1 = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let k2 = format!("{:x}", Sha256::digest(token.as_bytes()));
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn test_token_cache_key_different_tokens_produce_different_keys() {
+        let k1 = format!("{:x}", Sha256::digest(b"ak_aaaaaaaa_token1"));
+        let k2 = format!("{:x}", Sha256::digest(b"ak_bbbbbbbb_token2"));
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_token_cache_key_does_not_contain_raw_token() {
+        let token = "ak_12345678_very_secret";
+        let key = format!("{:x}", Sha256::digest(token.as_bytes()));
+        assert!(!key.contains("ak_12345678"));
+        assert!(!key.contains("very_secret"));
+    }
+
+    #[test]
+    fn test_api_token_cache_ttl_constant() {
+        assert_eq!(API_TOKEN_CACHE_TTL_SECS, 300);
+    }
+
+    #[test]
+    fn test_token_cache_construction() {
+        // Verify the token_cache field can be constructed and used
+        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+            RwLock::new(HashMap::new());
+        assert!(cache.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_token_cache_insert_and_read() {
+        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+            RwLock::new(HashMap::new());
+        let key = format!("{:x}", Sha256::digest(b"ak_testtest_token"));
+        let validation = ApiTokenValidation {
+            user: User {
+                id: Uuid::nil(),
+                username: "testuser".to_string(),
+                email: "test@example.com".to_string(),
+                password_hash: None,
+                display_name: None,
+                auth_provider: AuthProvider::Local,
+                external_id: None,
+                is_admin: false,
+                is_active: true,
+                is_service_account: false,
+                must_change_password: false,
+                totp_secret: None,
+                totp_enabled: false,
+                totp_backup_codes: None,
+                totp_verified_at: None,
+                last_login_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            scopes: vec!["read:artifacts".to_string()],
+            allowed_repo_ids: None,
+        };
+        cache
+            .write()
+            .unwrap()
+            .insert(key.clone(), (validation.clone(), Instant::now()));
+
+        let guard = cache.read().unwrap();
+        let (cached, at) = guard.get(&key).unwrap();
+        assert_eq!(cached.user.username, "testuser");
+        assert!(at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
+    }
+
+    #[test]
+    fn test_token_cache_eviction() {
+        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+            RwLock::new(HashMap::new());
+        let key = format!("{:x}", Sha256::digest(b"ak_stalekey_token"));
+        let validation = ApiTokenValidation {
+            user: User {
+                id: Uuid::nil(),
+                username: "stale".to_string(),
+                email: "stale@example.com".to_string(),
+                password_hash: None,
+                display_name: None,
+                auth_provider: AuthProvider::Local,
+                external_id: None,
+                is_admin: false,
+                is_active: true,
+                is_service_account: false,
+                must_change_password: false,
+                totp_secret: None,
+                totp_enabled: false,
+                totp_backup_codes: None,
+                totp_verified_at: None,
+                last_login_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            scopes: vec![],
+            allowed_repo_ids: None,
+        };
+
+        // Insert with a backdated timestamp
+        let expired_at =
+            Instant::now() - std::time::Duration::from_secs(API_TOKEN_CACHE_TTL_SECS + 1);
+        cache
+            .write()
+            .unwrap()
+            .insert(key.clone(), (validation, expired_at));
+
+        // Evict stale entries
+        cache
+            .write()
+            .unwrap()
+            .retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
+
+        assert!(cache.read().unwrap().get(&key).is_none());
     }
 }

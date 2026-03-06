@@ -9,6 +9,7 @@
 //! - `X-API-Key: <api_token>` - API tokens via custom header
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::{Request, State},
@@ -22,6 +23,7 @@ use axum::{
 use base64::Engine;
 use uuid::Uuid;
 
+use crate::api::{CachedRepo, RepoCache, REPO_CACHE_TTL_SECS};
 use crate::error::AppError;
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
@@ -395,8 +397,15 @@ async fn try_resolve_auth(
             .ok(),
         ExtractedToken::Basic(encoded) => {
             let (username, password) = decode_basic_credentials(encoded)?;
-            let (user, _token_pair) = auth_service.authenticate(&username, &password).await.ok()?;
-            Some(AuthExtension::from(user))
+            // Try bcrypt username/password auth first
+            if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
+                return Some(AuthExtension::from(user));
+            }
+            // Fall back to treating the password as an API token — compatible with
+            // pip netrc / Artifactory-style `token:<api_token>` credential format
+            validate_api_token_with_scopes(auth_service, &password)
+                .await
+                .ok()
         }
         ExtractedToken::None | ExtractedToken::Invalid => None,
     }
@@ -485,6 +494,9 @@ pub async fn admin_middleware(
 pub struct RepoVisibilityState {
     pub auth_service: Arc<AuthService>,
     pub db: sqlx::PgPool,
+    /// Shared with `AppState::repo_cache` so format-handler resolvers can
+    /// reuse the repo metadata fetched here without a second DB round-trip.
+    pub repo_cache: RepoCache,
 }
 
 /// Extract the repository key from a format handler request path.
@@ -530,19 +542,68 @@ pub async fn repo_visibility_middleware(
         return next.run(request).await;
     }
 
-    // Look up whether this repo is public.
-    let is_public: Option<bool> =
-        sqlx::query_scalar("SELECT is_public FROM repositories WHERE key = $1")
+    // Check the shared repo cache first to avoid a DB round-trip on every
+    // request.  The cache is populated with full repo metadata so that
+    // format-handler resolvers (e.g. resolve_cargo_repo) can reuse it
+    // without issuing their own DB lookup.
+    let cached = vis_state.repo_cache.read().ok().and_then(|cache| {
+        cache.get(repo_key).and_then(|(entry, at)| {
+            if at.elapsed().as_secs() < REPO_CACHE_TTL_SECS {
+                Some(entry.clone())
+            } else {
+                None
+            }
+        })
+    });
+
+    let repo = match cached {
+        Some(r) => Some(r),
+        None => {
+            // Cache miss: fetch full repo metadata in one query so we can
+            // populate the cache for both this middleware and downstream
+            // handlers.  Uses sqlx::query() (not the macro) so no new entry
+            // in the sqlx offline-query cache is required.
+            use sqlx::Row;
+            let row = sqlx::query(
+                "SELECT id, format::text as format, repo_type::text as repo_type, \
+                 upstream_url, storage_path, is_public, \
+                 (SELECT value FROM repository_config \
+                  WHERE repository_id = repositories.id \
+                  AND key = 'index_upstream_url') AS index_upstream_url \
+                 FROM repositories WHERE key = $1",
+            )
             .bind(repo_key)
             .fetch_optional(&vis_state.db)
             .await
             .ok()
             .flatten();
 
+            row.map(|r| {
+                let entry = CachedRepo {
+                    id: r.get("id"),
+                    format: r.get("format"),
+                    repo_type: r.get("repo_type"),
+                    upstream_url: r.get("upstream_url"),
+                    storage_path: r.get("storage_path"),
+                    is_public: r.get("is_public"),
+                    index_upstream_url: r.get("index_upstream_url"),
+                };
+                // Populate the shared cache; evict stale entries on write.
+                if let Ok(mut cache) = vis_state.repo_cache.write() {
+                    cache.retain(|_, (_, at)| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
+                    cache.insert(repo_key.to_string(), (entry.clone(), Instant::now()));
+                }
+                entry
+            })
+        }
+    };
+
     // If no repo found for this key, let the handler return its own 404.
-    let Some(is_public) = is_public else {
+    let Some(repo) = repo else {
         return next.run(request).await;
     };
+
+    let is_public = repo.is_public;
 
     // Perform optional auth (shared with optional_auth_middleware).
     let extracted = extract_token(&request);
@@ -556,7 +617,20 @@ pub async fn repo_visibility_middleware(
         return next.run(request).await;
     }
 
-    (StatusCode::NOT_FOUND, "Not found").into_response()
+    // Return 401 with a WWW-Authenticate challenge so that package manager
+    // clients (cargo, pip, npm, etc.) that follow the challenge-response
+    // credential flow can retry with credentials.  Using 404 here breaks
+    // cargo's sparse-registry credential provider protocol, which only
+    // injects a Bearer token after receiving a 401.
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            "WWW-Authenticate",
+            "Bearer realm=\"artifact-keeper\", charset=\"UTF-8\"",
+        )
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from("Authentication required"))
+        .unwrap()
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ pub fn create_router(state: SharedState) -> Router {
     let vis_state = RepoVisibilityState {
         auth_service: vis_auth_service,
         db: state.db.clone(),
+        repo_cache: state.repo_cache.clone(),
     };
 
     // All native-protocol format handlers share the repo visibility
