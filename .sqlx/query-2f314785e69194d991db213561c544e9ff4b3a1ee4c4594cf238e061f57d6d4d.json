@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE repositories\n            SET\n                key = COALESCE($2, key),\n                name = COALESCE($3, name),\n                description = COALESCE($4, description),\n                is_public = COALESCE($5, is_public),\n                quota_bytes = COALESCE($6, quota_bytes),\n                upstream_url = COALESCE($7, upstream_url),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                created_at, updated_at\n            ",
+  "query": "\n            UPDATE repositories\n            SET\n                key = COALESCE($2, key),\n                name = COALESCE($3, name),\n                description = COALESCE($4, description),\n                is_public = COALESCE($5, is_public),\n                quota_bytes = COALESCE($6, quota_bytes),\n                upstream_url = COALESCE($7, upstream_url),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -159,11 +159,41 @@
       },
       {
         "ordinal": 14,
+        "name": "curation_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "curation_source_repo_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 16,
+        "name": "curation_target_repo_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 17,
+        "name": "curation_default_action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 18,
+        "name": "curation_sync_interval_secs",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 19,
+        "name": "curation_auto_fetch",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 20,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 15,
+        "ordinal": 21,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -195,8 +225,14 @@
       true,
       true,
       false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
       false
     ]
   },
-  "hash": "0026019d50481bf9a5174478422f825d85959de7427543821fcf5f0cec9b71b5"
+  "hash": "2f314785e69194d991db213561c544e9ff4b3a1ee4c4594cf238e061f57d6d4d"
 }
