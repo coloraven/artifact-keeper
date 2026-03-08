@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0-rc.7] - 2026-03-08
+
+### Thank You
+- @todpunk for the security advisory heads-up and a Cargo token performance fix (#378, #377)
+- @arp-mbender for reporting the broken quickstart commands (#368)
+- @dispalt for catching the staging repo filter issue and SNAPSHOT soft-delete collision (#363, #321)
+- @Lerentis for reporting the Maven path upload bug and the S3 IRSA panic (#361, #343)
+- @lpreiner for flagging private repository visibility leaking to unauthenticated users (#333)
+- @CJLove for continued follow-up on Docker login behind reverse proxies (#322)
+
+### Added
+- **Package curation engine** (#405) - intercept packages from upstream mirrors through staging repos, evaluate against configurable rules (glob patterns, version constraints, architecture filters), and approve or block before exposing to consumers. Includes rules CRUD, bulk operations, re-evaluation, and stats API endpoints.
+- **Curation upstream sync** (#405) - background scheduler fetches and parses RPM primary.xml and DEB Packages indexes from remote repos, populating the curation catalog automatically.
+- **Artifact content viewing endpoint** (#407) - `GET /api/v1/tree/content` returns inline file content for browsing artifacts in the web UI.
+- **Automatic stale peer detection** (#402) - scheduler marks peers as stale when heartbeats stop, preventing sync attempts to unreachable nodes.
+- **Failed sync retry on peer recovery** (#401) - automatically retries previously failed sync tasks when a peer comes back online.
+- **Shared virtual metadata resolution** (#399) - extracted reusable helpers for resolving metadata across virtual repository members, reducing duplication in format handlers.
+- **Build traceability** (#367) - `/health` endpoint now includes the git commit SHA for identifying deployed versions.
+
+### Fixed
+- **Path traversal in FilesystemStorage** (#387, #380) - sanitize storage keys to prevent directory traversal attacks via crafted artifact paths.
+- **Peer identity endpoint exposed to non-admins** (#388, #381, #382) - restrict peer announce, heartbeat, and identity endpoints to admin users only.
+- **gRPC missing admin authorization** (#390, #383) - add admin privilege checks to the gRPC auth interceptor.
+- **Admin password file permissions** (#391, #384) - create password file with mode 0600 instead of world-readable.
+- **Timing side-channel in token validation** (#392, #385) - use constant-time comparison for API token prefix lookup.
+- **Authentication audit logging** (#393, #386) - wire up audit log entries for login, logout, and token operations.
+- **Quickstart commands in README** (#394, #368) - fix incorrect docker compose commands in the getting started guide.
+- **Air-gapped deployment issues** (#379) - fix offline installation and configuration for disconnected environments.
+- **Cargo sparse index proxy path** (#342, #341) - strip `index/` prefix when proxying to upstream Cargo registries.
+- **Soft-deleted artifact collision on re-upload** (#339, #321) - clean up soft-deleted records before INSERT to prevent unique constraint violations.
+- **Maven version-level metadata** (#362, #361) - serve maven-metadata.xml from storage at the version path level.
+- **Staging repo filter** (#364, #363) - accept `repo_type` query alias for filtering staging repositories.
+- **Repository format enum casting** (#376) - cast `repository_format` enum to text in quality check queries to prevent type mismatch errors.
+- **S3 IRSA TLS panic** (#348, #343) - install rustls CryptoProvider before S3 client initialization to prevent panics with IAM Roles for Service Accounts.
+- **Fork PR SonarCloud gate** (#396) - detect fork PRs correctly in the quality gate workflow.
+- **E2E PKI container cleanup** (#400) - kill lingering gpg-agent processes before cleanup to prevent non-zero exit codes.
+- **Cargo token auth performance** (#377) - contributed by @todpunk.
+
+### Tests
+- Curation E2E test suite (#406) - 33 assertions across 13 phases covering sync, rules, manual/bulk status, stats, CRUD, global rules, and DEB format. Uses mock upstream repos (nginx serving RPM/DEB fixture files).
+
+### Changed
+- Trivy CI scanner bumped from 0.69.1 to 0.69.3 (#404)
+- ALLOW_HTTP_INTEGRATIONS added to compose backend environment (#397)
+- CI mirror namespace switched to GHCR for fork PR E2E parity (#366)
+- Dependency bumps: actions/checkout 4 to 6, actions/upload-artifact 6 to 7, actions/download-artifact 4 to 8, github/codeql-action 3 to 4, alpine 3.21 to 3.23, trivy-action 0.34.1 to 0.34.2
+
 ## [1.1.0-rc.6] - 2026-02-28
 
 ### Thank You
