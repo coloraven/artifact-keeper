@@ -200,6 +200,7 @@ pub struct StatsQuery {
 #[utoipa::path(
     get,
     path = "/api/v1/curation/rules",
+    operation_id = "list_curation_rules",
     params(("staging_repo_id" = Option<Uuid>, Query, description = "Filter by staging repo")),
     responses((status = 200, body = Vec<RuleResponse>)),
     tag = "Curation"
@@ -217,6 +218,7 @@ async fn list_rules(
 #[utoipa::path(
     post,
     path = "/api/v1/curation/rules",
+    operation_id = "create_curation_rule",
     request_body = CreateRuleRequest,
     responses((status = 201, body = RuleResponse)),
     tag = "Curation"
@@ -245,6 +247,7 @@ async fn create_rule(
 #[utoipa::path(
     put,
     path = "/api/v1/curation/rules/{id}",
+    operation_id = "update_curation_rule",
     request_body = UpdateRuleRequest,
     params(("id" = Uuid, Path, description = "Rule ID")),
     responses((status = 200, body = RuleResponse)),
@@ -274,6 +277,7 @@ async fn update_rule(
 #[utoipa::path(
     delete,
     path = "/api/v1/curation/rules/{id}",
+    operation_id = "delete_curation_rule",
     params(("id" = Uuid, Path, description = "Rule ID")),
     responses((status = 204)),
     tag = "Curation"
@@ -290,6 +294,7 @@ async fn delete_rule(
 #[utoipa::path(
     get,
     path = "/api/v1/curation/packages",
+    operation_id = "list_curation_packages",
     params(PackageListQuery),
     responses((status = 200, body = Vec<PackageResponse>)),
     tag = "Curation"
@@ -313,6 +318,7 @@ async fn list_packages(
 #[utoipa::path(
     get,
     path = "/api/v1/curation/packages/{id}",
+    operation_id = "get_curation_package",
     params(("id" = Uuid, Path, description = "Package ID")),
     responses((status = 200, body = PackageResponse)),
     tag = "Curation"

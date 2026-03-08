@@ -616,6 +616,7 @@ pub struct ReindexResponse {
     path = "/reindex",
     context_path = "/api/v1/admin/search",
     tag = "admin",
+    operation_id = "trigger_search_reindex",
     responses(
         (status = 200, description = "Reindex started in background", body = ReindexResponse),
         (status = 500, description = "Meilisearch is not configured"),
