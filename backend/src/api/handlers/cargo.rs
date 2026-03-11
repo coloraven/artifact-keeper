@@ -900,8 +900,27 @@ fn extract_index_fields(
         );
     };
 
+    // Cargo publish API sends "version_req" but the sparse index format
+    // requires "req".  Rename on the fly so clients can parse the index.
+    // See https://doc.rust-lang.org/cargo/reference/registry-index.html
+    let deps = match meta.get("deps").cloned().unwrap_or(serde_json::json!([])) {
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(|mut dep| {
+                    if let serde_json::Value::Object(ref mut map) = dep {
+                        if let Some(vr) = map.remove("version_req") {
+                            map.entry("req").or_insert(vr);
+                        }
+                    }
+                    dep
+                })
+                .collect(),
+        ),
+        other => other,
+    };
+
     (
-        meta.get("deps").cloned().unwrap_or(serde_json::json!([])),
+        deps,
         meta.get("features")
             .cloned()
             .unwrap_or(serde_json::json!({})),
@@ -1686,6 +1705,28 @@ mod tests {
         let entry_str = build_index_entry("crate", "1.0.0", "cksum", Some(&meta));
         let entry: serde_json::Value = serde_json::from_str(&entry_str).unwrap();
         assert_eq!(entry["yanked"], false);
+    }
+
+    #[test]
+    fn test_build_index_entry_normalises_dep_version_req_field() {
+        // Cargo publish sends "version_req" but the sparse index requires "req".
+        // If metadata already uses "req" (e.g. proxied index), it passes through.
+        // See https://doc.rust-lang.org/cargo/reference/registry-index.html
+        let cases: &[(&str, &str)] = &[("version_req", "^1.0"), ("req", "^0.4")];
+        for &(field, ver) in cases {
+            let meta = serde_json::json!({
+                "deps": [{ "name": "dep", field: ver, "kind": "normal" }],
+                "features": {}
+            });
+            let entry_str = build_index_entry("test-crate", "0.1.0", "aaa", Some(&meta));
+            let entry: serde_json::Value = serde_json::from_str(&entry_str).unwrap();
+            let dep = &entry["deps"][0];
+            assert_eq!(dep["req"], ver, "field '{field}' should produce req={ver}");
+            assert!(
+                dep.get("version_req").is_none(),
+                "version_req must be absent for '{field}'"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
