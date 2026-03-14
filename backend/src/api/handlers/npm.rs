@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
@@ -58,48 +58,9 @@ use crate::api::middleware::auth::require_auth_with_bearer_fallback;
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        r#"SELECT id, storage_path, format::text as "format!", repo_type::text as "repo_type!", upstream_url
-        FROM repositories WHERE key = $1"#,
-        repo_key
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-
-    let fmt = repo.format.to_lowercase();
-    if fmt != "npm" && fmt != "yarn" && fmt != "pnpm" && fmt != "bower" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not an npm repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
-    }
-
-    Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
-    })
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["npm", "yarn", "pnpm", "bower"], "an npm")
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -413,17 +374,13 @@ async fn serve_tarball(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let fname = fname.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path_suffix(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &fname,
+                                &db, &state, member_id, &location, &fname,
                             )
                             .await
                         }
@@ -450,7 +407,9 @@ async fn serve_tarball(
     };
 
     // Read from storage
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -634,7 +593,7 @@ async fn store_npm_version(
     state: &SharedState,
     repo_id: uuid::Uuid,
     repo_key: &str,
-    storage_path: &str,
+    location: &crate::storage::StorageLocation,
     package_name: &str,
     user_id: uuid::Uuid,
     ver: &NpmVersionToPublish,
@@ -672,7 +631,7 @@ async fn store_npm_version(
         "npm/{}/{}/{}",
         package_name, ver.version, ver.tarball_filename
     );
-    let storage = state.storage_for_repo(storage_path);
+    let storage = state.storage_for_repo_or_500(location)?;
     storage
         .put(&storage_key, Bytes::from(ver.tarball_bytes.clone()))
         .await
@@ -781,7 +740,7 @@ async fn publish_package(
             state,
             repo.id,
             repo_key,
-            &repo.storage_path,
+            &repo.storage_location(),
             package_name,
             user_id,
             ver,
@@ -1108,7 +1067,9 @@ mod tests {
     fn test_repo_info_construction() {
         let info = RepoInfo {
             id: uuid::Uuid::new_v4(),
+            key: String::new(),
             storage_path: "/data/npm".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
         };

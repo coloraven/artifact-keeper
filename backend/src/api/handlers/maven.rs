@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::maven::{generate_metadata_xml, MavenCoordinates, MavenHandler};
@@ -40,48 +40,8 @@ pub fn router() -> Router<SharedState> {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        r#"SELECT id, storage_path, format::text as "format!", repo_type::text as "repo_type!", upstream_url
-        FROM repositories WHERE key = $1"#,
-        repo_key
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-
-    let fmt = repo.format.to_lowercase();
-    if fmt != "maven" && fmt != "gradle" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not a Maven repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
-    }
-
-    Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
-    })
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["maven", "gradle"], "a Maven").await
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +213,9 @@ async fn download(
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
 
     // 1. Check if this is a checksum request for metadata
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
@@ -355,7 +317,7 @@ async fn download(
         return serve_computed_checksum(
             &state,
             repo.id,
-            &repo.storage_path,
+            &repo.storage_location(),
             base_path,
             checksum_type,
         )
@@ -444,7 +406,9 @@ async fn serve_artifact(
         Some(a) => Some(a),
         None if path.contains("-SNAPSHOT") => {
             if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, path).await {
-                let storage = state.storage_for_repo(&repo.storage_path);
+                let storage = state
+                    .storage_for_repo(&repo.storage_location())
+                    .map_err(|e| e.into_response())?;
                 let content = storage.get(&resolved.storage_key).await.map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -499,7 +463,7 @@ async fn serve_artifact(
                     state.proxy_service.as_deref(),
                     repo.id,
                     path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let artifact_path = artifact_path.clone();
@@ -508,7 +472,7 @@ async fn serve_artifact(
                                 &db,
                                 &state,
                                 member_id,
-                                &storage_path,
+                                &location,
                                 &artifact_path,
                             )
                             .await
@@ -533,7 +497,9 @@ async fn serve_artifact(
             // database `path` was replaced but the file still exists in storage.
             if repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging
             {
-                let storage = state.storage_for_repo(&repo.storage_path);
+                let storage = state
+                    .storage_for_repo(&repo.storage_location())
+                    .map_err(|e| e.into_response())?;
                 let storage_key = format!("maven/{}", path);
                 if let Ok(content) = storage.get(&storage_key).await {
                     let ct = content_type_for_path(path);
@@ -550,7 +516,9 @@ async fn serve_artifact(
         }
     };
 
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -581,7 +549,7 @@ async fn serve_artifact(
 async fn serve_computed_checksum(
     state: &SharedState,
     repo_id: uuid::Uuid,
-    storage_path: &str,
+    location: &crate::storage::StorageLocation,
     base_path: &str,
     checksum_type: ChecksumType,
 ) -> Result<Response, Response> {
@@ -627,7 +595,7 @@ async fn serve_computed_checksum(
     let checksum = match checksum_type {
         ChecksumType::Sha256 => resolved_sha256,
         _ => {
-            let storage = state.storage_for_repo(storage_path);
+            let storage = state.storage_for_repo_or_500(location)?;
             let content = storage.get(&resolved_storage_key).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -734,7 +702,9 @@ async fn upload(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let storage_key = format!("maven/{}", path);
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
 
     // If this is a checksum file (.sha1, .md5, .sha256), just store it and return
     if parse_checksum_path(&path).is_some() {
@@ -1415,7 +1385,9 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let repo = RepoInfo {
             id,
+            key: String::new(),
             storage_path: "/data/maven".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
         };
@@ -1427,7 +1399,9 @@ mod tests {
     fn test_repo_info_remote() {
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
+            key: String::new(),
             storage_path: "/cache/maven".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
         };

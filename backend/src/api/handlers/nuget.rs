@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
@@ -67,47 +67,14 @@ pub fn router() -> Router<SharedState> {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_nuget_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        "SELECT id, storage_path, format::text as \"format!\", repo_type::text as \"repo_type!\", upstream_url FROM repositories WHERE key = $1",
-        repo_key
+    proxy_helpers::resolve_repo_by_key(
+        db,
+        repo_key,
+        &["nuget", "chocolatey", "powershell"],
+        "a NuGet",
     )
-    .fetch_optional(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-
-    let fmt = repo.format.to_lowercase();
-    if fmt != "nuget" && fmt != "chocolatey" && fmt != "powershell" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not a NuGet repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
-    }
-
-    Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -563,19 +530,14 @@ async fn flatcontainer_download(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let vname = vname.clone();
                         let vversion = vversion.clone();
                         async move {
                             proxy_helpers::local_fetch_by_name_version(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &vname,
-                                &vversion,
+                                &db, &state, member_id, &location, &vname, &vversion,
                             )
                             .await
                         }
@@ -602,7 +564,9 @@ async fn flatcontainer_download(
     };
 
     // Read from storage.
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -735,7 +699,9 @@ async fn push_package(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file.
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     storage.put(&storage_key, nupkg_bytes).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1379,7 +1345,9 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let info = RepoInfo {
             id,
+            key: String::new(),
             storage_path: "/data/nuget".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
         };

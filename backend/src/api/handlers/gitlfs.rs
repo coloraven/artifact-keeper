@@ -16,7 +16,7 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{post, put};
 use axum::Extension;
 use axum::Router;
@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
@@ -188,19 +188,13 @@ struct UnlockResponse {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        r#"SELECT id, storage_path, format::text as "format!", repo_type::text as "repo_type!", upstream_url
-        FROM repositories WHERE key = $1"#,
-        repo_key
+    use sqlx::Row;
+    let repo = sqlx::query(
+        "SELECT id, key, storage_backend, storage_path, format::text as format, \
+         repo_type::text as repo_type, upstream_url FROM repositories WHERE key = $1",
     )
+    .bind(repo_key)
     .fetch_optional(db)
     .await
     .map_err(|e| {
@@ -211,7 +205,8 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
     })?
     .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Repository not found"))?;
 
-    let fmt = repo.format.to_lowercase();
+    let fmt: String = repo.try_get("format").unwrap_or_default();
+    let fmt = fmt.to_lowercase();
     if fmt != "gitlfs" {
         return Err(lfs_error_response(
             StatusCode::BAD_REQUEST,
@@ -223,10 +218,12 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
     }
 
     Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
+        id: repo.try_get("id").unwrap_or_default(),
+        key: repo.try_get("key").unwrap_or_default(),
+        storage_path: repo.try_get("storage_path").unwrap_or_default(),
+        storage_backend: repo.try_get("storage_backend").unwrap_or_default(),
+        repo_type: repo.try_get("repo_type").unwrap_or_default(),
+        upstream_url: repo.try_get("upstream_url").ok(),
     })
 }
 
@@ -498,7 +495,9 @@ async fn upload_object(
 
     // Store the object
     let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     storage.put(&storage_key, body.clone()).await.map_err(|e| {
         lfs_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -628,17 +627,13 @@ async fn download_object(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let path = path_clone.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &path,
+                                &db, &state, member_id, &location, &path,
                             )
                             .await
                         }
@@ -664,7 +659,9 @@ async fn download_object(
         }
     };
 
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         lfs_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1455,7 +1452,9 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let info = RepoInfo {
             id,
+            key: String::new(),
             storage_path: "/data/lfs".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
         };

@@ -42,7 +42,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::conda_native::CondaNativeHandler;
@@ -879,44 +879,8 @@ pub fn token_router() -> Router<SharedState> {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_conda_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        "SELECT id, storage_path, format::text as \"format!\", repo_type::text as \"repo_type!\", upstream_url FROM repositories WHERE key = $1",
-        repo_key
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        tracing::error!("Database error resolving conda repo '{}': {}", repo_key, e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-
-    let fmt = repo.format.to_lowercase();
-    if fmt != "conda" && fmt != "conda_native" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not a Conda repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
-    }
-
-    Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
-    })
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["conda", "conda_native"], "a Conda").await
 }
 
 /// Check that the caller has read access to a repository.
@@ -2415,17 +2379,13 @@ async fn download_package(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let path = artifact_path_clone.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &path,
+                                &db, &state, member_id, &location, &path,
                             )
                             .await
                         }
@@ -2460,7 +2420,9 @@ async fn download_package(
     };
 
     // Read from storage
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         tracing::error!("Storage error reading conda package: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
@@ -3097,7 +3059,9 @@ async fn store_conda_package(
 
     // Store the file
     let storage_key = format!("conda/{}/{}/{}", repo.id, subdir, filename);
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     storage
         .put(&storage_key, content.clone())
         .await

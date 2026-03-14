@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::ansible::AnsibleHandler;
@@ -59,48 +59,8 @@ pub fn router() -> Router<SharedState> {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_ansible_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        r#"SELECT id, storage_path, format::text as "format!", repo_type::text as "repo_type!", upstream_url
-        FROM repositories WHERE key = $1"#,
-        repo_key
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-
-    let fmt = repo.format.to_lowercase();
-    if fmt != "ansible" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not an Ansible repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
-    }
-
-    Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
-    })
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["ansible"], "an Ansible").await
 }
 
 // ---------------------------------------------------------------------------
@@ -485,17 +445,13 @@ async fn download_collection(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let vfilename = vfilename.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path_suffix(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &vfilename,
+                                &db, &state, member_id, &location, &vfilename,
                             )
                             .await
                         }
@@ -517,7 +473,9 @@ async fn download_collection(
         }
     };
 
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -684,7 +642,9 @@ async fn upload_collection(
 
     // Store the file
     let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     storage
         .put(&storage_key, tarball.clone())
         .await
@@ -788,7 +748,9 @@ mod tests {
     fn test_repo_info_struct() {
         let info = RepoInfo {
             id: uuid::Uuid::nil(),
+            key: String::new(),
             storage_path: "/tmp/test".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: Some("https://example.com".to_string()),
         };

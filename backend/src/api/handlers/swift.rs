@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::swift::SwiftHandler;
@@ -51,48 +51,8 @@ pub fn router() -> Router<SharedState> {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_swift_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        r#"SELECT id, storage_path, format::text as "format!", repo_type::text as "repo_type!", upstream_url
-        FROM repositories WHERE key = $1"#,
-        repo_key
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-
-    let fmt = repo.format.to_lowercase();
-    if fmt != "swift" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not a Swift repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
-    }
-
-    Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
-    })
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["swift"], "a Swift").await
 }
 
 // ---------------------------------------------------------------------------
@@ -362,19 +322,14 @@ async fn download_archive(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let name = name_clone.clone();
                         let version = version_clone.clone();
                         async move {
                             proxy_helpers::local_fetch_by_name_version(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &name,
-                                &version,
+                                &db, &state, member_id, &location, &name, &version,
                             )
                             .await
                         }
@@ -400,7 +355,9 @@ async fn download_archive(
         }
     };
 
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         swift_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -574,7 +531,9 @@ async fn publish_release(
 
     // Store the file
     let storage_key = format!("swift/{}/{}/{}/{}.zip", scope, name, version, name);
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     storage.put(&storage_key, body.clone()).await.map_err(|e| {
         swift_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -874,7 +833,9 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let repo = RepoInfo {
             id,
+            key: String::new(),
             storage_path: "/data/swift-repo".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
         };
@@ -888,7 +849,9 @@ mod tests {
     fn test_repo_info_remote() {
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
+            key: String::new(),
             storage_path: "/data/cache".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://swift-packages.example.com".to_string()),
         };

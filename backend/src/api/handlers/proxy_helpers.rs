@@ -12,6 +12,103 @@ use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
 use crate::services::proxy_service::ProxyService;
+use crate::storage::StorageLocation;
+
+// ---------------------------------------------------------------------------
+// Shared RepoInfo
+// ---------------------------------------------------------------------------
+
+/// Lightweight repository descriptor returned by [`resolve_repo_by_key`].
+///
+/// Every format handler needs the same handful of fields after looking up a
+/// repository by its key. This struct avoids duplicating the definition in
+/// each handler module.
+pub struct RepoInfo {
+    pub id: Uuid,
+    pub key: String,
+    pub storage_path: String,
+    pub storage_backend: String,
+    pub repo_type: String,
+    pub upstream_url: Option<String>,
+}
+
+impl RepoInfo {
+    pub fn storage_location(&self) -> StorageLocation {
+        StorageLocation {
+            backend: self.storage_backend.clone(),
+            path: self.storage_path.clone(),
+        }
+    }
+}
+
+/// Look up a repository by key and verify that its format matches one of the
+/// `expected_formats` (compared case-insensitively).
+///
+/// `format_label` is used only in the error message when the format does not
+/// match (e.g. "an Alpine", "a Maven", "an npm").
+///
+/// Returns a [`RepoInfo`] on success or a plain-text error [`Response`].
+#[allow(clippy::result_large_err)]
+pub async fn resolve_repo_by_key(
+    db: &PgPool,
+    repo_key: &str,
+    expected_formats: &[&str],
+    format_label: &str,
+) -> Result<RepoInfo, Response> {
+    use sqlx::Row;
+    let repo = sqlx::query(
+        "SELECT id, key, storage_backend, storage_path, format::text as format, \
+         repo_type::text as repo_type, upstream_url \
+         FROM repositories WHERE key = $1",
+    )
+    .bind(repo_key)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
+
+    let fmt: String = repo.try_get("format").unwrap_or_default();
+    let fmt_lower = fmt.to_lowercase();
+    if !expected_formats.iter().any(|f| *f == fmt_lower) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Repository '{}' is not {} repository (format: {})",
+                repo_key, format_label, fmt
+            ),
+        )
+            .into_response());
+    }
+
+    Ok(RepoInfo {
+        id: repo.try_get("id").unwrap_or_default(),
+        key: repo.try_get("key").unwrap_or_default(),
+        storage_path: repo.try_get("storage_path").unwrap_or_default(),
+        storage_backend: repo.try_get("storage_backend").unwrap_or_default(),
+        repo_type: repo.try_get("repo_type").unwrap_or_default(),
+        upstream_url: repo.try_get("upstream_url").ok(),
+    })
+}
+
+/// Map an error to a 500 Internal Server Error plain-text response.
+///
+/// The `label` is prepended to the error message (e.g. "Storage", "Database").
+/// This avoids repeating the five-line `(StatusCode::INTERNAL_SERVER_ERROR,
+/// format!("... error: {}", e)).into_response()` block throughout the
+/// local_fetch helpers.
+fn internal_error(label: &str, e: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{} error: {}", label, e),
+    )
+        .into_response()
+}
 
 /// Reject write operations (publish/upload) on remote and virtual repositories.
 /// Returns 405 Method Not Allowed for remote repos, 400 for virtual repos.
@@ -79,7 +176,7 @@ pub async fn resolve_virtual_download<F, Fut>(
     local_fetch: F,
 ) -> Result<(Bytes, Option<String>), Response>
 where
-    F: Fn(Uuid, String) -> Fut,
+    F: Fn(Uuid, StorageLocation) -> Fut,
     Fut: std::future::Future<Output = Result<(Bytes, Option<String>), Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
@@ -90,7 +187,7 @@ where
 
     for member in &members {
         // Try local storage first (works for Local, Staging, and cached Remote)
-        if let Ok(result) = local_fetch(member.id, member.storage_path.clone()).await {
+        if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
             return Ok(result);
         }
 
@@ -283,7 +380,7 @@ pub async fn local_fetch_by_path(
     db: &PgPool,
     state: &AppState,
     repo_id: Uuid,
-    storage_path: &str,
+    location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
     let artifact = sqlx::query!(
@@ -296,23 +393,14 @@ pub async fn local_fetch_by_path(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    let storage = state.storage_for_repo(storage_path);
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let storage = state.storage_for_repo_or_500(location)?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
 
     Ok((content, Some(artifact.content_type)))
 }
@@ -323,7 +411,7 @@ pub async fn local_fetch_by_name_version(
     db: &PgPool,
     state: &AppState,
     repo_id: Uuid,
-    storage_path: &str,
+    location: &StorageLocation,
     name: &str,
     version: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
@@ -338,23 +426,14 @@ pub async fn local_fetch_by_name_version(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    let storage = state.storage_for_repo(storage_path);
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let storage = state.storage_for_repo_or_500(location)?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
 
     Ok((content, Some(artifact.content_type)))
 }
@@ -365,7 +444,7 @@ pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
     state: &AppState,
     repo_id: Uuid,
-    storage_path: &str,
+    location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
     let artifact = sqlx::query!(
@@ -378,23 +457,14 @@ pub async fn local_fetch_by_path_suffix(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    let storage = state.storage_for_repo(storage_path);
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let storage = state.storage_for_repo_or_500(location)?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
 
     Ok((content, Some(artifact.content_type)))
 }
@@ -541,5 +611,19 @@ mod tests {
     fn test_reject_write_unknown_type_is_ok() {
         let result = reject_write_if_not_hosted("something-else");
         assert!(result.is_ok());
+    }
+
+    // ── internal_error tests ────────────────────────────────────────
+
+    #[test]
+    fn test_internal_error_returns_500() {
+        let response = internal_error("Storage", "disk full");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_internal_error_database_label() {
+        let response = internal_error("Database", "connection refused");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

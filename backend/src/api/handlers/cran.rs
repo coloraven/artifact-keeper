@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::cran::CranHandler;
@@ -63,48 +63,8 @@ pub fn router() -> Router<SharedState> {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_cran_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        r#"SELECT id, storage_path, format::text as "format!", repo_type::text as "repo_type!", upstream_url
-        FROM repositories WHERE key = $1"#,
-        repo_key
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-
-    let fmt = repo.format.to_lowercase();
-    if fmt != "cran" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not a CRAN repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
-    }
-
-    Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
-    })
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["cran"], "a CRAN").await
 }
 
 /// Build a combined PACKAGES index from all virtual repository members.
@@ -299,17 +259,13 @@ async fn download_package(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let vfilename = vfilename.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path_suffix(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &vfilename,
+                                &db, &state, member_id, &location, &vfilename,
                             )
                             .await
                         }
@@ -331,7 +287,9 @@ async fn download_package(
         }
     };
 
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -480,7 +438,9 @@ async fn upload_package(
 
     // Store the file
     let storage_key = format!("cran/{}/{}/{}", pkg_name, pkg_version, filename);
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     storage.put(&storage_key, body.clone()).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -700,7 +660,9 @@ mod tests {
     fn test_repo_info_construction() {
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
+            key: String::new(),
             storage_path: "/data/cran-local".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
         };
@@ -713,7 +675,9 @@ mod tests {
     fn test_repo_info_remote() {
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
+            key: String::new(),
             storage_path: "/data/cran-remote".to_string(),
+            storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://cloud.r-project.org".to_string()),
         };

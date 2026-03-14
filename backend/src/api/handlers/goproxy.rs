@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
@@ -162,49 +162,8 @@ use crate::api::middleware::auth::require_auth_with_bearer_fallback;
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-struct RepoInfo {
-    id: uuid::Uuid,
-    key: String,
-    storage_path: String,
-    repo_type: String,
-    upstream_url: Option<String>,
-}
-
 async fn resolve_go_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    let repo = sqlx::query!(
-        "SELECT id, key, storage_path, format::text as \"format!\", repo_type::text as \"repo_type!\", upstream_url FROM repositories WHERE key = $1",
-        repo_key
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-
-    let fmt = repo.format.to_lowercase();
-    if fmt != "go" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not a Go repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
-    }
-
-    Ok(RepoInfo {
-        id: repo.id,
-        key: repo.key,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
-    })
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["go"], "a Go").await
 }
 
 // ---------------------------------------------------------------------------
@@ -449,19 +408,14 @@ async fn get_mod_file(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let name = module_clone.clone();
                         let ver = version_clone.clone();
                         async move {
                             proxy_helpers::local_fetch_by_name_version(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &name,
-                                &ver,
+                                &db, &state, member_id, &location, &name, &ver,
                             )
                             .await
                         }
@@ -484,7 +438,9 @@ async fn get_mod_file(
         }
     };
 
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -591,19 +547,14 @@ async fn download_zip(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
-                    |member_id, storage_path| {
+                    |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
                         let name = module_clone.clone();
                         let ver = version_clone.clone();
                         async move {
                             proxy_helpers::local_fetch_by_name_version(
-                                &db,
-                                &state,
-                                member_id,
-                                &storage_path,
-                                &name,
-                                &ver,
+                                &db, &state, member_id, &location, &name, &ver,
                             )
                             .await
                         }
@@ -626,7 +577,9 @@ async fn download_zip(
         }
     };
 
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -765,7 +718,9 @@ async fn upload_zip(
     let storage_key = format!("go/{}/{}/{}.zip", encoded_module, version, version);
 
     // Store the file
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     storage.put(&storage_key, body).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -890,7 +845,9 @@ async fn upload_mod(
     let storage_key = format!("go/{}/{}/go.mod", encoded_module, version);
 
     // Store the file
-    let storage = state.storage_for_repo(&repo.storage_path);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     storage.put(&storage_key, body).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
