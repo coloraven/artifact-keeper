@@ -39,6 +39,10 @@ pub struct LdapConfig {
     pub admin_group_dn: Option<String>,
     /// Use STARTTLS
     pub use_starttls: bool,
+    /// Path to a PEM file with custom CA certificates for LDAPS/STARTTLS
+    pub ca_cert_path: Option<String>,
+    /// Skip TLS certificate verification (development only)
+    pub no_tls_verify: bool,
 }
 
 redacted_debug!(LdapConfig {
@@ -53,13 +57,30 @@ redacted_debug!(LdapConfig {
     show groups_attr,
     show admin_group_dn,
     show use_starttls,
+    show ca_cert_path,
+    show no_tls_verify,
 });
 
 impl LdapConfig {
+    /// Read TLS-related settings from environment variables.
+    ///
+    /// `LDAP_CA_CERT_PATH` takes priority, falling back to the shared
+    /// `CUSTOM_CA_CERT_PATH`. `LDAP_INSECURE_TLS=true` skips verification.
+    fn tls_from_env() -> (Option<String>, bool) {
+        let ca_cert_path = std::env::var("LDAP_CA_CERT_PATH")
+            .ok()
+            .or_else(|| std::env::var("CUSTOM_CA_CERT_PATH").ok());
+        let no_tls_verify = std::env::var("LDAP_INSECURE_TLS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        (ca_cert_path, no_tls_verify)
+    }
+
     /// Create LDAP config from application config
     pub fn from_config(config: &Config) -> Option<Self> {
         let url = config.ldap_url.clone()?;
         let base_dn = config.ldap_base_dn.clone()?;
+        let (ca_cert_path, no_tls_verify) = Self::tls_from_env();
 
         Some(Self {
             url,
@@ -79,6 +100,8 @@ impl LdapConfig {
             use_starttls: std::env::var("LDAP_USE_STARTTLS")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            ca_cert_path,
+            no_tls_verify,
         })
     }
 }
@@ -141,6 +164,7 @@ impl LdapService {
         admin_group_dn: Option<&str>,
         use_starttls: bool,
     ) -> Self {
+        let (ca_cert_path, no_tls_verify) = LdapConfig::tls_from_env();
         let config = LdapConfig {
             url: server_url.to_string(),
             base_dn: user_base_dn.to_string(),
@@ -153,6 +177,8 @@ impl LdapService {
             groups_attr: groups_attr.to_string(),
             admin_group_dn: admin_group_dn.map(String::from),
             use_starttls,
+            ca_cert_path,
+            no_tls_verify,
         };
         Self {
             db,
@@ -353,14 +379,76 @@ impl LdapService {
         pattern.replace("{}", username)
     }
 
-    /// Validate LDAP credentials via real LDAP simple bind.
-    async fn validate_ldap_credentials(&self, user_dn: &str, password: &str) -> Result<()> {
-        use ldap3::{LdapConnAsync, LdapConnSettings};
+    /// Parse PEM certificates from a byte buffer.
+    ///
+    /// `native_tls::Certificate::from_pem` only handles a single cert, so this
+    /// splits the bundle on PEM boundaries and returns each cert individually.
+    fn parse_pem_certificates(
+        pem_bytes: &[u8],
+        source: &str,
+    ) -> Result<Vec<native_tls::Certificate>> {
+        let pem_str = String::from_utf8_lossy(pem_bytes);
+        let mut certs = Vec::new();
+        for block in pem_str.split("-----END CERTIFICATE-----") {
+            let trimmed = block.trim();
+            if trimmed.is_empty() || !trimmed.contains("-----BEGIN CERTIFICATE-----") {
+                continue;
+            }
+            let pem = format!("{trimmed}\n-----END CERTIFICATE-----\n");
+            let cert = native_tls::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
+                AppError::Config(format!("Failed to parse CA cert from {source}: {e}"))
+            })?;
+            certs.push(cert);
+        }
+        if certs.is_empty() {
+            return Err(AppError::Config(format!(
+                "No valid PEM certificates found in {source}"
+            )));
+        }
+        Ok(certs)
+    }
+
+    /// Build LDAP connection settings with TLS configuration.
+    ///
+    /// Supports custom CA certificates via `LDAP_CA_CERT_PATH` (or the shared
+    /// `CUSTOM_CA_CERT_PATH` as fallback) and `LDAP_INSECURE_TLS=true` to skip
+    /// certificate verification for development environments.
+    fn build_conn_settings(&self) -> Result<ldap3::LdapConnSettings> {
         use std::time::Duration;
 
-        let settings = LdapConnSettings::new()
+        let mut settings = ldap3::LdapConnSettings::new()
             .set_conn_timeout(Duration::from_secs(10))
-            .set_starttls(self.config.use_starttls);
+            .set_starttls(self.config.use_starttls)
+            .set_no_tls_verify(self.config.no_tls_verify);
+
+        if let Some(ca_path) = &self.config.ca_cert_path {
+            let pem_bytes = std::fs::read(ca_path).map_err(|e| {
+                AppError::Config(format!("Failed to read LDAP CA cert at {ca_path}: {e}"))
+            })?;
+
+            let certs = Self::parse_pem_certificates(&pem_bytes, ca_path)?;
+            let mut builder = native_tls::TlsConnector::builder();
+            for cert in &certs {
+                builder.add_root_certificate(cert.clone());
+            }
+            if self.config.no_tls_verify {
+                builder.danger_accept_invalid_certs(true);
+            }
+            let connector = builder
+                .build()
+                .map_err(|e| AppError::Config(format!("Failed to build TLS connector: {e}")))?;
+            settings = settings.set_connector(connector);
+            tracing::info!(path = %ca_path, count = certs.len(), "Loaded custom CA certificate(s) for LDAP");
+        }
+
+        Ok(settings)
+    }
+
+    /// Validate LDAP credentials via real LDAP simple bind.
+    async fn validate_ldap_credentials(&self, user_dn: &str, password: &str) -> Result<()> {
+        use ldap3::LdapConnAsync;
+
+        let settings = self.build_conn_settings()?;
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
             .await
@@ -383,15 +471,12 @@ impl LdapService {
 
     /// Get user information from LDAP via real search.
     async fn get_user_info(&self, username: &str, user_dn: &str) -> Result<LdapUserInfo> {
-        use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
-        use std::time::Duration;
+        use ldap3::{LdapConnAsync, Scope, SearchEntry};
 
         // If we have a bind DN, use search-then-bind
         // Otherwise return basic info from the DN
         if let (Some(bind_dn), Some(bind_pw)) = (&self.config.bind_dn, &self.config.bind_password) {
-            let settings = LdapConnSettings::new()
-                .set_conn_timeout(Duration::from_secs(10))
-                .set_starttls(self.config.use_starttls);
+            let settings = self.build_conn_settings()?;
 
             let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
                 .await
@@ -544,7 +629,14 @@ mod tests {
             groups_attr: "memberOf".to_string(),
             admin_group_dn: Some("cn=admins,ou=groups,dc=example,dc=com".to_string()),
             use_starttls: false,
+            ca_cert_path: None,
+            no_tls_verify: false,
         }
+    }
+
+    fn make_test_service(config: LdapConfig) -> LdapService {
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        LdapService::with_config(db, config)
     }
 
     #[test]
@@ -737,19 +829,11 @@ mod tests {
 
     #[test]
     fn test_ldap_config_debug_redacts_bind_password() {
-        let config = LdapConfig {
-            url: "ldap://ldap.example.com:389".to_string(),
-            base_dn: "dc=example,dc=com".to_string(),
-            user_filter: "(uid={username})".to_string(),
-            bind_dn: Some("cn=admin,dc=example,dc=com".to_string()),
-            bind_password: Some("super-secret-ldap-password".to_string()),
-            username_attr: "uid".to_string(),
-            email_attr: "mail".to_string(),
-            display_name_attr: "cn".to_string(),
-            groups_attr: "memberOf".to_string(),
-            admin_group_dn: None,
-            use_starttls: true,
-        };
+        let mut config = make_test_ldap_config();
+        config.bind_dn = Some("cn=admin,dc=example,dc=com".to_string());
+        config.bind_password = Some("super-secret-ldap-password".to_string());
+        config.use_starttls = true;
+        config.admin_group_dn = None;
         let debug = format!("{:?}", config);
         assert!(debug.contains("ldap.example.com"));
         assert!(debug.contains("dc=example,dc=com"));
@@ -759,20 +843,204 @@ mod tests {
 
     #[test]
     fn test_ldap_config_debug_shows_none_for_missing_password() {
-        let config = LdapConfig {
-            url: "ldap://localhost".to_string(),
-            base_dn: "dc=test".to_string(),
-            user_filter: "(uid={username})".to_string(),
-            bind_dn: None,
-            bind_password: None,
-            username_attr: "uid".to_string(),
-            email_attr: "mail".to_string(),
-            display_name_attr: "cn".to_string(),
-            groups_attr: "memberOf".to_string(),
-            admin_group_dn: None,
-            use_starttls: false,
-        };
+        let config = make_test_ldap_config();
         let debug = format!("{:?}", config);
         assert!(debug.contains("None"));
+    }
+
+    // --- TLS configuration tests ---
+
+    #[test]
+    fn test_ldap_config_tls_defaults() {
+        let config = make_test_ldap_config();
+        assert!(config.ca_cert_path.is_none());
+        assert!(!config.no_tls_verify);
+    }
+
+    #[test]
+    fn test_ldap_config_with_ca_cert_path() {
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some("/etc/ssl/certs/ldap-ca.pem".to_string());
+        assert_eq!(
+            config.ca_cert_path.as_deref(),
+            Some("/etc/ssl/certs/ldap-ca.pem")
+        );
+    }
+
+    #[test]
+    fn test_ldap_config_with_insecure_tls() {
+        let mut config = make_test_ldap_config();
+        config.no_tls_verify = true;
+        assert!(config.no_tls_verify);
+    }
+
+    #[test]
+    fn test_parse_pem_single_cert() {
+        let pem = include_bytes!("../../tests/fixtures/test-ca.pem");
+        let certs = LdapService::parse_pem_certificates(pem, "test-ca.pem");
+        assert!(certs.is_ok());
+        let certs = certs.expect("should parse test CA");
+        assert_eq!(certs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_pem_multiple_certs() {
+        let single = include_bytes!("../../tests/fixtures/test-ca.pem");
+        // Concatenate the same cert twice to simulate a bundle
+        let mut bundle = single.to_vec();
+        bundle.extend_from_slice(single);
+        let certs =
+            LdapService::parse_pem_certificates(&bundle, "bundle.pem").expect("should parse");
+        assert_eq!(certs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_pem_empty_file() {
+        let result = LdapService::parse_pem_certificates(b"", "empty.pem");
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("No valid PEM certificates")),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pem_garbage_data() {
+        let result = LdapService::parse_pem_certificates(b"not a certificate", "garbage.pem");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_pem_partial_markers() {
+        // Has BEGIN but no END, so no cert block is captured
+        let data = b"-----BEGIN CERTIFICATE-----\ngarbage";
+        let result = LdapService::parse_pem_certificates(data, "partial.pem");
+        assert!(result.is_err());
+    }
+
+    /// Build conn settings from a config, asserting success or failure.
+    fn assert_conn_settings_ok(config: LdapConfig) {
+        let svc = make_test_service(config);
+        assert!(svc.build_conn_settings().is_ok());
+    }
+
+    fn assert_conn_settings_err(config: LdapConfig, expected_msg: &str) {
+        let svc = make_test_service(config);
+        let result = svc.build_conn_settings();
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains(expected_msg),
+                "expected error containing '{expected_msg}', got: {e}"
+            ),
+            Ok(_) => panic!("expected error containing '{expected_msg}'"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_no_tls() {
+        assert_conn_settings_ok(make_test_ldap_config());
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_with_insecure_tls() {
+        let mut config = make_test_ldap_config();
+        config.no_tls_verify = true;
+        assert_conn_settings_ok(config);
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_missing_ca_file() {
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some("/nonexistent/ca.pem".to_string());
+        assert_conn_settings_err(config, "Failed to read LDAP CA cert");
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_with_valid_ca() {
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path =
+            Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem").to_string());
+        assert_conn_settings_ok(config);
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_with_starttls() {
+        let mut config = make_test_ldap_config();
+        config.use_starttls = true;
+        assert_conn_settings_ok(config);
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_ca_plus_insecure() {
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path =
+            Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem").to_string());
+        config.no_tls_verify = true;
+        assert_conn_settings_ok(config);
+    }
+
+    #[test]
+    fn test_ldap_config_debug_shows_tls_fields() {
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some("/etc/ssl/certs/ca.pem".to_string());
+        config.no_tls_verify = true;
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("/etc/ssl/certs/ca.pem"));
+        assert!(debug.contains("no_tls_verify"));
+    }
+
+    #[test]
+    fn test_tls_from_env_defaults() {
+        // Without the env vars set, should return (None, false)
+        let (ca, insecure) = LdapConfig::tls_from_env();
+        // We can't assert exact values since other tests or CI may set
+        // CUSTOM_CA_CERT_PATH, but we can assert the types are correct
+        let _ = ca;
+        assert!(!insecure || std::env::var("LDAP_INSECURE_TLS").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_from_db_config_sets_tls_defaults() {
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::from_db_config(
+            db,
+            "test-ldap",
+            "ldaps://ad.example.com:636",
+            Some("cn=svc,dc=example,dc=com"),
+            Some("password"),
+            "ou=users,dc=example,dc=com",
+            "(sAMAccountName={username})",
+            "sAMAccountName",
+            "mail",
+            "displayName",
+            "memberOf",
+            Some("cn=admins,dc=example,dc=com"),
+            false,
+        );
+        // Verify TLS fields are populated from env (defaults)
+        assert!(!svc.config.no_tls_verify || std::env::var("LDAP_INSECURE_TLS").is_ok());
+        // Verify non-TLS fields passed through
+        assert_eq!(svc.config.url, "ldaps://ad.example.com:636");
+        assert_eq!(svc.config.username_attr, "sAMAccountName");
+        assert_eq!(
+            svc.config.admin_group_dn.as_deref(),
+            Some("cn=admins,dc=example,dc=com")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_invalid_pem_content() {
+        let tmp = std::env::temp_dir().join("bad-ldap-ca.pem");
+        std::fs::write(
+            &tmp,
+            b"-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write temp");
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some(tmp.to_string_lossy().to_string());
+        let svc = make_test_service(config);
+        let result = svc.build_conn_settings();
+        assert!(result.is_err());
+        std::fs::remove_file(&tmp).ok();
     }
 }

@@ -92,7 +92,7 @@ async fn upsert_index_upstream_url(
 /// Create repository routes
 pub fn router() -> Router<SharedState> {
     use axum::extract::DefaultBodyLimit;
-    use axum::routing::{delete, put};
+    use axum::routing::{delete, post, put};
 
     Router::new()
         .route("/", get(list_repositories).post(create_repository))
@@ -104,6 +104,9 @@ pub fn router() -> Router<SharedState> {
         )
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // Upstream auth management for remote repositories
+        .route("/:key/upstream-auth", put(set_upstream_auth))
+        .route("/:key/test-upstream", post(test_upstream))
         // Virtual repository member management
         .route(
             "/:key/members",
@@ -168,6 +171,12 @@ pub struct CreateRepositoryRequest {
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
     pub member_repos: Option<Vec<CreateVirtualMemberInput>>,
+    /// Upstream auth type: "basic" or "bearer". Only valid for remote repos.
+    pub upstream_auth_type: Option<String>,
+    /// Username for basic auth.
+    pub upstream_username: Option<String>,
+    /// Password (basic) or token (bearer). Write-only, never returned in responses.
+    pub upstream_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -204,6 +213,8 @@ pub struct RepositoryResponse {
     pub is_public: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
+    pub upstream_auth_type: Option<String>,
+    pub upstream_auth_configured: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -229,6 +240,8 @@ fn repo_to_response(
         is_public: repo.is_public,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
+        upstream_auth_type: None,
+        upstream_auth_configured: false,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -620,11 +633,32 @@ pub async fn create_repository(
         }
     }
 
+    // Store upstream auth credentials if provided
+    if let Some(ref auth_type) = payload.upstream_auth_type {
+        let credentials_json = build_upstream_credentials(
+            auth_type,
+            payload.upstream_username.as_deref(),
+            payload.upstream_password.as_deref(),
+        )?;
+        crate::services::upstream_auth::save_upstream_auth(
+            &state.db,
+            repo.id,
+            auth_type,
+            &credentials_json,
+        )
+        .await?;
+    }
+
     state
         .event_bus
         .emit("repository.created", repo.id, Some(auth.username.clone()));
 
-    Ok(Json(repo_to_response(repo, 0)))
+    let mut response = repo_to_response(repo, 0);
+    if let Some(ref at) = payload.upstream_auth_type {
+        response.upstream_auth_type = Some(at.clone());
+        response.upstream_auth_configured = true;
+    }
+    Ok(Json(response))
 }
 
 /// Get repository details
@@ -650,8 +684,13 @@ pub async fn get_repository(
     let repo = service.get_by_key(&key).await?;
     require_visible(&repo, &auth)?;
     let storage_used = service.get_storage_usage(repo.id).await?;
+    let auth_type =
+        crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
 
-    Ok(Json(repo_to_response(repo, storage_used)))
+    let mut response = repo_to_response(repo, storage_used);
+    response.upstream_auth_configured = auth_type.is_some();
+    response.upstream_auth_type = auth_type;
+    Ok(Json(response))
 }
 
 /// Update repository
@@ -1652,6 +1691,157 @@ pub async fn update_virtual_members(
     list_virtual_members(State(state), Path(key)).await
 }
 
+// ---------------------------------------------------------------------------
+// Upstream auth management
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpstreamAuthRequest {
+    /// Auth type: "basic", "bearer", or "none" to remove.
+    pub auth_type: String,
+    /// Username for basic auth.
+    pub username: Option<String>,
+    /// Password (basic) or token (bearer). Write-only, never returned.
+    pub password: Option<String>,
+}
+
+/// Load a remote repository by key, verifying auth and repo type.
+/// Returns an error if the repo is not a remote repository.
+async fn load_remote_repo(
+    state: &SharedState,
+    auth: &AuthExtension,
+    key: &str,
+) -> Result<crate::models::repository::Repository> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(key).await?;
+    require_repo_access(auth, repo.id)?;
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "This operation is only valid for remote repositories".to_string(),
+        ));
+    }
+    Ok(repo)
+}
+
+/// Set or remove upstream auth for a remote repository
+#[utoipa::path(
+    put,
+    path = "/{key}/upstream-auth",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = UpstreamAuthRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream auth updated"),
+        (status = 400, description = "Invalid auth type or missing fields"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_upstream_auth(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<UpstreamAuthRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let repo = load_remote_repo(&state, &auth, &key).await?;
+
+    if payload.auth_type == "none" {
+        crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
+        return Ok(Json(
+            serde_json::json!({"message": "Upstream auth removed"}),
+        ));
+    }
+
+    let credentials_json = build_upstream_credentials(
+        &payload.auth_type,
+        payload.username.as_deref(),
+        payload.password.as_deref(),
+    )?;
+
+    crate::services::upstream_auth::save_upstream_auth(
+        &state.db,
+        repo.id,
+        &payload.auth_type,
+        &credentials_json,
+    )
+    .await?;
+
+    Ok(Json(
+        serde_json::json!({"message": "Upstream auth configured"}),
+    ))
+}
+
+/// Test connectivity to the upstream URL of a remote repository
+#[utoipa::path(
+    post,
+    path = "/{key}/test-upstream",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream reachable"),
+        (status = 400, description = "Repository is not remote or has no upstream URL"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+        (status = 502, description = "Upstream unreachable"),
+    )
+)]
+pub async fn test_upstream(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("read")?;
+    let repo = load_remote_repo(&state, &auth, &key).await?;
+
+    let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
+        AppError::Validation("Repository has no upstream URL configured".to_string())
+    })?;
+
+    let client = crate::services::http_client::base_client_builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?;
+
+    let mut request = client.head(upstream_url);
+
+    // Apply upstream auth if configured
+    if let Some(upstream_auth) =
+        crate::services::upstream_auth::load_upstream_auth(&state.db, repo.id).await?
+    {
+        request = crate::services::upstream_auth::apply_upstream_auth(request, &upstream_auth);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {e}")))?;
+
+    let status = response.status().as_u16();
+    // 2xx or 404 (root URL may not serve content) are acceptable
+    if response.status().is_success() || status == 404 {
+        Ok(Json(serde_json::json!({
+            "status": "ok",
+            "upstream_status": status,
+            "upstream_url": upstream_url,
+        })))
+    } else {
+        Err(AppError::BadGateway(format!(
+            "Upstream returned HTTP {status}"
+        )))
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1671,6 +1861,8 @@ pub async fn update_virtual_members(
         add_virtual_member,
         remove_virtual_member,
         update_virtual_members,
+        set_upstream_auth,
+        test_upstream,
     ),
     components(schemas(
         ListRepositoriesQuery,
@@ -1689,6 +1881,7 @@ pub async fn update_virtual_members(
         VirtualMemberResponse,
         VirtualMembersListResponse,
         CreateVirtualMemberInput,
+        UpstreamAuthRequest,
     ))
 )]
 pub struct RepositoriesApiDoc;
@@ -1701,6 +1894,49 @@ fn resolve_member_priority(explicit: i32, index: usize) -> i32 {
     } else {
         (index as i32) + 1
     }
+}
+
+/// Build a JSON credential string from an upstream auth request.
+/// Validates that the required fields are present for the given auth type,
+/// then delegates to `build_credentials_json` for serialization.
+fn build_upstream_credentials(
+    auth_type: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> crate::error::Result<String> {
+    use crate::services::upstream_auth::{build_credentials_json, UpstreamAuthType};
+
+    let auth = match auth_type {
+        "basic" => {
+            let username = username.ok_or_else(|| {
+                AppError::Validation("username is required for basic auth".to_string())
+            })?;
+            let password = password.ok_or_else(|| {
+                AppError::Validation("password is required for basic auth".to_string())
+            })?;
+            UpstreamAuthType::Basic {
+                username: username.to_string(),
+                password: password.to_string(),
+            }
+        }
+        "bearer" => {
+            let token = password.ok_or_else(|| {
+                AppError::Validation(
+                    "password is required for bearer auth (used as token)".to_string(),
+                )
+            })?;
+            UpstreamAuthType::Bearer {
+                token: token.to_string(),
+            }
+        }
+        other => {
+            return Err(AppError::Validation(format!(
+                "Invalid auth_type: {other}. Must be 'basic', 'bearer', or 'none'"
+            )));
+        }
+    };
+
+    Ok(build_credentials_json(&auth))
 }
 
 /// Convert a VirtualMemberRow into a VirtualMemberResponse.
@@ -2175,6 +2411,8 @@ mod tests {
             is_public: true,
             storage_used_bytes: 1024,
             quota_bytes: Some(1048576),
+            upstream_auth_type: None,
+            upstream_auth_configured: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -3127,5 +3365,93 @@ mod tests {
             repo_type: RepositoryType::Local,
         };
         assert_eq!(map_member_row(row).priority, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // UpstreamAuthRequest deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upstream_auth_request_basic() {
+        let json = r#"{"auth_type":"basic","username":"bot","password":"s3cret"}"#;
+        let req: UpstreamAuthRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.auth_type, "basic");
+        assert_eq!(req.username, Some("bot".to_string()));
+        assert_eq!(req.password, Some("s3cret".to_string()));
+    }
+
+    #[test]
+    fn test_upstream_auth_request_bearer() {
+        let json = r#"{"auth_type":"bearer","password":"ghp_token123"}"#;
+        let req: UpstreamAuthRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.auth_type, "bearer");
+        assert!(req.username.is_none());
+        assert_eq!(req.password, Some("ghp_token123".to_string()));
+    }
+
+    #[test]
+    fn test_upstream_auth_request_none() {
+        let json = r#"{"auth_type":"none"}"#;
+        let req: UpstreamAuthRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.auth_type, "none");
+        assert!(req.username.is_none());
+        assert!(req.password.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_upstream_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_upstream_credentials_basic() {
+        let json = build_upstream_credentials("basic", Some("admin"), Some("pass")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["username"], "admin");
+        assert_eq!(parsed["password"], "pass");
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_bearer() {
+        let json = build_upstream_credentials("bearer", None, Some("tok_abc")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["token"], "tok_abc");
+    }
+
+    /// Assert that `build_upstream_credentials` returns an error whose message
+    /// contains `expected_substr`.
+    fn assert_credentials_err(
+        auth_type: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        expected_substr: &str,
+    ) {
+        let result = build_upstream_credentials(auth_type, username, password);
+        let err = result.expect_err("expected credential validation error");
+        assert!(
+            err.to_string().contains(expected_substr),
+            "error {:?} should contain {:?}",
+            err.to_string(),
+            expected_substr,
+        );
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_basic_missing_username() {
+        assert_credentials_err("basic", None, Some("pass"), "username is required");
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_basic_missing_password() {
+        assert_credentials_err("basic", Some("user"), None, "password is required");
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_bearer_missing_token() {
+        assert_credentials_err("bearer", None, None, "password is required");
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_invalid_type() {
+        assert_credentials_err("oauth2", Some("u"), Some("p"), "Invalid auth_type");
     }
 }
