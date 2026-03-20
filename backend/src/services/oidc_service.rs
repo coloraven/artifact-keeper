@@ -177,7 +177,7 @@ impl OidcService {
         Ok(Self {
             db,
             config,
-            http_client: Client::new(),
+            http_client: crate::services::http_client::default_client(),
             discovery: None,
         })
     }
@@ -187,7 +187,7 @@ impl OidcService {
         Self {
             db,
             config,
-            http_client: Client::new(),
+            http_client: crate::services::http_client::default_client(),
             discovery: None,
         }
     }

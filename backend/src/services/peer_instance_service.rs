@@ -648,7 +648,7 @@ impl PeerInstanceService {
         let peer = self.register(req).await?;
 
         // Announce ourselves to the remote peer
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::default_client();
         let announce_url = format!(
             "{}/api/v1/peers/announce",
             remote_endpoint.trim_end_matches('/')

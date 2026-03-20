@@ -167,7 +167,7 @@ impl LdapService {
         Ok(Self {
             db,
             config,
-            http_client: Client::new(),
+            http_client: crate::services::http_client::default_client(),
         })
     }
 
@@ -207,7 +207,7 @@ impl LdapService {
         Self {
             db,
             config,
-            http_client: Client::new(),
+            http_client: crate::services::http_client::default_client(),
         }
     }
 
@@ -219,7 +219,7 @@ impl LdapService {
         Self {
             db,
             config,
-            http_client: Client::new(),
+            http_client: crate::services::http_client::default_client(),
         }
     }
 

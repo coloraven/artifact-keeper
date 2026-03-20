@@ -197,7 +197,7 @@ async fn proxy_get(
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http_client::default_client()
         .get(&target)
         .bearer_auth(&api_key)
         .send()
@@ -233,7 +233,7 @@ async fn proxy_post(
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http_client::default_client()
         .post(&target)
         .bearer_auth(&api_key)
         .header("content-type", "application/json")
@@ -271,7 +271,7 @@ async fn proxy_put(
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http_client::default_client()
         .put(&target)
         .bearer_auth(&api_key)
         .header("content-type", "application/json")
@@ -307,7 +307,7 @@ async fn proxy_delete(
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http_client::default_client()
         .delete(&target)
         .bearer_auth(&api_key)
         .send()
