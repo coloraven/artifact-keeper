@@ -134,6 +134,29 @@ pub struct LdapService {
 }
 
 impl LdapService {
+    const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// Classify an LDAP connection error as an internal server error.
+    fn connection_error(e: impl std::fmt::Display) -> AppError {
+        tracing::error!(error = %e, "LDAP connection failed");
+        AppError::Internal(format!("LDAP connection failed: {e}"))
+    }
+
+    /// Classify an LDAP bind rejection as an authentication error.
+    ///
+    /// The original error is logged but never exposed to the caller,
+    /// preventing credential or server details from leaking.
+    fn bind_error(e: impl std::fmt::Display) -> AppError {
+        tracing::error!(error = %e, "LDAP bind failed");
+        AppError::Authentication("Invalid credentials".into())
+    }
+
+    /// Classify an LDAP search failure as an internal server error.
+    fn search_error(e: impl std::fmt::Display) -> AppError {
+        tracing::error!(error = %e, "LDAP search failed");
+        AppError::Internal(format!("LDAP search failed: {e}"))
+    }
+
     /// Create a new LDAP service
     pub fn new(db: PgPool, app_config: Arc<Config>) -> Result<Self> {
         let config = LdapConfig::from_config(&app_config)
@@ -226,22 +249,22 @@ impl LdapService {
             ));
         }
 
-        let sanitized_username = Self::sanitize_ldap_input(username);
-
-        let user_info = if self.config.bind_dn.is_some() && self.config.bind_password.is_some() {
-            let user_info = self.search_user_entry(&sanitized_username).await?;
-            self.validate_ldap_credentials(&user_info.dn, password)
-                .await?;
-            user_info
-        } else {
-            // Fallback mode for deployments that intentionally rely on direct
-            // user binds without a service account. Use the submitted username
-            // directly instead of fabricating a DN.
-            self.validate_ldap_credentials(&sanitized_username, password)
-                .await?;
-            self.get_user_info(&sanitized_username, &sanitized_username)
-                .await?
-        };
+        let user_info = tokio::time::timeout(Self::AUTH_TIMEOUT, async {
+            if self.config.bind_dn.is_some() && self.config.bind_password.is_some() {
+                let user_info = self.search_user_entry(username).await?;
+                self.validate_ldap_credentials(&user_info.dn, password)
+                    .await?;
+                Ok(user_info)
+            } else {
+                self.validate_ldap_credentials(username, password).await?;
+                self.get_user_info(username, username).await
+            }
+        })
+        .await
+        .map_err(|_| {
+            tracing::error!(username = %username, timeout = ?Self::AUTH_TIMEOUT, "LDAP authentication timed out");
+            AppError::Internal("LDAP authentication timed out".into())
+        })??;
 
         tracing::info!(
             username = %username,
@@ -477,15 +500,15 @@ impl LdapService {
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
             .await
-            .map_err(|e| AppError::Authentication(format!("LDAP connection failed: {e}")))?;
+            .map_err(Self::connection_error)?;
 
         ldap3::drive!(conn);
 
         ldap.simple_bind(bind_dn, bind_password)
             .await
-            .map_err(|e| AppError::Authentication(format!("LDAP bind failed: {e}")))?
+            .map_err(Self::bind_error)?
             .success()
-            .map_err(|e| AppError::Authentication(format!("LDAP bind failed: {e}")))?;
+            .map_err(Self::bind_error)?;
 
         Ok(ldap)
     }
@@ -495,10 +518,11 @@ impl LdapService {
     /// Replaces both `{0}` and `{username}` placeholders in the configured
     /// user filter pattern.
     fn build_search_filter(&self, username: &str) -> String {
+        let safe = Self::sanitize_ldap_input(username);
         self.config
             .user_filter
-            .replace("{0}", username)
-            .replace("{username}", username)
+            .replace("{0}", &safe)
+            .replace("{username}", &safe)
     }
 
     /// Return the list of LDAP attributes to request during a user search.
@@ -571,8 +595,8 @@ impl LdapService {
         let (bind_dn, bind_pw) = match (&self.config.bind_dn, &self.config.bind_password) {
             (Some(dn), Some(pw)) => (dn, pw),
             _ => {
-                return Err(AppError::Authentication(
-                    "LDAP bind_dn and bind_password are required for search-then-bind".into(),
+                return Err(AppError::Internal(
+                    "LDAP service account not configured for search-then-bind".into(),
                 ))
             }
         };
@@ -585,9 +609,9 @@ impl LdapService {
         let (results, _) = ldap
             .search(&self.config.base_dn, Scope::Subtree, &search_filter, attrs)
             .await
-            .map_err(|e| AppError::Authentication(format!("LDAP search failed: {e}")))?
+            .map_err(Self::search_error)?
             .success()
-            .map_err(|e| AppError::Authentication(format!("LDAP search failed: {e}")))?;
+            .map_err(Self::search_error)?;
 
         ldap.unbind().await.ok();
 
@@ -1460,6 +1484,14 @@ mod tests {
         assert_eq!(filter, "(uid=john.doe@example.com)");
     }
 
+    #[tokio::test]
+    async fn test_build_search_filter_sanitizes_input() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        let filter = svc.build_search_filter("DOMAIN\\user");
+        assert_eq!(filter, "(uid=DOMAIN\\5cuser)");
+    }
+
     // --- user_search_attrs() tests ---
 
     #[tokio::test]
@@ -1617,5 +1649,131 @@ mod tests {
         assert_eq!(info.email, "fallback_user@unknown");
         assert!(info.display_name.is_none());
         assert!(info.groups.is_empty());
+    }
+
+    // --- build_search_filter sanitization tests (PR #470 coverage) ---
+
+    #[tokio::test]
+    async fn test_build_search_filter_sanitizes_special_chars() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        // Asterisk, parens, and null byte should all be escaped by the
+        // internal sanitize_ldap_input call inside build_search_filter.
+        let filter = svc.build_search_filter("user*(\0)");
+        assert_eq!(filter, "(uid=user\\2a\\28\\00\\29)");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_with_zero_placeholder_sanitizes() {
+        let mut config = make_test_ldap_config();
+        config.user_filter = "(sAMAccountName={0})".to_string();
+        let svc = make_test_service(config);
+        let filter = svc.build_search_filter("evil*user");
+        assert_eq!(filter, "(sAMAccountName=evil\\2auser)");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_both_placeholders_sanitized() {
+        let mut config = make_test_ldap_config();
+        config.user_filter = "(|(uid={username})(cn={0}))".to_string();
+        let svc = make_test_service(config);
+        let filter = svc.build_search_filter("bad(user)");
+        assert_eq!(filter, "(|(uid=bad\\28user\\29)(cn=bad\\28user\\29))");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_normal_chars_unchanged() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        // Dots, @, hyphens, and underscores are not LDAP special chars
+        // and should pass through without escaping.
+        let filter = svc.build_search_filter("john.doe@example.com");
+        assert_eq!(filter, "(uid=john.doe@example.com)");
+    }
+
+    #[tokio::test]
+    async fn test_auth_timeout_constant() {
+        assert_eq!(
+            LdapService::AUTH_TIMEOUT,
+            std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_backslash_in_domain_prefix() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        // A Windows-style domain login like CORP\jdoe should have the
+        // backslash escaped to \5c in the resulting LDAP filter.
+        let filter = svc.build_search_filter("CORP\\jdoe");
+        assert_eq!(filter, "(uid=CORP\\5cjdoe)");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_null_byte() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        let filter = svc.build_search_filter("admin\0extra");
+        assert_eq!(filter, "(uid=admin\\00extra)");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_parentheses_injection() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        // An LDAP injection attempt: )(uid=*)( should be fully escaped.
+        let filter = svc.build_search_filter(")(uid=*)(");
+        assert_eq!(filter, "(uid=\\29\\28uid=\\2a\\29\\28)");
+    }
+
+    // --- error classification helper tests ---
+
+    #[tokio::test]
+    async fn test_connection_error_returns_internal() {
+        let err = LdapService::connection_error("test connection failure");
+        match err {
+            AppError::Internal(msg) => assert!(msg.contains("LDAP connection failed")),
+            other => panic!("expected Internal, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_error_returns_authentication() {
+        let err = LdapService::bind_error("test bind failure");
+        match err {
+            AppError::Authentication(msg) => assert_eq!(msg, "Invalid credentials"),
+            other => panic!("expected Authentication, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_error_returns_internal() {
+        let err = LdapService::search_error("test search failure");
+        match err {
+            AppError::Internal(msg) => assert!(msg.contains("LDAP search failed")),
+            other => panic!("expected Internal, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_error_does_not_leak_details() {
+        let err = LdapService::bind_error("secret LDAP server ldap://10.0.0.1 DN cn=admin");
+        match err {
+            AppError::Authentication(msg) => {
+                assert_eq!(msg, "Invalid credentials");
+                assert!(!msg.contains("ldap://"));
+                assert!(!msg.contains("cn=admin"));
+            }
+            other => panic!("expected Authentication, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_error_includes_detail_for_logging() {
+        let err = LdapService::connection_error("io error: Connection refused");
+        match err {
+            AppError::Internal(msg) => assert!(msg.contains("Connection refused")),
+            other => panic!("expected Internal, got {:?}", other),
+        }
     }
 }
