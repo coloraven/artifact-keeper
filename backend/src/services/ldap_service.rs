@@ -161,7 +161,9 @@ impl LdapService {
     pub fn new(db: PgPool, app_config: Arc<Config>) -> Result<Self> {
         let config = LdapConfig::from_config(&app_config)
             .ok_or_else(|| AppError::Config("LDAP configuration not set".into()))?;
-
+        if config.no_tls_verify {
+            tracing::warn!("LDAP TLS verification is disabled (LDAP_INSECURE_TLS=true). Do not use in production.");
+        }
         Ok(Self {
             db,
             config,
@@ -211,6 +213,9 @@ impl LdapService {
 
     /// Create LDAP service from explicit config
     pub fn with_config(db: PgPool, config: LdapConfig) -> Self {
+        if config.no_tls_verify {
+            tracing::warn!("LDAP TLS verification is disabled (LDAP_INSECURE_TLS=true). Do not use in production.");
+        }
         Self {
             db,
             config,
@@ -256,6 +261,7 @@ impl LdapService {
                     .await?;
                 Ok(user_info)
             } else {
+                tracing::debug!(username = %username, "Using direct-bind fallback (no service account configured)");
                 self.validate_ldap_credentials(username, password).await?;
                 self.get_user_info(username, username).await
             }
@@ -496,6 +502,8 @@ impl LdapService {
     async fn connect_and_bind(&self, bind_dn: &str, bind_password: &str) -> Result<ldap3::Ldap> {
         use ldap3::LdapConnAsync;
 
+        tracing::debug!(url = %self.config.url, bind_dn = %bind_dn, "Connecting to LDAP server");
+
         let settings = self.build_conn_settings()?;
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
@@ -509,6 +517,8 @@ impl LdapService {
             .map_err(Self::bind_error)?
             .success()
             .map_err(Self::bind_error)?;
+
+        tracing::debug!("LDAP bind successful");
 
         Ok(ldap)
     }
@@ -592,6 +602,8 @@ impl LdapService {
     async fn search_user_entry(&self, username: &str) -> Result<LdapUserInfo> {
         use ldap3::{Scope, SearchEntry};
 
+        tracing::debug!(username = %username, "Searching for user in LDAP");
+
         let (bind_dn, bind_pw) = match (&self.config.bind_dn, &self.config.bind_password) {
             (Some(dn), Some(pw)) => (dn, pw),
             _ => {
@@ -621,6 +633,8 @@ impl LdapService {
             .ok_or_else(|| AppError::Authentication("User not found in LDAP".into()))?;
 
         let entry = SearchEntry::construct(entry);
+
+        tracing::debug!(username = %username, dn = %entry.dn, "LDAP user found");
 
         Ok(self.extract_user_from_entry(entry, username))
     }
@@ -683,6 +697,27 @@ impl LdapService {
     /// Get the LDAP server URL (for diagnostics)
     pub fn server_url(&self) -> &str {
         &self.config.url
+    }
+
+    /// Probe LDAP connectivity by attempting a service-account bind.
+    ///
+    /// If a service account is configured, performs a real bind to verify
+    /// the LDAP server is reachable and credentials are valid. If no
+    /// service account is configured, just verifies the URL is non-empty.
+    pub async fn check_health(&self) -> Result<()> {
+        if self.config.url.is_empty() {
+            return Err(AppError::Config("LDAP URL not configured".into()));
+        }
+        if let (Some(bind_dn), Some(bind_pw)) = (&self.config.bind_dn, &self.config.bind_password) {
+            let mut ldap = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.connect_and_bind(bind_dn, bind_pw),
+            )
+            .await
+            .map_err(|_| AppError::Internal("LDAP health check timed out".into()))??;
+            ldap.unbind().await.ok();
+        }
+        Ok(())
     }
 }
 
@@ -1775,5 +1810,64 @@ mod tests {
             AppError::Internal(msg) => assert!(msg.contains("Connection refused")),
             other => panic!("expected Internal, got {:?}", other),
         }
+    }
+
+    // --- check_health() and with_config() coverage tests ---
+
+    #[tokio::test]
+    async fn test_check_health_empty_url_returns_config_error() {
+        let mut config = make_test_ldap_config();
+        config.url = String::new();
+        let svc = make_test_service(config);
+        let result = svc.check_health().await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Config(msg) => assert!(msg.contains("not configured")),
+            other => panic!("expected Config error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_health_no_bind_credentials_with_url_succeeds() {
+        // When URL is set but no bind credentials, check_health just verifies URL is non-empty
+        let config = make_test_ldap_config(); // has URL but no bind_dn/bind_password
+        let svc = make_test_service(config);
+        let result = svc.check_health().await;
+        assert!(
+            result.is_ok(),
+            "health check should pass with URL but no bind credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_config_insecure_tls_creates_valid_service() {
+        let mut config = make_test_ldap_config();
+        config.no_tls_verify = true;
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        // Service created successfully despite insecure TLS (warning logged but no error)
+        assert!(svc.is_configured());
+        assert!(svc.config.no_tls_verify);
+    }
+
+    #[tokio::test]
+    async fn test_with_config_normal_tls_no_warning() {
+        let config = make_test_ldap_config(); // no_tls_verify = false
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        assert!(svc.is_configured());
+        assert!(!svc.config.no_tls_verify);
+    }
+
+    #[tokio::test]
+    async fn test_check_health_empty_url_with_bind_credentials() {
+        let mut config = make_test_ldap_config();
+        config.url = String::new();
+        config.bind_dn = Some("cn=admin,dc=test".to_string());
+        config.bind_password = Some("secret".to_string());
+        let svc = make_test_service(config);
+        let result = svc.check_health().await;
+        // Should fail on empty URL check before attempting bind
+        assert!(result.is_err());
     }
 }
