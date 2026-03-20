@@ -210,6 +210,7 @@ pub struct RepositoryResponse {
     pub is_public: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
+    pub upstream_url: Option<String>,
     pub upstream_auth_type: Option<String>,
     pub upstream_auth_configured: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -237,6 +238,7 @@ fn repo_to_response(
         is_public: repo.is_public,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
+        upstream_url: repo.upstream_url,
         upstream_auth_type: None,
         upstream_auth_configured: false,
         created_at: repo.created_at,
@@ -2437,6 +2439,7 @@ mod tests {
             is_public: true,
             storage_used_bytes: 1024,
             quota_bytes: Some(1048576),
+            upstream_url: None,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             created_at: chrono::Utc::now(),
@@ -2793,6 +2796,7 @@ mod tests {
         assert!(response.is_public);
         assert_eq!(response.storage_used_bytes, 5000);
         assert_eq!(response.quota_bytes, Some(1073741824));
+        assert!(response.upstream_url.is_none());
     }
 
     #[test]
@@ -2832,6 +2836,10 @@ mod tests {
         assert_eq!(response.storage_used_bytes, 0);
         assert!(response.quota_bytes.is_none());
         assert!(response.description.is_none());
+        assert_eq!(
+            response.upstream_url,
+            Some("https://registry.npmjs.org".to_string())
+        );
     }
 
     #[test]
