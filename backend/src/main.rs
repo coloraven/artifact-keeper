@@ -809,6 +809,8 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             .await
             .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
+    let demo_mode = matches!(std::env::var("DEMO_MODE").as_deref(), Ok("true" | "1"));
+
     if let Some((must_change,)) = admin_row {
         // Ensure existing admin user always has auth_provider = 'local' so
         // password-based login works.  This is a no-op when the column is
@@ -820,7 +822,23 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         .await
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
-        // Admin already exists — determine if setup lock is needed
+        if !must_change && !demo_mode {
+            if let Ok(env_pw) = std::env::var("ADMIN_PASSWORD") {
+                if is_insecure_default_password(&env_pw) {
+                    tracing::warn!("ADMIN_PASSWORD matches a well-known default.");
+                    sqlx::query(
+                        "UPDATE users SET must_change_password = true WHERE username = 'admin'",
+                    )
+                    .execute(db)
+                    .await
+                    .map_err(|e| {
+                        artifact_keeper_backend::error::AppError::Database(e.to_string())
+                    })?;
+                    return Ok(true);
+                }
+            }
+        }
+
         if must_change {
             tracing::warn!(
                 "Admin user has not changed default password. API is locked until password is changed."
@@ -834,9 +852,15 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         return Ok(false);
     }
 
-    // No admin exists — create one
     let (password, must_change) = match std::env::var("ADMIN_PASSWORD") {
-        Ok(p) if !p.is_empty() => (p, false),
+        Ok(p) if !p.is_empty() => {
+            if is_insecure_default_password(&p) && !demo_mode {
+                tracing::warn!("ADMIN_PASSWORD matches a well-known default.");
+                (p, true)
+            } else {
+                (p, false)
+            }
+        }
         _ => {
             const CHARSET: &[u8] =
                 b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
@@ -928,6 +952,24 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         tracing::info!("Admin user created with password from ADMIN_PASSWORD env var");
         Ok(false)
     }
+}
+
+fn is_insecure_default_password(password: &str) -> bool {
+    const INSECURE_DEFAULTS: &[&str] = &[
+        "admin",
+        "password",
+        "changeme",
+        "admin123",
+        "Password1",
+        "letmein",
+        "welcome",
+        "123456",
+        "admin1234",
+        "default",
+    ];
+    INSECURE_DEFAULTS
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(password))
 }
 
 /// Load active plugins from the database.
@@ -1200,5 +1242,85 @@ mod tests {
         assert!(!obj.contains_key("redirect_uri"));
         assert!(!obj.contains_key("username_claim"));
         assert!(!obj.contains_key("email_claim"));
+    }
+
+    #[test]
+    fn test_insecure_default_admin() {
+        assert!(is_insecure_default_password("admin"));
+    }
+
+    #[test]
+    fn test_insecure_default_case_insensitive() {
+        assert!(is_insecure_default_password("ADMIN"));
+        assert!(is_insecure_default_password("PASSWORD"));
+    }
+
+    #[test]
+    fn test_secure_password_not_flagged() {
+        assert!(!is_insecure_default_password("xK9#mP2$vL5nQ8"));
+    }
+
+    #[test]
+    fn test_all_insecure_defaults_detected() {
+        let defaults = [
+            "admin",
+            "password",
+            "changeme",
+            "admin123",
+            "Password1",
+            "letmein",
+            "welcome",
+            "123456",
+            "admin1234",
+            "default",
+        ];
+        for pw in defaults {
+            assert!(
+                is_insecure_default_password(pw),
+                "{pw} should be flagged as insecure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insecure_defaults_mixed_case_variations() {
+        assert!(is_insecure_default_password("ChAnGeMe"));
+        assert!(is_insecure_default_password("LETMEIN"));
+        assert!(is_insecure_default_password("Welcome"));
+        assert!(is_insecure_default_password("Default"));
+        assert!(is_insecure_default_password("ADMIN123"));
+        assert!(is_insecure_default_password("password1"));
+    }
+
+    #[test]
+    fn test_empty_password_not_flagged() {
+        assert!(!is_insecure_default_password(""));
+    }
+
+    #[test]
+    fn test_near_miss_passwords_not_flagged() {
+        // Passwords similar to but not matching the insecure list
+        assert!(!is_insecure_default_password("admin2"));
+        assert!(!is_insecure_default_password("password!"));
+        assert!(!is_insecure_default_password("changeme1"));
+        assert!(!is_insecure_default_password("1234567"));
+        assert!(!is_insecure_default_password("defaults"));
+    }
+
+    #[test]
+    fn test_long_secure_password_not_flagged() {
+        assert!(!is_insecure_default_password("my-secure-p@ssw0rd-2026"));
+        assert!(!is_insecure_default_password(
+            "correct-horse-battery-staple"
+        ));
+        assert!(!is_insecure_default_password("Tr0ub4dor&3"));
+    }
+
+    #[test]
+    fn test_whitespace_password_not_flagged() {
+        // Passwords with leading/trailing whitespace are not in the list
+        assert!(!is_insecure_default_password(" admin"));
+        assert!(!is_insecure_default_password("admin "));
+        assert!(!is_insecure_default_password(" password "));
     }
 }
