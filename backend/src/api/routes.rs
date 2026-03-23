@@ -88,15 +88,25 @@ pub fn create_router(state: SharedState) -> Router {
         format_routes.layer(DefaultBodyLimit::max(upload_limit as usize))
     };
 
+    let swagger_enabled = {
+        let env = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".into());
+        env == "development" || std::env::var("ENABLE_SWAGGER").is_ok()
+    };
+
     let mut router = Router::new()
         // Health endpoints (no auth required)
         .route("/health", get(handlers::health::health_check))
         .route("/healthz", get(handlers::health::health_check))
         .route("/ready", get(handlers::health::readiness_check))
         .route("/readyz", get(handlers::health::readiness_check))
-        .route("/livez", get(handlers::health::liveness_check))
-        // OpenAPI spec (served by SwaggerUi at /api/v1/openapi.json) and Swagger UI
-        .merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", openapi))
+        .route("/livez", get(handlers::health::liveness_check));
+
+    // Only mount Swagger UI and OpenAPI spec in development or when explicitly enabled
+    if swagger_enabled {
+        router = router.merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", openapi));
+    }
+
+    let mut router = router
         // API v1 routes
         .nest("/api/v1", api_v1_routes(state.clone()))
         // Docker Registry V2 API (OCI Distribution Spec)
@@ -331,12 +341,20 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // Format handler routes with optional auth (list is public, enable/disable requires auth)
+        // Format handler read-only routes (list, get) with optional auth
         .nest(
             "/formats",
             handlers::plugins::format_router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 optional_auth_middleware,
+            )),
+        )
+        // Format handler mutating routes (enable, disable, test) require admin
+        .nest(
+            "/formats",
+            handlers::plugins::format_admin_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                admin_middleware,
             )),
         )
         // Webhook routes with auth middleware

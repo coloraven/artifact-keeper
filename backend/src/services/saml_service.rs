@@ -511,8 +511,8 @@ impl SamlService {
         // Parse SAML response
         let response = self.parse_saml_response(&xml_string)?;
 
-        // Validate response
-        self.validate_response(&response)?;
+        // Validate response (including XML signature verification)
+        self.validate_response(&response, &xml_string)?;
 
         // Extract user info from assertion
         let assertion = response
@@ -559,8 +559,8 @@ impl SamlService {
         Ok(parser.finish())
     }
 
-    /// Validate SAML response
-    fn validate_response(&self, response: &SamlResponse) -> Result<()> {
+    /// Validate SAML response, including XML digital signature verification
+    fn validate_response(&self, response: &SamlResponse, xml: &str) -> Result<()> {
         // Check status code
         if !response.status_code.ends_with(":Success") {
             let message = response
@@ -613,12 +613,53 @@ impl SamlService {
             }
         }
 
-        // Note: In production, signature verification should be performed here
-        // using the IdP certificate. This would require a proper crypto library.
-        if self.config.require_signed_assertions {
+        // XML digital signature verification using bergshamra
+        if let Some(ref idp_cert_pem) = self.config.idp_certificate {
+            let key = bergshamra::keys::loader::load_x509_cert_pem(idp_cert_pem.as_bytes())
+                .map_err(|e| {
+                    AppError::Authentication(format!("Failed to parse IdP certificate: {}", e))
+                })?;
+
+            let mut keys_manager = bergshamra::KeysManager::new();
+            keys_manager.add_key(key);
+
+            let mut ctx = bergshamra::DsigContext::new(keys_manager);
+            ctx.strict_verification = true;
+            ctx.trusted_keys_only = true;
+
+            match bergshamra::verify(&ctx, xml) {
+                Ok(bergshamra::VerifyResult::Valid { .. }) => {
+                    tracing::debug!("SAML response signature verified successfully");
+                }
+                Ok(bergshamra::VerifyResult::Invalid { reason }) => {
+                    return Err(AppError::Authentication(format!(
+                        "SAML signature verification failed: {}",
+                        reason
+                    )));
+                }
+                Err(bergshamra::Error::MissingElement(_))
+                    if !self.config.require_signed_assertions =>
+                {
+                    tracing::warn!(
+                        "SAML response has no XML signature but require_signed_assertions \
+                         is false; proceeding without signature verification"
+                    );
+                }
+                Err(e) => {
+                    return Err(AppError::Authentication(format!(
+                        "SAML signature verification error: {}",
+                        e
+                    )));
+                }
+            }
+        } else if self.config.require_signed_assertions {
+            return Err(AppError::Authentication(
+                "Signed assertions are required but no IdP certificate is configured".into(),
+            ));
+        } else {
             tracing::warn!(
-                "Signature verification is not implemented. \
-                 In production, validate assertion signature using IdP certificate."
+                "No IdP certificate configured; skipping SAML signature verification. \
+                 Set SAML_IDP_CERTIFICATE and require_signed_assertions=true in production."
             );
         }
 
@@ -1385,7 +1426,7 @@ mod tests {
         let xml = sample_saml_response_xml();
         let response = service.parse_saml_response(&xml).unwrap();
 
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_ok());
     }
 
@@ -1401,7 +1442,7 @@ mod tests {
             assertion: None,
         };
 
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Auth failed"));
@@ -1419,7 +1460,7 @@ mod tests {
             assertion: None,
         };
 
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Invalid issuer"));
@@ -1447,7 +1488,7 @@ mod tests {
             }),
         };
 
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("audience restriction"));
@@ -1476,7 +1517,7 @@ mod tests {
         };
 
         // Empty audiences list means no restriction to check
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_ok());
     }
 
@@ -1502,7 +1543,7 @@ mod tests {
             }),
         };
 
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("expired"));
@@ -1530,7 +1571,7 @@ mod tests {
             }),
         };
 
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not yet valid"));
@@ -1562,7 +1603,7 @@ mod tests {
             }),
         };
 
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_ok());
     }
 
@@ -1578,11 +1619,61 @@ mod tests {
             assertion: None,
         };
 
-        let result = service.validate_response(&response);
+        let result = service.validate_response(&response, "");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         // Should include the status code in the default message
         assert!(err.contains("Responder"));
+    }
+
+    // =======================================================================
+    // Signature verification tests
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_validate_response_rejects_missing_cert_when_required() {
+        let mut config = make_test_saml_config();
+        config.require_signed_assertions = true;
+        config.idp_certificate = None;
+        let service = SamlService::with_config(
+            PgPool::connect_lazy("postgres://invalid:invalid@localhost/invalid").unwrap(),
+            config,
+        );
+        let response = SamlResponse {
+            id: "_resp1".to_string(),
+            in_response_to: None,
+            issuer: "https://idp.example.com".to_string(),
+            status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
+            status_message: None,
+            assertion: None,
+        };
+
+        let result = service.validate_response(&response, "");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no IdP certificate"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_response_allows_no_cert_when_not_required() {
+        let mut config = make_test_saml_config();
+        config.require_signed_assertions = false;
+        config.idp_certificate = None;
+        let service = SamlService::with_config(
+            PgPool::connect_lazy("postgres://invalid:invalid@localhost/invalid").unwrap(),
+            config,
+        );
+        let response = SamlResponse {
+            id: "_resp1".to_string(),
+            in_response_to: None,
+            issuer: "https://idp.example.com".to_string(),
+            status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
+            status_message: None,
+            assertion: None,
+        };
+
+        let result = service.validate_response(&response, "");
+        assert!(result.is_ok());
     }
 
     // =======================================================================
@@ -2102,7 +2193,7 @@ mod tests {
         let response = service.parse_saml_response(&xml).unwrap();
 
         // Validate
-        service.validate_response(&response).unwrap();
+        service.validate_response(&response, "").unwrap();
 
         // Extract
         let assertion = response.assertion.unwrap();

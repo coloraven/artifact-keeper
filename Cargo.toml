@@ -108,3 +108,6 @@ tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 tonic-build = "0.12"
+
+# XML Digital Signatures (SAML signature verification)
+bergshamra = "0.3"
