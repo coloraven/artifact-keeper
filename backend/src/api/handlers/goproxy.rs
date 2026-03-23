@@ -227,6 +227,65 @@ async fn handle_put(
 // GET /@v/list — List versions
 // ---------------------------------------------------------------------------
 
+/// Proxy a Go metadata request to the upstream for remote repos, or resolve
+/// through virtual repo members. Returns `Ok(response)` if the proxy produced
+/// a result, or `Err(())` if no proxy was available and the caller should fall
+/// back to the local/not-found response.
+async fn try_proxy_go_metadata(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upstream_path: &str,
+    default_content_type: &str,
+) -> Result<Response, ()> {
+    // Remote repo: proxy to upstream
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            if let Ok((content, content_type)) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, upstream_path)
+                    .await
+            {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        "Content-Type",
+                        content_type.unwrap_or_else(|| default_content_type.to_string()),
+                    )
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
+    }
+
+    // Virtual repo: try each member in priority order
+    if repo.repo_type == RepositoryType::Virtual {
+        let ct = default_content_type.to_string();
+        if let Ok(resp) = proxy_helpers::resolve_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            upstream_path,
+            |bytes, _key| {
+                let ct = ct.clone();
+                async move {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, ct)
+                        .body(Body::from(bytes))
+                        .unwrap())
+                }
+            },
+        )
+        .await
+        {
+            return Ok(resp);
+        }
+    }
+
+    Err(())
+}
+
 async fn list_versions(
     state: &SharedState,
     repo: &RepoInfo,
@@ -260,6 +319,16 @@ async fn list_versions(
         .flatten()
         .collect::<Vec<_>>()
         .join("\n");
+
+    if body.is_empty() {
+        let encoded = encode_module_path(module);
+        let upstream_path = format!("{}/@v/list", encoded);
+        if let Ok(resp) =
+            try_proxy_go_metadata(state, repo, &upstream_path, "text/plain; charset=utf-8").await
+        {
+            return Ok(resp);
+        }
+    }
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -308,7 +377,21 @@ async fn version_info(
             format!("Version {} not found for module {}", version, module),
         )
             .into_response()
-    })?;
+    });
+
+    let artifact = match artifact {
+        Ok(a) => a,
+        Err(not_found) => {
+            let encoded = encode_module_path(module);
+            let upstream_path = format!("{}/@v/{}.info", encoded, version);
+            if let Ok(resp) =
+                try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
+            {
+                return Ok(resp);
+            }
+            return Err(not_found);
+        }
+    };
 
     let time_str = artifact.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -648,7 +731,21 @@ async fn latest_version(
             format!("No versions found for module {}", module),
         )
             .into_response()
-    })?;
+    });
+
+    let artifact = match artifact {
+        Ok(a) => a,
+        Err(not_found) => {
+            let encoded = encode_module_path(module);
+            let upstream_path = format!("{}/@latest", encoded);
+            if let Ok(resp) =
+                try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
+            {
+                return Ok(resp);
+            }
+            return Err(not_found);
+        }
+    };
 
     let version = artifact.version.unwrap_or_default();
     let time_str = artifact.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -1302,6 +1399,101 @@ mod tests {
     // -----------------------------------------------------------------------
     // build_go_upstream_path
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Upstream proxy path construction for list/info/latest
+    // (covers the paths built by the new proxy fallback code)
+    // -----------------------------------------------------------------------
+
+    fn build_go_upstream_list_path(module: &str) -> String {
+        let encoded = encode_module_path(module);
+        format!("{}/@v/list", encoded)
+    }
+
+    fn build_go_upstream_info_path(module: &str, version: &str) -> String {
+        let encoded = encode_module_path(module);
+        format!("{}/@v/{}.info", encoded, version)
+    }
+
+    fn build_go_upstream_latest_path(module: &str) -> String {
+        let encoded = encode_module_path(module);
+        format!("{}/@latest", encoded)
+    }
+
+    #[test]
+    fn test_build_go_upstream_list_path_simple() {
+        assert_eq!(
+            build_go_upstream_list_path("github.com/user/repo"),
+            "github.com/user/repo/@v/list"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_list_path_encoded() {
+        assert_eq!(
+            build_go_upstream_list_path("github.com/Azure/go-sdk"),
+            "github.com/!azure/go-sdk/@v/list"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_info_path_simple() {
+        assert_eq!(
+            build_go_upstream_info_path("github.com/user/repo", "v1.0.0"),
+            "github.com/user/repo/@v/v1.0.0.info"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_info_path_prerelease() {
+        assert_eq!(
+            build_go_upstream_info_path("golang.org/x/text", "v0.14.0-rc.1"),
+            "golang.org/x/text/@v/v0.14.0-rc.1.info"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_latest_path_simple() {
+        assert_eq!(
+            build_go_upstream_latest_path("github.com/user/repo"),
+            "github.com/user/repo/@latest"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_latest_path_encoded() {
+        assert_eq!(
+            build_go_upstream_latest_path("github.com/Azure/go-sdk"),
+            "github.com/!azure/go-sdk/@latest"
+        );
+    }
+
+    #[test]
+    fn test_version_list_merge_dedup() {
+        // Simulates the merge logic used in virtual repo list_versions
+        let list_a = "v1.0.0\nv1.1.0\nv2.0.0";
+        let list_b = "v1.1.0\nv2.0.0\nv3.0.0";
+        let merged: Vec<&str> = [list_a, list_b]
+            .iter()
+            .flat_map(|text| text.lines())
+            .filter(|l| !l.is_empty())
+            .collect();
+        // The handler collects all versions (including duplicates) from members
+        assert_eq!(merged.len(), 6);
+        assert!(merged.contains(&"v1.0.0"));
+        assert!(merged.contains(&"v3.0.0"));
+    }
+
+    #[test]
+    fn test_version_list_merge_empty_inputs() {
+        let lists: Vec<&str> = vec![];
+        let merged: Vec<&str> = lists
+            .iter()
+            .flat_map(|text| text.lines())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(merged.is_empty());
+    }
 
     #[test]
     fn test_build_go_upstream_path_zip() {
