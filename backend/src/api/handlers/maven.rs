@@ -20,11 +20,16 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
+use crate::error::AppError;
 use crate::formats::maven::{generate_metadata_xml, MavenCoordinates, MavenHandler};
 use crate::models::repository::RepositoryType;
+
+// TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
+// plain-text error responses and should be migrated to AppError (#553).
 
 // ---------------------------------------------------------------------------
 // Router
@@ -280,7 +285,7 @@ async fn download(
         }
 
         // Metadata not found anywhere
-        return Err((StatusCode::NOT_FOUND, "Metadata not found").into_response());
+        return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
     }
 
     // 3. Check if this is a checksum request for a stored file
@@ -351,18 +356,12 @@ async fn generate_metadata_for_artifact(
     )
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     let versions: Vec<String> = rows.into_iter().filter_map(|r| r.version).collect();
 
     if versions.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "No versions found").into_response());
+        return Err(AppError::NotFound("No versions found".to_string()).into_response());
     }
 
     let latest = versions.last().unwrap().clone();
@@ -391,13 +390,7 @@ async fn serve_artifact(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     // If artifact not found by exact path, try SNAPSHOT resolution
     let artifact = match artifact {
@@ -407,13 +400,10 @@ async fn serve_artifact(
                 let storage = state
                     .storage_for_repo(&repo.storage_location())
                     .map_err(|e| e.into_response())?;
-                let content = storage.get(&resolved.storage_key).await.map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Storage error: {}", e),
-                    )
-                        .into_response()
-                })?;
+                let content = storage
+                    .get(&resolved.storage_key)
+                    .await
+                    .map_err(map_storage_err)?;
 
                 let ct = content_type_for_path(path);
                 return Ok(Response::builder()
@@ -510,20 +500,17 @@ async fn serve_artifact(
                 }
             }
 
-            return Err((StatusCode::NOT_FOUND, "File not found").into_response());
+            return Err(AppError::NotFound("File not found".to_string()).into_response());
         }
     };
 
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -565,13 +552,7 @@ async fn serve_computed_checksum(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     // If the exact path was not found and this is a SNAPSHOT request, resolve
     // the `-SNAPSHOT` filename to the latest timestamped version.
@@ -581,10 +562,12 @@ async fn serve_computed_checksum(
             if base_path.contains("-SNAPSHOT") {
                 let resolved = resolve_snapshot_artifact(&state.db, repo_id, base_path)
                     .await
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response())?;
+                    .ok_or_else(|| {
+                        AppError::NotFound("File not found".to_string()).into_response()
+                    })?;
                 (resolved.storage_key, resolved.checksum_sha256)
             } else {
-                return Err((StatusCode::NOT_FOUND, "File not found").into_response());
+                return Err(AppError::NotFound("File not found".to_string()).into_response());
             }
         }
     };
@@ -594,13 +577,10 @@ async fn serve_computed_checksum(
         ChecksumType::Sha256 => resolved_sha256,
         _ => {
             let storage = state.storage_for_repo_or_500(location)?;
-            let content = storage.get(&resolved_storage_key).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Storage error: {}", e),
-                )
-                    .into_response()
-            })?;
+            let content = storage
+                .get(&resolved_storage_key)
+                .await
+                .map_err(map_storage_err)?;
             compute_checksum(&content, checksum_type)
         }
     };
@@ -714,13 +694,7 @@ async fn update_artifact_record(
     .bind(artifact_id)
     .execute(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
     Ok(())
 }
 
@@ -747,13 +721,10 @@ async fn upload(
 
     // If this is a checksum file (.sha1, .md5, .sha256), just store it and return
     if parse_checksum_path(&path).is_some() {
-        storage.put(&storage_key, body).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+        storage
+            .put(&storage_key, body)
+            .await
+            .map_err(map_storage_err)?;
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -762,13 +733,10 @@ async fn upload(
 
     // If this is a maven-metadata.xml upload, just store it
     if MavenHandler::is_metadata(&path) {
-        storage.put(&storage_key, body).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+        storage
+            .put(&storage_key, body)
+            .await
+            .map_err(map_storage_err)?;
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -776,13 +744,8 @@ async fn upload(
     }
 
     // Parse Maven coordinates from the path
-    let coords = MavenHandler::parse_coordinates(&path).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid Maven path: {}", e),
-        )
-            .into_response()
-    })?;
+    let coords = MavenHandler::parse_coordinates(&path)
+        .map_err(|e| AppError::Validation(format!("Invalid Maven path: {}", e)).into_response())?;
 
     // Compute SHA-256
     let mut hasher = Sha256::new();
@@ -800,17 +763,11 @@ async fn upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     if existing.is_some() {
         if !coords.version.contains("SNAPSHOT") {
-            return Err((StatusCode::CONFLICT, "Artifact already exists").into_response());
+            return Err(AppError::Conflict("Artifact already exists".to_string()).into_response());
         }
         // Hard-delete old SNAPSHOT version so the UNIQUE(repository_id, path)
         // constraint allows re-insert. Safe because SNAPSHOTs are mutable by design.
@@ -828,13 +785,10 @@ async fn upload(
     }
 
     // Store file in object storage regardless of grouping outcome
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(map_storage_err)?;
 
     // Build metadata JSON for this file
     let handler = MavenHandler::new();
@@ -878,13 +832,7 @@ async fn upload(
         .bind(&coords.version)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(map_db_err)?;
 
         use sqlx::Row;
         row.map(|r| {
@@ -1075,13 +1023,7 @@ async fn upload(
             .bind(user_id)
             .fetch_one(&state.db)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Database error: {}", e),
-                )
-                    .into_response()
-            })?;
+            .map_err(map_db_err)?;
             let artifact_id: uuid::Uuid = row.get("id");
 
             // Initialize empty files array; the primary info lives on the

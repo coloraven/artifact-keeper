@@ -62,6 +62,49 @@ pub(crate) fn generate_password() -> String {
         .collect()
 }
 
+/// Validate password strength beyond minimum length.
+fn validate_password(password: &str) -> Result<()> {
+    if password.len() < 8 {
+        return Err(AppError::Validation(
+            "Password must be at least 8 characters".to_string(),
+        ));
+    }
+    if password.len() > 128 {
+        return Err(AppError::Validation(
+            "Password must be at most 128 characters".to_string(),
+        ));
+    }
+    const COMMON_PASSWORDS: &[&str] = &[
+        "password",
+        "12345678",
+        "123456789",
+        "1234567890",
+        "qwerty123",
+        "qwertyui",
+        "password1",
+        "iloveyou",
+        "12341234",
+        "00000000",
+        "abc12345",
+        "11111111",
+        "password123",
+        "admin123",
+        "letmein1",
+        "welcome1",
+        "monkey12",
+        "dragon12",
+        "baseball1",
+        "trustno1",
+    ];
+    let lower = password.to_lowercase();
+    if COMMON_PASSWORDS.contains(&lower.as_str()) {
+        return Err(AppError::Validation(
+            "Password is too common; choose a stronger password".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateUserRequest {
     pub email: Option<String>,
@@ -217,11 +260,9 @@ pub async fn create_user(
 
     // Generate password if not provided, otherwise validate
     let (password, auto_generated) = match payload.password {
-        Some(ref p) if p.len() >= 8 => (p.clone(), false),
-        Some(_) => {
-            return Err(AppError::Validation(
-                "Password must be at least 8 characters".to_string(),
-            ));
+        Some(ref p) => {
+            validate_password(p)?;
+            (p.clone(), false)
         }
         None => (generate_password(), true),
     };
@@ -748,11 +789,7 @@ pub async fn change_password(
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<()> {
     // Validate new password
-    if payload.new_password.len() < 8 {
-        return Err(AppError::Validation(
-            "Password must be at least 8 characters".to_string(),
-        ));
-    }
+    validate_password(&payload.new_password)?;
 
     // For non-admins changing their own password, verify current password
     if auth.user_id == id && !auth.is_admin {
@@ -1420,5 +1457,97 @@ mod tests {
         let per_page: u32 = 20;
         let offset = ((page - 1) * per_page) as i64;
         assert_eq!(offset, 0);
+    }
+
+    // -- validate_password tests --
+
+    #[test]
+    fn test_validate_password_too_short() {
+        let result = validate_password("abc");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("at least 8 characters"));
+    }
+
+    #[test]
+    fn test_validate_password_exactly_min_length() {
+        // 8 chars, not a common password
+        let result = validate_password("xK9!mZ2q");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_password_too_long() {
+        let long = "a".repeat(129);
+        let result = validate_password(&long);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("at most 128 characters"));
+    }
+
+    #[test]
+    fn test_validate_password_exactly_max_length() {
+        let long = "aB3!".repeat(32); // 128 chars
+        let result = validate_password(&long);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_password_common_password_rejected() {
+        let result = validate_password("password");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_password_case_insensitive() {
+        // "Password" differs in case but should still be rejected
+        let result = validate_password("Password");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_numeric() {
+        let result = validate_password("12345678");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_qwerty() {
+        let result = validate_password("qwerty123");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_admin123() {
+        let result = validate_password("admin123");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_trustno1() {
+        let result = validate_password("trustno1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_valid_strong_password() {
+        let result = validate_password("Correct-Horse-Battery-Staple!");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_password_seven_chars_rejected() {
+        let result = validate_password("aB3!xYz");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least 8 characters"));
     }
 }

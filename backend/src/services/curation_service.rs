@@ -84,34 +84,13 @@ impl CurationService {
         .fetch_all(&self.db)
         .await?;
 
-        for rule in &rules {
-            if !Self::pattern_matches(&rule.package_pattern, package_name) {
-                continue;
-            }
-            if !Self::version_matches(&rule.version_constraint, version) {
-                continue;
-            }
-            if rule.architecture != "*" {
-                if let Some(arch) = architecture {
-                    if rule.architecture != arch {
-                        continue;
-                    }
-                }
-            }
-
-            return Ok(RuleEvaluation {
-                action: rule.action.clone(),
-                reason: rule.reason.clone(),
-                rule_id: Some(rule.id),
-            });
-        }
-
-        // No rule matched: use default stance
-        Ok(RuleEvaluation {
-            action: default_action.to_string(),
-            reason: format!("No matching rule; default action: {default_action}"),
-            rule_id: None,
-        })
+        Ok(Self::evaluate_package_in_memory(
+            &rules,
+            default_action,
+            package_name,
+            version,
+            architecture,
+        ))
     }
 
     // ---------------------------------------------------------------------------
@@ -358,7 +337,47 @@ impl CurationService {
         Ok(rows)
     }
 
+    /// Evaluate a package against a pre-fetched rule set in memory (no DB call).
+    fn evaluate_package_in_memory(
+        rules: &[CurationRule],
+        default_action: &str,
+        package_name: &str,
+        version: &str,
+        architecture: Option<&str>,
+    ) -> RuleEvaluation {
+        for rule in rules {
+            if !Self::pattern_matches(&rule.package_pattern, package_name) {
+                continue;
+            }
+            if !Self::version_matches(&rule.version_constraint, version) {
+                continue;
+            }
+            if rule.architecture != "*" {
+                if let Some(arch) = architecture {
+                    if rule.architecture != arch {
+                        continue;
+                    }
+                }
+            }
+
+            return RuleEvaluation {
+                action: rule.action.clone(),
+                reason: rule.reason.clone(),
+                rule_id: Some(rule.id),
+            };
+        }
+
+        RuleEvaluation {
+            action: default_action.to_string(),
+            reason: format!("No matching rule; default action: {default_action}"),
+            rule_id: None,
+        }
+    }
+
     /// Evaluate all pending packages against current rules and update their status.
+    ///
+    /// Fetches rules once, evaluates each package in memory, then batches the
+    /// status updates to avoid N+1 query overhead.
     pub async fn re_evaluate_pending(
         &self,
         staging_repo_id: Uuid,
@@ -371,17 +390,33 @@ impl CurationService {
         .fetch_all(&self.db)
         .await?;
 
-        let mut updated = 0u64;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        // Fetch all applicable rules once
+        let rules: Vec<CurationRule> = sqlx::query_as(
+            r#"SELECT * FROM curation_rules
+               WHERE enabled = true
+                 AND (staging_repo_id = $1 OR staging_repo_id IS NULL)
+               ORDER BY priority ASC, created_at ASC"#,
+        )
+        .bind(staging_repo_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        // Group packages by (status, reason, rule_id) for batch updates
+        let mut groups: std::collections::HashMap<(String, String, Option<Uuid>), Vec<Uuid>> =
+            std::collections::HashMap::new();
+
         for pkg in &pending {
-            let eval = self
-                .evaluate_package(
-                    staging_repo_id,
-                    default_action,
-                    &pkg.package_name,
-                    &pkg.version,
-                    pkg.architecture.as_deref(),
-                )
-                .await?;
+            let eval = Self::evaluate_package_in_memory(
+                &rules,
+                default_action,
+                &pkg.package_name,
+                &pkg.version,
+                pkg.architecture.as_deref(),
+            );
 
             let new_status = match eval.action.as_str() {
                 "allow" => "approved",
@@ -389,9 +424,28 @@ impl CurationService {
                 _ => "review",
             };
 
-            self.set_package_status(pkg.id, new_status, &eval.reason, None, eval.rule_id)
-                .await?;
-            updated += 1;
+            groups
+                .entry((new_status.to_string(), eval.reason, eval.rule_id))
+                .or_default()
+                .push(pkg.id);
+        }
+
+        // Batch update each group
+        let mut updated = 0u64;
+        for ((status, reason, rule_id), ids) in &groups {
+            let result = sqlx::query(
+                r#"UPDATE curation_packages SET
+                   status = $2, evaluation_reason = $3, evaluated_by = NULL,
+                   rule_id = $4, evaluated_at = now()
+                   WHERE id = ANY($1)"#,
+            )
+            .bind(ids)
+            .bind(status)
+            .bind(reason)
+            .bind(rule_id)
+            .execute(&self.db)
+            .await?;
+            updated += result.rows_affected();
         }
         Ok(updated)
     }
@@ -471,6 +525,7 @@ fn version_compare(a: &str, b: &str) -> i32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
 
@@ -573,5 +628,135 @@ mod tests {
         // No operator means exact match
         assert!(CurationService::version_matches("1.2.3", "1.2.3"));
         assert!(!CurationService::version_matches("1.2.3", "1.2.4"));
+    }
+
+    // -- evaluate_package_in_memory --
+
+    fn make_rule(
+        pattern: &str,
+        version_constraint: &str,
+        arch: &str,
+        action: &str,
+    ) -> CurationRule {
+        CurationRule {
+            id: Uuid::new_v4(),
+            staging_repo_id: None,
+            package_pattern: pattern.to_string(),
+            version_constraint: version_constraint.to_string(),
+            architecture: arch.to_string(),
+            action: action.to_string(),
+            priority: 0,
+            reason: format!("{action} by test rule"),
+            enabled: true,
+            created_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_no_rules_uses_default() {
+        let eval =
+            CurationService::evaluate_package_in_memory(&[], "allow", "nginx", "1.0.0", None);
+        assert_eq!(eval.action, "allow");
+        assert!(eval.rule_id.is_none());
+        assert!(eval.reason.contains("No matching rule"));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_matching_rule_blocks() {
+        let rule = make_rule("telnet*", "*", "*", "block");
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule.clone()],
+            "allow",
+            "telnet-server",
+            "1.0",
+            None,
+        );
+        assert_eq!(eval.action, "block");
+        assert_eq!(eval.rule_id, Some(rule.id));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_version_mismatch_skips_rule() {
+        let rule = make_rule("nginx", ">= 2.0", "*", "block");
+        let eval =
+            CurationService::evaluate_package_in_memory(&[rule], "allow", "nginx", "1.5", None);
+        // Version 1.5 does not satisfy >= 2.0, so the rule is skipped
+        assert_eq!(eval.action, "allow");
+        assert!(eval.rule_id.is_none());
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_architecture_filter() {
+        let rule = make_rule("*", "*", "aarch64", "block");
+        // Package has x86_64 architecture, rule requires aarch64
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule],
+            "allow",
+            "nginx",
+            "1.0",
+            Some("x86_64"),
+        );
+        assert_eq!(eval.action, "allow");
+        assert!(eval.rule_id.is_none());
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_architecture_match() {
+        let rule = make_rule("*", "*", "x86_64", "block");
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule.clone()],
+            "allow",
+            "nginx",
+            "1.0",
+            Some("x86_64"),
+        );
+        assert_eq!(eval.action, "block");
+        assert_eq!(eval.rule_id, Some(rule.id));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_wildcard_architecture() {
+        // Rule with "*" architecture matches any package architecture
+        let rule = make_rule("nginx", "*", "*", "block");
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule.clone()],
+            "allow",
+            "nginx",
+            "1.0",
+            Some("aarch64"),
+        );
+        assert_eq!(eval.action, "block");
+        assert_eq!(eval.rule_id, Some(rule.id));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_first_match_wins() {
+        let allow_rule = make_rule("nginx", "*", "*", "allow");
+        let block_rule = make_rule("nginx", "*", "*", "block");
+        let eval = CurationService::evaluate_package_in_memory(
+            &[allow_rule.clone(), block_rule],
+            "block",
+            "nginx",
+            "1.0",
+            None,
+        );
+        // The first matching rule (allow) wins
+        assert_eq!(eval.action, "allow");
+        assert_eq!(eval.rule_id, Some(allow_rule.id));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_default_action_review() {
+        let eval = CurationService::evaluate_package_in_memory(
+            &[],
+            "review",
+            "unknown-pkg",
+            "0.1.0",
+            None,
+        );
+        assert_eq!(eval.action, "review");
+        assert!(eval.reason.contains("review"));
     }
 }
