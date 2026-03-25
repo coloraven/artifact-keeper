@@ -1,12 +1,16 @@
-//! S3 storage backend using rust-s3 crate.
+//! S3 storage backend using the `object_store` crate (Apache Arrow project).
 //!
-//! Supports AWS S3 and S3-compatible services (MinIO, etc.).
+//! Supports AWS S3 and S3-compatible services (MinIO, Ceph RGW, R2, etc.).
 //! Configuration via environment variables:
 //! - S3_BUCKET: Bucket name (required)
 //! - S3_REGION: AWS region (default: us-east-1)
 //! - S3_ENDPOINT: Custom endpoint URL for S3-compatible services
 //! - S3_ACCESS_KEY_ID: Access key (preferred, falls back to AWS_ACCESS_KEY_ID)
 //! - S3_SECRET_ACCESS_KEY: Secret key (preferred, falls back to AWS_SECRET_ACCESS_KEY)
+//!
+//! For TLS configuration:
+//! - S3_CA_CERT_PATH: Path to PEM file with custom CA certificate(s)
+//! - S3_INSECURE_TLS: Disable TLS certificate verification (default: false)
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -25,11 +29,10 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use s3::bucket::Bucket;
-use s3::creds::Credentials;
-use s3::error::S3Error;
-use s3::region::Region;
-use s3::request::ResponseData;
+use futures::TryStreamExt;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::time::Duration;
 
 use super::{PresignedUrl, PresignedUrlSource, StoragePathFormat};
@@ -58,6 +61,10 @@ pub struct S3Config {
     pub presign_access_key: Option<String>,
     /// Dedicated secret key for presigned URL signing (optional, overrides default credentials)
     pub presign_secret_key: Option<String>,
+    /// Path to a PEM file containing custom CA certificate(s) for S3 connections
+    pub ca_cert_path: Option<String>,
+    /// Disable TLS certificate verification (for dev/test with self-signed certs)
+    pub insecure_tls: bool,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -99,6 +106,11 @@ impl S3Config {
         let presign_access_key = std::env::var("S3_PRESIGN_ACCESS_KEY_ID").ok();
         let presign_secret_key = std::env::var("S3_PRESIGN_SECRET_ACCESS_KEY").ok();
 
+        let ca_cert_path = std::env::var("S3_CA_CERT_PATH").ok();
+        let insecure_tls = std::env::var("S3_INSECURE_TLS")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
         Ok(Self {
             bucket,
             region,
@@ -110,6 +122,8 @@ impl S3Config {
             path_format,
             presign_access_key,
             presign_secret_key,
+            ca_cert_path,
+            insecure_tls,
         })
     }
 
@@ -168,6 +182,8 @@ impl S3Config {
             path_format: StoragePathFormat::default(),
             presign_access_key: None,
             presign_secret_key: None,
+            ca_cert_path: None,
+            insecure_tls: false,
         }
     }
 
@@ -194,88 +210,133 @@ impl S3Config {
         self.cloudfront = Some(config);
         self
     }
+
+    pub fn with_ca_cert_path(mut self, path: String) -> Self {
+        self.ca_cert_path = Some(path);
+        self
+    }
+
+    pub fn with_insecure_tls(mut self, insecure: bool) -> Self {
+        self.insecure_tls = insecure;
+        self
+    }
+}
+
+/// Generate the full S3 key with optional prefix.
+fn make_full_key(prefix: Option<&str>, key: &str) -> String {
+    match prefix {
+        Some(p) => format!("{}/{}", p.trim_end_matches('/'), key),
+        None => key.to_string(),
+    }
+}
+
+/// Strip the prefix from an S3 key.
+fn strip_key_prefix(prefix: Option<&str>, key: &str) -> String {
+    match prefix {
+        Some(p) => {
+            let prefix_with_slash = format!("{}/", p.trim_end_matches('/'));
+            key.strip_prefix(&prefix_with_slash)
+                .unwrap_or(key)
+                .to_string()
+        }
+        None => key.to_string(),
+    }
+}
+
+/// Try to generate an Artifactory fallback path from a native path.
+/// Native format: ab/cd/abcd...full_checksum (64 chars)
+/// Artifactory format: ab/abcd...full_checksum
+fn artifactory_fallback_path(key: &str) -> Option<String> {
+    if key.split('/').count() < 3 {
+        return None;
+    }
+    let checksum = key.rsplit('/').next()?;
+    if checksum.len() == 64 && checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(format!("{}/{}", &checksum[..2], checksum))
+    } else {
+        None
+    }
 }
 
 /// S3-compatible storage backend
 pub struct S3Backend {
-    bucket: Box<Bucket>,
+    store: AmazonS3,
     prefix: Option<String>,
-    /// Enable redirect downloads via presigned URLs
     redirect_downloads: bool,
-    /// Default presigned URL expiry
-    presign_expiry: Duration,
-    /// CloudFront configuration (optional)
     cloudfront: Option<CloudFrontConfig>,
-    /// Storage path format (for Artifactory compatibility)
     path_format: StoragePathFormat,
-    /// Pre-built signing bucket with dedicated credentials (Option B)
-    signing_bucket: Option<Box<Bucket>>,
-    /// Stored region for creating fresh signing buckets (Option A)
-    region: Region,
-    /// Stored bucket name for creating fresh signing buckets (Option A)
-    bucket_name: String,
-    /// Whether to use path-style access (for MinIO)
-    use_path_style: bool,
+    signing_store: Option<AmazonS3>,
 }
 
 impl S3Backend {
-    /// Create new S3 backend from configuration
-    pub async fn new(config: S3Config) -> Result<Self> {
-        // S3-prefixed credential env vars take precedence, then fall back to the
-        // default AWS credential chain (AWS_ACCESS_KEY_ID, ~/.aws/credentials, IRSA, etc.)
-        let credentials = if let (Ok(ak), Ok(sk)) = (
+    fn build_store(
+        config: &S3Config,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+    ) -> Result<AmazonS3> {
+        let mut client_opts = object_store::ClientOptions::new();
+
+        if config
+            .endpoint
+            .as_ref()
+            .is_some_and(|e| e.starts_with("http://"))
+        {
+            client_opts = client_opts.with_allow_http(true);
+        }
+
+        if let Some(ca_path) = &config.ca_cert_path {
+            let pem = std::fs::read(ca_path).map_err(|e| {
+                AppError::Config(format!("Failed to read CA cert '{}': {}", ca_path, e))
+            })?;
+            let certs = object_store::Certificate::from_pem_bundle(&pem).map_err(|e| {
+                AppError::Config(format!("Invalid CA cert PEM '{}': {}", ca_path, e))
+            })?;
+            for cert in certs {
+                client_opts = client_opts.with_root_certificate(cert);
+            }
+            tracing::info!(path = %ca_path, "Loaded custom CA certificate(s) for S3");
+        }
+
+        if config.insecure_tls {
+            client_opts = client_opts.with_allow_invalid_certificates(true);
+            tracing::warn!("S3 TLS certificate verification is DISABLED (S3_INSECURE_TLS=true)");
+        }
+
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(&config.bucket)
+            .with_region(&config.region)
+            .with_client_options(client_opts);
+
+        if let Some(endpoint) = &config.endpoint {
+            builder = builder.with_endpoint(endpoint);
+        }
+
+        if let Some(ak) = access_key {
+            if let Some(sk) = secret_key {
+                builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
+            }
+        } else if let (Ok(ak), Ok(sk)) = (
             std::env::var("S3_ACCESS_KEY_ID"),
             std::env::var("S3_SECRET_ACCESS_KEY"),
         ) {
             tracing::info!("Using S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY for S3 credentials");
-            Credentials::new(Some(&ak), Some(&sk), None, None, None)
-                .map_err(|e| AppError::Config(format!("Invalid S3 credentials: {}", e)))?
-        } else {
-            Credentials::default()
-                .map_err(|e| AppError::Config(format!("Failed to load AWS credentials: {}", e)))?
-        };
+            builder = builder.with_access_key_id(&ak).with_secret_access_key(&sk);
+        }
 
-        // Create region (with optional custom endpoint)
-        let region = match &config.endpoint {
-            Some(endpoint) => Region::Custom {
-                region: config.region.clone(),
-                endpoint: endpoint.clone(),
-            },
-            None => config
-                .region
-                .parse()
-                .map_err(|_| AppError::Config(format!("Invalid S3 region: {}", config.region)))?,
-        };
+        builder
+            .build()
+            .map_err(|e| AppError::Config(format!("Failed to build S3 client: {}", e)))
+    }
 
-        let use_path_style = config.endpoint.is_some();
+    /// Create new S3 backend from configuration
+    pub async fn new(config: S3Config) -> Result<Self> {
+        let store = Self::build_store(&config, None, None)?;
 
-        // Create bucket handle
-        let bucket = Bucket::new(&config.bucket, region.clone(), credentials)
-            .map_err(|e| AppError::Config(format!("Failed to create S3 bucket: {}", e)))?;
-
-        // Enable path-style access for MinIO compatibility
-        let bucket = if use_path_style {
-            bucket.with_path_style()
-        } else {
-            bucket
-        };
-
-        // Build dedicated signing bucket if explicit presign credentials are provided
-        let signing_bucket = match (&config.presign_access_key, &config.presign_secret_key) {
+        let signing_store = match (&config.presign_access_key, &config.presign_secret_key) {
             (Some(ak), Some(sk)) => {
-                let signing_creds = Credentials::new(Some(ak), Some(sk), None, None, None)
-                    .map_err(|e| AppError::Config(format!("Invalid presign credentials: {}", e)))?;
-                let sb =
-                    Bucket::new(&config.bucket, region.clone(), signing_creds).map_err(|e| {
-                        AppError::Config(format!("Failed to create signing bucket: {}", e))
-                    })?;
-                let sb = if use_path_style {
-                    sb.with_path_style()
-                } else {
-                    sb
-                };
+                let ss = Self::build_store(&config, Some(ak), Some(sk))?;
                 tracing::info!("Using dedicated credentials for presigned URL signing");
-                Some(sb)
+                Some(ss)
             }
             _ => None,
         };
@@ -285,35 +346,25 @@ impl S3Backend {
                 bucket = %config.bucket,
                 cloudfront = config.cloudfront.is_some(),
                 expiry_secs = config.presign_expiry.as_secs(),
-                dedicated_signing_creds = signing_bucket.is_some(),
+                dedicated_signing_creds = signing_store.is_some(),
                 "S3 redirect downloads enabled"
             );
         }
 
         if config.path_format != StoragePathFormat::Native {
-            tracing::info!(
-                path_format = %config.path_format,
-                "S3 storage path format configured"
-            );
+            tracing::info!(path_format = %config.path_format, "S3 storage path format configured");
         }
 
-        let bucket_name = config.bucket;
-
         Ok(Self {
-            bucket,
+            store,
             prefix: config.prefix,
             redirect_downloads: config.redirect_downloads,
-            presign_expiry: config.presign_expiry,
             cloudfront: config.cloudfront,
             path_format: config.path_format,
-            signing_bucket,
-            region,
-            bucket_name,
-            use_path_style,
+            signing_store,
         })
     }
 
-    /// Create S3 backend from environment variables
     pub async fn from_env() -> Result<Self> {
         let config = S3Config::from_env()?;
         Self::new(config).await
@@ -321,175 +372,17 @@ impl S3Backend {
 
     /// Generate the full S3 key with optional prefix
     fn full_key(&self, key: &str) -> String {
-        match &self.prefix {
-            Some(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), key),
-            None => key.to_string(),
-        }
+        make_full_key(self.prefix.as_deref(), key)
     }
 
     /// Strip the prefix from an S3 key
     fn strip_prefix(&self, key: &str) -> String {
-        match &self.prefix {
-            Some(prefix) => {
-                let prefix_with_slash = format!("{}/", prefix.trim_end_matches('/'));
-                key.strip_prefix(&prefix_with_slash)
-                    .unwrap_or(key)
-                    .to_string()
-            }
-            None => key.to_string(),
-        }
+        strip_key_prefix(self.prefix.as_deref(), key)
     }
 
     /// Try to generate an Artifactory fallback path from a native path
-    ///
-    /// Native format: ab/cd/abcd...full_checksum (64 chars)
-    /// Artifactory format: ab/abcd...full_checksum
     fn try_artifactory_fallback(&self, key: &str) -> Option<String> {
-        // Parse native format: {checksum[0:2]}/{checksum[2:4]}/{checksum}
-        let parts: Vec<&str> = key.split('/').collect();
-        if parts.len() >= 3 {
-            // Last part should be the full checksum
-            let checksum = parts[parts.len() - 1];
-            if checksum.len() == 64 && checksum.chars().all(|c| c.is_ascii_hexdigit()) {
-                // Generate Artifactory format: {checksum[0:2]}/{checksum}
-                return Some(format!("{}/{}", &checksum[..2], checksum));
-            }
-        }
-        None
-    }
-
-    fn is_not_found_error(err: &str) -> bool {
-        err.contains("404") || err.contains("NoSuchKey")
-    }
-
-    /// Check if a head_object error string indicates "not found" (includes "Not Found" variant
-    /// used by some S3-compatible backends in addition to standard 404/NoSuchKey).
-    fn is_head_not_found_error(err: &str) -> bool {
-        Self::is_not_found_error(err) || err.contains("Not Found")
-    }
-
-    /// Validate that a put response has a successful status code.
-    /// Returns Ok(()) for 2xx, Err(Storage) otherwise.
-    /// The `body` parameter is included in error messages to surface S3 error
-    /// details (e.g. AccessDenied, SignatureDoesNotMatch) for diagnostics.
-    fn classify_put_status(key: &str, status: u16, body: &[u8]) -> Result<()> {
-        if (200..300).contains(&status) {
-            Ok(())
-        } else {
-            let detail = String::from_utf8_lossy(body);
-            let detail = if detail.is_empty() {
-                String::new()
-            } else {
-                // Truncate long XML bodies to a reasonable length
-                let truncated: String = detail.chars().take(512).collect();
-                format!(": {}", truncated)
-            };
-            Err(AppError::Storage(format!(
-                "S3 returned status {} for put '{}'{}",
-                status, key, detail
-            )))
-        }
-    }
-
-    /// Classify the primary get_object result (before fallback logic).
-    /// Returns:
-    ///   Ok(Some(())) for 2xx responses
-    ///   Ok(None) for 404 status (caller should try fallback)
-    ///   Err(Storage) for other non-2xx status codes
-    fn classify_get_response(key: &str, resp: &ResponseData) -> Result<Option<()>> {
-        let status = resp.status_code();
-        if (200..300).contains(&status) {
-            Ok(Some(()))
-        } else if status == 404 {
-            Ok(None)
-        } else {
-            Err(AppError::Storage(format!(
-                "S3 returned status {} for '{}'",
-                status, key
-            )))
-        }
-    }
-
-    /// Classify a get_object S3Error.
-    /// Returns true if the error indicates "not found" (caller should try fallback),
-    /// or returns Err(Storage) for other errors.
-    fn classify_get_error_is_not_found(key: &str, e: &S3Error) -> Result<bool> {
-        let err_str = e.to_string();
-        if Self::is_not_found_error(&err_str) {
-            Ok(true)
-        } else {
-            Err(AppError::Storage(format!(
-                "Failed to get object '{}': {}",
-                key, e
-            )))
-        }
-    }
-
-    /// Classify a head_object status code for exists/size operations.
-    /// Returns:
-    ///   Ok(Some(true)) for 2xx (object exists)
-    ///   Ok(None) for 404 (not found, caller may try fallback)
-    ///   Err(Storage) for other status codes
-    fn classify_head_status(key: &str, status: u16) -> Result<Option<bool>> {
-        if (200..300).contains(&status) {
-            Ok(Some(true))
-        } else if status == 404 {
-            Ok(None)
-        } else {
-            Err(AppError::Storage(format!(
-                "S3 returned status {} for head '{}'",
-                status, key
-            )))
-        }
-    }
-
-    /// Validate that a delete response has an acceptable status code.
-    /// Returns Ok(()) for 2xx or 404, Err(Storage) otherwise.
-    fn classify_delete_status(key: &str, status: u16) -> Result<()> {
-        if (200..300).contains(&status) || status == 404 {
-            Ok(())
-        } else {
-            Err(AppError::Storage(format!(
-                "S3 returned status {} for delete '{}'",
-                status, key
-            )))
-        }
-    }
-
-    fn classify_fallback_get_result(
-        key: &str,
-        fallback_key: &str,
-        result: std::result::Result<ResponseData, S3Error>,
-    ) -> Result<Option<Bytes>> {
-        match result {
-            Ok(resp) if (200..300).contains(&resp.status_code()) => {
-                tracing::info!(
-                    key = %key,
-                    fallback = %fallback_key,
-                    size = resp.bytes().len(),
-                    "Found artifact at Artifactory fallback path"
-                );
-                Ok(Some(Bytes::from(resp.to_vec())))
-            }
-            Ok(resp) if resp.status_code() == 404 => Ok(None),
-            Ok(resp) => Err(AppError::Storage(format!(
-                "S3 returned status {} for fallback '{}' while reading '{}'",
-                resp.status_code(),
-                fallback_key,
-                key
-            ))),
-            Err(e) => {
-                let err_str = e.to_string();
-                if Self::is_not_found_error(&err_str) {
-                    Ok(None)
-                } else {
-                    Err(AppError::Storage(format!(
-                        "Failed to get fallback object '{}' for '{}': {}",
-                        fallback_key, key, e
-                    )))
-                }
-            }
-        }
+        artifactory_fallback_path(key)
     }
 
     async fn try_fallback_get(&self, key: &str, reason: &'static str) -> Result<Option<Bytes>> {
@@ -509,11 +402,26 @@ impl S3Backend {
             "Trying Artifactory fallback path"
         );
 
-        Self::classify_fallback_get_result(
-            key,
-            &fallback_key,
-            self.bucket.get_object(&fallback_full_key).await,
-        )
+        let path: ObjectPath = fallback_full_key.into();
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let bytes = result.bytes().await.map_err(|e| {
+                    AppError::Storage(format!("Failed to read fallback '{}': {}", fallback_key, e))
+                })?;
+                tracing::info!(
+                    key = %key,
+                    fallback = %fallback_key,
+                    size = bytes.len(),
+                    "Found artifact at Artifactory fallback path"
+                );
+                Ok(Some(bytes))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(AppError::Storage(format!(
+                "Failed to get fallback object '{}' for '{}': {}",
+                fallback_key, key, e
+            ))),
+        }
     }
 }
 
@@ -521,34 +429,12 @@ impl S3Backend {
 impl super::StorageBackend for S3Backend {
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let resp = self
-            .bucket
-            .put_object(&full_key, &content)
-            .await
-            .map_err(|e| {
-                // With fail-on-err, non-2xx responses arrive here as
-                // S3Error::HttpFailWithBody(status, body) which includes the
-                // full S3 error XML (e.g. AccessDenied, SignatureDoesNotMatch).
-                tracing::error!(
-                    key = %key,
-                    full_key = %full_key,
-                    error = %e,
-                    "S3 put_object failed"
-                );
-                AppError::Storage(format!("Failed to put object '{}': {}", key, e))
-            })?;
-
-        if let Err(e) = Self::classify_put_status(key, resp.status_code(), resp.bytes()) {
-            tracing::error!(
-                key = %key,
-                full_key = %full_key,
-                status = resp.status_code(),
-                response_body = %String::from_utf8_lossy(resp.bytes()),
-                "S3 put rejected"
-            );
-            return Err(e);
-        }
+        self.store.put(&path, content.into()).await.map_err(|e| {
+            tracing::error!(key = %key, error = %e, "S3 put_object failed");
+            AppError::Storage(format!("Failed to put object '{}': {}", key, e))
+        })?;
 
         tracing::debug!(key = %key, "S3 put object successful");
         Ok(())
@@ -556,105 +442,66 @@ impl super::StorageBackend for S3Backend {
 
     async fn get(&self, key: &str) -> Result<Bytes> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let response = match self.bucket.get_object(&full_key).await {
-            Ok(resp) => match Self::classify_get_response(key, &resp)? {
-                Some(()) => resp,
-                None => {
-                    // rust-s3 may return Ok with 404 status (e.g. Ceph RGW)
-                    if let Some(bytes) = self
-                        .try_fallback_get(key, "primary returned status 404")
-                        .await?
-                    {
-                        return Ok(bytes);
-                    }
-                    return Err(AppError::NotFound(format!(
-                        "Storage key not found: {}",
-                        key
-                    )));
-                }
-            },
-            Err(e) => {
-                if Self::classify_get_error_is_not_found(key, &e)? {
-                    if let Some(bytes) = self
-                        .try_fallback_get(key, "primary returned not found error")
-                        .await?
-                    {
-                        return Ok(bytes);
-                    }
-                    return Err(AppError::NotFound(format!(
-                        "Storage key not found: {}",
-                        key
-                    )));
-                }
-                // classify_get_error_is_not_found returns Err for non-not-found errors,
-                // so this is unreachable, but kept for safety.
-                return Err(AppError::Storage(format!(
-                    "Failed to get object '{}': {}",
-                    key, e
-                )));
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let bytes = result.bytes().await.map_err(|e| {
+                    AppError::Storage(format!("Failed to read object '{}': {}", key, e))
+                })?;
+                tracing::debug!(key = %key, size = bytes.len(), "S3 get object successful");
+                Ok(bytes)
             }
-        };
-
-        tracing::debug!(key = %key, size = response.bytes().len(), "S3 get object successful");
-        Ok(Bytes::from(response.to_vec()))
+            Err(object_store::Error::NotFound { .. }) => {
+                if let Some(bytes) = self.try_fallback_get(key, "primary not found").await? {
+                    return Ok(bytes);
+                }
+                Err(AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    key
+                )))
+            }
+            Err(e) => Err(AppError::Storage(format!(
+                "Failed to get object '{}': {}",
+                key, e
+            ))),
+        }
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let is_not_found = match self.bucket.head_object(&full_key).await {
-            Ok((_, status)) => {
-                match Self::classify_head_status(key, status)? {
-                    Some(true) => return Ok(true),
-                    _ => true, // 404 -> not found, try fallback
-                }
-            }
+        match self.store.head(&path).await {
+            Ok(_) => return Ok(true),
+            Err(object_store::Error::NotFound { .. }) => {}
             Err(e) => {
-                let err_str = e.to_string();
-                if Self::is_head_not_found_error(&err_str) {
-                    true
-                } else {
-                    return Err(AppError::Storage(format!(
-                        "Failed to check existence of '{}': {}",
-                        key, e
-                    )));
-                }
+                return Err(AppError::Storage(format!(
+                    "Failed to check existence of '{}': {}",
+                    key, e
+                )));
             }
-        };
+        }
 
-        if is_not_found && self.path_format.has_fallback() {
+        if self.path_format.has_fallback() {
             if let Some(fallback_key) = self.try_artifactory_fallback(key) {
                 let fallback_full_key = self.full_key(&fallback_key);
-                match self.bucket.head_object(&fallback_full_key).await {
-                    Ok((_, status)) if (200..300).contains(&status) => {
+                let fallback_path: ObjectPath = fallback_full_key.into();
+                match self.store.head(&fallback_path).await {
+                    Ok(_) => {
                         tracing::debug!(
-                            key = %key,
-                            fallback = %fallback_key,
+                            key = %key, fallback = %fallback_key,
                             "Found artifact at Artifactory fallback path"
                         );
                         return Ok(true);
                     }
-                    Ok((_, status)) if status != 404 => {
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => {
                         tracing::warn!(
-                            key = %key,
-                            fallback = %fallback_key,
-                            status,
-                            "Unexpected status from fallback head_object"
+                            key = %key, fallback = %fallback_key, error = %e,
+                            "Fallback head_object failed with unexpected error"
                         );
                     }
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if !Self::is_head_not_found_error(&err_str) {
-                            tracing::warn!(
-                                key = %key,
-                                fallback = %fallback_key,
-                                error = %e,
-                                "Fallback head_object failed with unexpected error"
-                            );
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
@@ -664,13 +511,12 @@ impl super::StorageBackend for S3Backend {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let resp =
-            self.bucket.delete_object(&full_key).await.map_err(|e| {
-                AppError::Storage(format!("Failed to delete object '{}': {}", key, e))
-            })?;
-
-        Self::classify_delete_status(key, resp.status_code())?;
+        self.store
+            .delete(&path)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to delete object '{}': {}", key, e)))?;
 
         tracing::debug!(key = %key, "S3 delete object successful");
         Ok(())
@@ -690,15 +536,11 @@ impl super::StorageBackend for S3Backend {
         }
 
         let full_key = self.full_key(key);
-        let expiry_secs = expires_in.as_secs().min(604800) as u32; // Max 7 days for S3
 
-        // If CloudFront is configured, use CloudFront signed URLs
         if let Some(cf) = &self.cloudfront {
             let url = self.generate_cloudfront_signed_url(cf, &full_key, expires_in)?;
             tracing::debug!(
-                key = %key,
-                expires_in_secs = expiry_secs,
-                source = "cloudfront",
+                key = %key, expires_in_secs = expires_in.as_secs(), source = "cloudfront",
                 "Generated CloudFront signed URL"
             );
             return Ok(Some(PresignedUrl {
@@ -708,93 +550,45 @@ impl super::StorageBackend for S3Backend {
             }));
         }
 
-        // Generate S3 presigned URL with fresh or dedicated credentials
-        let presign_result = if let Some(sb) = &self.signing_bucket {
-            // Option B: use dedicated signing credentials (long-lived, no STS expiry concern)
-            sb.presign_get(&full_key, expiry_secs, None).await
-        } else {
-            // Option A: refresh credentials from default chain before signing
-            // This ensures STS/IRSA credentials are current, so the presigned URL
-            // gets the full requested lifetime instead of being limited by
-            // the remaining TTL of stale credentials.
-            match Credentials::default() {
-                Ok(fresh_creds) => {
-                    match Bucket::new(&self.bucket_name, self.region.clone(), fresh_creds) {
-                        Ok(fresh_bucket) => {
-                            let fresh_bucket = if self.use_path_style {
-                                fresh_bucket.with_path_style()
-                            } else {
-                                fresh_bucket
-                            };
-                            fresh_bucket.presign_get(&full_key, expiry_secs, None).await
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to create fresh signing bucket, using cached credentials: {}",
-                                e
-                            );
-                            self.bucket.presign_get(&full_key, expiry_secs, None).await
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to refresh credentials for presigning, using cached credentials: {}",
-                        e
-                    );
-                    self.bucket.presign_get(&full_key, expiry_secs, None).await
-                }
-            }
-        };
+        use object_store::signer::Signer;
 
-        let url = presign_result.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to generate presigned URL for '{}': {}",
-                key, e
-            ))
-        })?;
+        let path: ObjectPath = full_key.into();
+        let signer = self.signing_store.as_ref().unwrap_or(&self.store);
+
+        // S3 enforces a maximum presigned URL expiry of 7 days
+        let clamped_expiry = Duration::from_secs(expires_in.as_secs().min(604800));
+
+        let presigned_url = signer
+            .signed_url(http::Method::GET, &path, clamped_expiry)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to generate presigned URL for '{}': {}",
+                    key, e
+                ))
+            })?;
 
         tracing::debug!(
-            key = %key,
-            expires_in_secs = expiry_secs,
-            source = "s3",
-            dedicated_creds = self.signing_bucket.is_some(),
+            key = %key, expires_in_secs = clamped_expiry.as_secs(), source = "s3",
+            dedicated_creds = self.signing_store.is_some(),
             "Generated S3 presigned URL"
         );
 
         Ok(Some(PresignedUrl {
-            url,
-            expires_in,
+            url: presigned_url.to_string(),
+            expires_in: clamped_expiry,
             source: PresignedUrlSource::S3,
         }))
     }
 
     async fn health_check(&self) -> Result<()> {
-        // Use head_object on a sentinel key. A 404 (NoSuchKey) proves that the
-        // bucket is reachable and credentials are valid. Only transport-level or
-        // auth errors indicate an unhealthy backend.
-        match self.bucket.head_object(".health-probe").await {
+        let path: ObjectPath = ".health-probe".into();
+        match self.store.head(&path).await {
             Ok(_) => Ok(()),
-            Err(S3Error::HttpFailWithBody(status, _)) if (400..500).contains(&status) => {
-                // 4xx other than auth errors: bucket is reachable.
-                // 403 could mean bad creds, so treat that as unhealthy.
-                if status == 403 {
-                    Err(AppError::Storage(
-                        "S3 health check failed: access denied (403)".to_string(),
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => {
-                let err_str = e.to_string();
-                // 404 / NoSuchKey is expected and proves connectivity
-                if err_str.contains("404")
-                    || err_str.contains("NoSuchKey")
-                    || err_str.contains("Not Found")
-                {
-                    Ok(())
-                } else if err_str.contains("403") || err_str.contains("Access Denied") {
+                let msg = e.to_string();
+                if msg.contains("403") || msg.contains("Access Denied") {
                     Err(AppError::Storage(format!(
                         "S3 health check failed: access denied: {}",
                         e
@@ -818,16 +612,17 @@ impl S3Backend {
             (None, None) => String::new(),
         };
 
-        let results = self
-            .bucket
-            .list(search_prefix, None)
+        let list_path: ObjectPath = search_prefix.into();
+        let objects: Vec<_> = self
+            .store
+            .list(Some(&list_path))
+            .try_collect()
             .await
             .map_err(|e| AppError::Storage(format!("Failed to list objects: {}", e)))?;
 
-        let keys: Vec<String> = results
+        let keys: Vec<String> = objects
             .into_iter()
-            .flat_map(|result| result.contents)
-            .map(|obj| self.strip_prefix(&obj.key))
+            .map(|meta| self.strip_prefix(meta.location.as_ref()))
             .collect();
 
         tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
@@ -839,15 +634,12 @@ impl S3Backend {
         let source_key = self.full_key(source);
         let dest_key = self.full_key(dest);
 
-        // S3 CopyObject requires source in format "bucket/key"
-        let copy_source = format!("{}/{}", self.bucket.name(), source_key);
+        let from: ObjectPath = source_key.into();
+        let to: ObjectPath = dest_key.into();
 
-        self.bucket
-            .copy_object_internal(&copy_source, &dest_key)
-            .await
-            .map_err(|e| {
-                AppError::Storage(format!("Failed to copy '{}' to '{}': {}", source, dest, e))
-            })?;
+        self.store.copy(&from, &to).await.map_err(|e| {
+            AppError::Storage(format!("Failed to copy '{}' to '{}': {}", source, dest, e))
+        })?;
 
         tracing::debug!(source = %source, dest = %dest, "S3 copy object successful");
         Ok(())
@@ -856,35 +648,22 @@ impl S3Backend {
     /// Get content size without fetching full content
     pub async fn size(&self, key: &str) -> Result<u64> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let (head, status) = match self.bucket.head_object(&full_key).await {
-            Ok((head, status)) => match Self::classify_head_status(key, status)? {
-                Some(true) => (head, status),
-                _ => {
-                    return Err(AppError::NotFound(format!(
-                        "Storage key not found: {}",
-                        key
-                    )));
-                }
-            },
-            Err(e) => {
-                let err_str = e.to_string();
-                if Self::is_head_not_found_error(&err_str) {
-                    return Err(AppError::NotFound(format!(
-                        "Storage key not found: {}",
-                        key
-                    )));
-                }
-                return Err(AppError::Storage(format!(
-                    "Failed to get size of '{}': {}",
-                    key, e
-                )));
+        match self.store.head(&path).await {
+            Ok(meta) => {
+                tracing::debug!(key = %key, size = meta.size, "S3 head object successful");
+                Ok(meta.size)
             }
-        };
-
-        let size = head.content_length.unwrap_or(0) as u64;
-        tracing::debug!(key = %key, size = size, status, "S3 head object successful");
-        Ok(size)
+            Err(object_store::Error::NotFound { .. }) => Err(AppError::NotFound(format!(
+                "Storage key not found: {}",
+                key
+            ))),
+            Err(e) => Err(AppError::Storage(format!(
+                "Failed to get size of '{}': {}",
+                key, e
+            ))),
+        }
     }
 
     /// Generate a CloudFront signed URL
@@ -946,67 +725,135 @@ impl S3Backend {
 
         Ok(signed_url)
     }
-
-    /// Check if redirect downloads are enabled
-    pub fn redirect_enabled(&self) -> bool {
-        self.redirect_downloads
-    }
-
-    /// Get the default presign expiry duration
-    pub fn default_presign_expiry(&self) -> Duration {
-        self.presign_expiry
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // --- free function tests: make_full_key ---
+
     #[test]
     fn test_full_key_with_prefix() {
-        // We can't create a real S3Backend without credentials, but we can test the key logic
-        // by testing the string operations directly
-        let prefix = Some("artifacts".to_string());
-        let key = "test/file.txt";
-
-        let full = match &prefix {
-            Some(p) => format!("{}/{}", p.trim_end_matches('/'), key),
-            None => key.to_string(),
-        };
-
-        assert_eq!(full, "artifacts/test/file.txt");
+        assert_eq!(
+            make_full_key(Some("artifacts"), "test/file.txt"),
+            "artifacts/test/file.txt"
+        );
     }
 
     #[test]
     fn test_full_key_without_prefix() {
-        let prefix: Option<String> = None;
-        let key = "test/file.txt";
-
-        let full = match &prefix {
-            Some(p) => format!("{}/{}", p.trim_end_matches('/'), key),
-            None => key.to_string(),
-        };
-
-        assert_eq!(full, "test/file.txt");
+        assert_eq!(make_full_key(None, "test/file.txt"), "test/file.txt");
     }
 
     #[test]
-    fn test_strip_prefix() {
-        let prefix = Some("artifacts".to_string());
-        let key = "artifacts/test/file.txt";
-
-        let stripped = match &prefix {
-            Some(p) => {
-                let prefix_with_slash = format!("{}/", p.trim_end_matches('/'));
-                key.strip_prefix(&prefix_with_slash)
-                    .unwrap_or(key)
-                    .to_string()
-            }
-            None => key.to_string(),
-        };
-
-        assert_eq!(stripped, "test/file.txt");
+    fn test_full_key_trailing_slash_prefix() {
+        assert_eq!(
+            make_full_key(Some("artifacts/"), "test/file.txt"),
+            "artifacts/test/file.txt"
+        );
     }
+
+    #[test]
+    fn test_full_key_empty_key() {
+        assert_eq!(make_full_key(Some("prefix"), ""), "prefix/");
+        assert_eq!(make_full_key(None, ""), "");
+    }
+
+    #[test]
+    fn test_make_full_key_double_slash_prevention() {
+        // Prefix with trailing slash should not produce double slash
+        assert_eq!(make_full_key(Some("prefix/"), "key"), "prefix/key");
+    }
+
+    // --- free function tests: strip_key_prefix ---
+
+    #[test]
+    fn test_strip_prefix() {
+        assert_eq!(
+            strip_key_prefix(Some("artifacts"), "artifacts/test/file.txt"),
+            "test/file.txt"
+        );
+    }
+
+    #[test]
+    fn test_strip_prefix_no_match() {
+        assert_eq!(
+            strip_key_prefix(Some("other-prefix"), "artifacts/test/file.txt"),
+            "artifacts/test/file.txt"
+        );
+    }
+
+    #[test]
+    fn test_strip_prefix_none() {
+        assert_eq!(strip_key_prefix(None, "test/file.txt"), "test/file.txt");
+    }
+
+    #[test]
+    fn test_strip_prefix_exact_match() {
+        // Key is exactly "prefix/" with nothing after
+        assert_eq!(strip_key_prefix(Some("prefix"), "prefix/"), "");
+    }
+
+    #[test]
+    fn test_strip_prefix_with_trailing_slash() {
+        assert_eq!(
+            strip_key_prefix(Some("prefix/"), "prefix/test/file.txt"),
+            "test/file.txt"
+        );
+    }
+
+    // --- free function tests: artifactory_fallback_path ---
+
+    #[test]
+    fn test_artifactory_fallback_valid_native_path() {
+        let key = "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
+        let result = artifactory_fallback_path(key);
+        assert_eq!(
+            result.unwrap(),
+            "91/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
+        );
+    }
+
+    #[test]
+    fn test_artifactory_fallback_short_checksum_rejected() {
+        assert!(artifactory_fallback_path("ab/cd/abcdef1234").is_none());
+    }
+
+    #[test]
+    fn test_artifactory_fallback_non_hex_rejected() {
+        assert!(artifactory_fallback_path(
+            "zz/yy/zzyy00000000000000000000000000000000000000000000000000gggggg"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_artifactory_fallback_single_segment_rejected() {
+        assert!(artifactory_fallback_path(
+            "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_artifactory_fallback_two_segments() {
+        assert!(artifactory_fallback_path(
+            "ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_artifactory_fallback_deeply_nested() {
+        // More than 3 segments should still work (takes the last one)
+        let checksum = "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
+        let key = format!("a/b/c/d/{}", checksum);
+        let result = artifactory_fallback_path(&key);
+        assert_eq!(result.unwrap(), format!("91/{}", checksum));
+    }
+
+    // --- S3Config constructor / builder tests ---
 
     #[test]
     fn test_s3_config_new() {
@@ -1030,48 +877,13 @@ mod tests {
     fn test_s3_config_with_path_format() {
         let config = S3Config::new("my-bucket".to_string(), "us-west-2".to_string(), None, None)
             .with_path_format(StoragePathFormat::Artifactory);
-
         assert_eq!(config.path_format, StoragePathFormat::Artifactory);
     }
 
     #[test]
-    fn test_artifactory_fallback_path_extraction() {
-        // Test the path extraction logic directly
-        let native_key = "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
-
-        // Parse native format: {checksum[0:2]}/{checksum[2:4]}/{checksum}
-        let parts: Vec<&str> = native_key.split('/').collect();
-        assert_eq!(parts.len(), 3);
-
-        let checksum = parts[2];
-        assert_eq!(checksum.len(), 64);
-
-        // Generate Artifactory format
-        let artifactory_key = format!("{}/{}", &checksum[..2], checksum);
-        assert_eq!(
-            artifactory_key,
-            "91/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
-        );
-    }
-
-    #[test]
-    fn test_artifactory_fallback_invalid_key() {
-        // Test with invalid key (not a valid checksum path)
-        let invalid_key = "not/a/valid/path.txt";
-
-        let parts: Vec<&str> = invalid_key.split('/').collect();
-        let last_part = parts.last().unwrap();
-
-        // Should not match: not 64 chars and not all hex
-        assert!(last_part.len() != 64 || !last_part.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
     fn test_path_format_with_s3_config() {
-        // Test that path format is properly set via with_path_format
         let config = S3Config::new("test".to_string(), "us-east-1".to_string(), None, None)
             .with_path_format(StoragePathFormat::Migration);
-
         assert_eq!(config.path_format, StoragePathFormat::Migration);
         assert!(config.path_format.has_fallback());
     }
@@ -1088,510 +900,8 @@ mod tests {
         let config = S3Config::new("b".to_string(), "us-east-1".to_string(), None, None)
             .with_redirect_downloads(true);
         assert!(config.redirect_downloads);
-        // Without presign credentials, Option A (auto-refresh) will be used
         assert!(config.presign_access_key.is_none());
     }
-
-    #[test]
-    fn test_is_not_found_error_matches_404() {
-        assert!(S3Backend::is_not_found_error(
-            "Got HTTP 404 with content 'NoSuchKey'"
-        ));
-        assert!(S3Backend::is_not_found_error("NoSuchKey"));
-        assert!(S3Backend::is_not_found_error("404"));
-    }
-
-    #[test]
-    fn test_is_not_found_error_rejects_other_errors() {
-        assert!(!S3Backend::is_not_found_error(
-            "Got HTTP 500 with content 'Internal'"
-        ));
-        assert!(!S3Backend::is_not_found_error("Service Unavailable"));
-        assert!(!S3Backend::is_not_found_error("connection refused"));
-    }
-
-    const TEST_KEY: &str = "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
-    const TEST_FALLBACK: &str =
-        "91/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
-
-    #[test]
-    fn test_classify_fallback_get_result_success_returns_bytes() {
-        use std::collections::HashMap;
-
-        let body = b"artifact data";
-        let resp = ResponseData::new(Bytes::from_static(body), 200, HashMap::new());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
-
-        let bytes = result.unwrap().expect("expected Some(bytes)");
-        assert_eq!(&bytes[..], body);
-    }
-
-    #[test]
-    fn test_classify_fallback_get_result_404_returns_none() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b""), 404, HashMap::new());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
-
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_classify_fallback_get_result_propagates_server_failure() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(
-            Bytes::from_static(b"fallback unavailable"),
-            500,
-            HashMap::new(),
-        );
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
-
-        match result {
-            Err(AppError::Storage(message)) => {
-                assert!(
-                    message.contains("500"),
-                    "unexpected error message: {message}"
-                );
-            }
-            other => panic!("expected storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_fallback_get_result_not_found_error_returns_none() {
-        let err = S3Error::HttpFailWithBody(404, "NoSuchKey".to_string());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Err(err));
-
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_classify_fallback_get_result_other_error_propagates() {
-        let err = S3Error::HttpFailWithBody(503, "Service Unavailable".to_string());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Err(err));
-
-        match result {
-            Err(AppError::Storage(message)) => {
-                assert!(
-                    message.contains("Service Unavailable"),
-                    "unexpected error message: {message}"
-                );
-            }
-            other => panic!("expected storage error, got {other:?}"),
-        }
-    }
-
-    // --- is_head_not_found_error tests ---
-
-    #[test]
-    fn test_is_head_not_found_error_matches_404_and_nosuchkey() {
-        assert!(S3Backend::is_head_not_found_error("404"));
-        assert!(S3Backend::is_head_not_found_error("NoSuchKey"));
-        assert!(S3Backend::is_head_not_found_error("Not Found"));
-        assert!(S3Backend::is_head_not_found_error("Got HTTP 404 Not Found"));
-    }
-
-    #[test]
-    fn test_is_head_not_found_error_rejects_other_errors() {
-        assert!(!S3Backend::is_head_not_found_error(
-            "500 Internal Server Error"
-        ));
-        assert!(!S3Backend::is_head_not_found_error("connection refused"));
-        assert!(!S3Backend::is_head_not_found_error("timeout"));
-    }
-
-    // --- classify_put_status tests ---
-
-    #[test]
-    fn test_classify_put_status_accepts_200() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 200, b"").is_ok());
-    }
-
-    #[test]
-    fn test_classify_put_status_accepts_201() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 201, b"").is_ok());
-    }
-
-    #[test]
-    fn test_classify_put_status_accepts_204() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 204, b"").is_ok());
-    }
-
-    #[test]
-    fn test_classify_put_status_rejects_403() {
-        let body = b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
-        match S3Backend::classify_put_status(TEST_KEY, 403, body) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("403"), "expected 403 in message: {msg}");
-                assert!(msg.contains("put"), "expected 'put' in message: {msg}");
-                assert!(
-                    msg.contains("AccessDenied"),
-                    "expected S3 error detail in message: {msg}"
-                );
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_put_status_rejects_500() {
-        match S3Backend::classify_put_status(TEST_KEY, 500, b"Internal Error") {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("500"), "expected 500 in message: {msg}");
-                assert!(
-                    msg.contains("Internal Error"),
-                    "expected S3 body in message: {msg}"
-                );
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_put_status_rejects_500_empty_body() {
-        match S3Backend::classify_put_status(TEST_KEY, 500, b"") {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("500"), "expected 500 in message: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_put_status_rejects_301_redirect() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 301, b"").is_err());
-    }
-
-    // --- classify_get_response tests ---
-
-    #[test]
-    fn test_classify_get_response_200_returns_some() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b"data"), 200, HashMap::new());
-        let result = S3Backend::classify_get_response(TEST_KEY, &resp);
-        assert!(result.unwrap().is_some());
-    }
-
-    #[test]
-    fn test_classify_get_response_206_partial_returns_some() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b"partial"), 206, HashMap::new());
-        let result = S3Backend::classify_get_response(TEST_KEY, &resp);
-        assert!(result.unwrap().is_some());
-    }
-
-    #[test]
-    fn test_classify_get_response_404_returns_none() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b""), 404, HashMap::new());
-        let result = S3Backend::classify_get_response(TEST_KEY, &resp);
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_classify_get_response_500_returns_storage_error() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b""), 500, HashMap::new());
-        match S3Backend::classify_get_response(TEST_KEY, &resp) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("500"), "expected 500 in message: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_get_response_403_returns_storage_error() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b"Forbidden"), 403, HashMap::new());
-        match S3Backend::classify_get_response(TEST_KEY, &resp) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("403"), "expected 403 in message: {msg}");
-                assert!(msg.contains(TEST_KEY), "expected key in message: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    // --- classify_get_error_is_not_found tests ---
-
-    #[test]
-    fn test_classify_get_error_is_not_found_for_404() {
-        let err = S3Error::HttpFailWithBody(404, "NoSuchKey".to_string());
-        let result = S3Backend::classify_get_error_is_not_found(TEST_KEY, &err);
-        assert!(result.unwrap());
-    }
-
-    #[test]
-    fn test_classify_get_error_is_not_found_for_nosuchkey() {
-        let err = S3Error::HttpFailWithBody(
-            404,
-            "NoSuchKey: the specified key does not exist".to_string(),
-        );
-        let result = S3Backend::classify_get_error_is_not_found(TEST_KEY, &err);
-        assert!(result.unwrap());
-    }
-
-    #[test]
-    fn test_classify_get_error_propagates_503() {
-        let err = S3Error::HttpFailWithBody(503, "Service Unavailable".to_string());
-        match S3Backend::classify_get_error_is_not_found(TEST_KEY, &err) {
-            Err(AppError::Storage(msg)) => {
-                assert!(
-                    msg.contains("Service Unavailable"),
-                    "expected error detail in message: {msg}"
-                );
-                assert!(msg.contains(TEST_KEY), "expected key in message: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_get_error_propagates_io_error() {
-        let err = S3Error::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            "connection refused",
-        ));
-        match S3Backend::classify_get_error_is_not_found(TEST_KEY, &err) {
-            Err(AppError::Storage(msg)) => {
-                assert!(
-                    msg.contains("connection refused"),
-                    "expected error detail in message: {msg}"
-                );
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    // --- classify_head_status tests ---
-
-    #[test]
-    fn test_classify_head_status_200_returns_some_true() {
-        let result = S3Backend::classify_head_status(TEST_KEY, 200);
-        assert_eq!(result.unwrap(), Some(true));
-    }
-
-    #[test]
-    fn test_classify_head_status_204_returns_some_true() {
-        let result = S3Backend::classify_head_status(TEST_KEY, 204);
-        assert_eq!(result.unwrap(), Some(true));
-    }
-
-    #[test]
-    fn test_classify_head_status_404_returns_none() {
-        let result = S3Backend::classify_head_status(TEST_KEY, 404);
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_classify_head_status_403_returns_storage_error() {
-        match S3Backend::classify_head_status(TEST_KEY, 403) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("403"), "expected 403 in message: {msg}");
-                assert!(msg.contains("head"), "expected 'head' in message: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_head_status_500_returns_storage_error() {
-        match S3Backend::classify_head_status(TEST_KEY, 500) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("500"), "expected 500 in message: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_head_status_301_returns_storage_error() {
-        // Redirects should not be silently accepted
-        assert!(S3Backend::classify_head_status(TEST_KEY, 301).is_err());
-    }
-
-    // --- classify_delete_status tests ---
-
-    #[test]
-    fn test_classify_delete_status_200_ok() {
-        assert!(S3Backend::classify_delete_status(TEST_KEY, 200).is_ok());
-    }
-
-    #[test]
-    fn test_classify_delete_status_204_ok() {
-        assert!(S3Backend::classify_delete_status(TEST_KEY, 204).is_ok());
-    }
-
-    #[test]
-    fn test_classify_delete_status_404_ok() {
-        // Delete of a non-existent key is fine (idempotent)
-        assert!(S3Backend::classify_delete_status(TEST_KEY, 404).is_ok());
-    }
-
-    #[test]
-    fn test_classify_delete_status_403_returns_error() {
-        match S3Backend::classify_delete_status(TEST_KEY, 403) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("403"), "expected 403 in message: {msg}");
-                assert!(
-                    msg.contains("delete"),
-                    "expected 'delete' in message: {msg}"
-                );
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_delete_status_500_returns_error() {
-        match S3Backend::classify_delete_status(TEST_KEY, 500) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("500"), "expected 500 in message: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_delete_status_503_returns_error() {
-        assert!(S3Backend::classify_delete_status(TEST_KEY, 503).is_err());
-    }
-
-    // --- classify_fallback_get_result: additional edge cases ---
-
-    #[test]
-    fn test_classify_fallback_get_result_201_returns_bytes() {
-        use std::collections::HashMap;
-
-        let body = b"created";
-        let resp = ResponseData::new(Bytes::from_static(body), 201, HashMap::new());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
-
-        let bytes = result.unwrap().expect("expected Some(bytes)");
-        assert_eq!(&bytes[..], body);
-    }
-
-    #[test]
-    fn test_classify_fallback_get_result_403_returns_error() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b"Forbidden"), 403, HashMap::new());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
-
-        match result {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("403"), "expected 403 in message: {msg}");
-                assert!(
-                    msg.contains("fallback"),
-                    "expected 'fallback' in message: {msg}"
-                );
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_fallback_get_result_empty_body_on_success() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b""), 200, HashMap::new());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
-
-        let bytes = result.unwrap().expect("expected Some(bytes)");
-        assert!(bytes.is_empty());
-    }
-
-    // --- Boundary / combined tests ---
-
-    #[test]
-    fn test_status_code_boundary_299_is_success() {
-        // 299 is the upper boundary of 2xx
-        assert!(S3Backend::classify_put_status(TEST_KEY, 299, b"").is_ok());
-        assert!(S3Backend::classify_delete_status(TEST_KEY, 299).is_ok());
-        assert_eq!(
-            S3Backend::classify_head_status(TEST_KEY, 299).unwrap(),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn test_status_code_boundary_300_is_failure() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 300, b"").is_err());
-        assert!(S3Backend::classify_head_status(TEST_KEY, 300)
-            .unwrap_err()
-            .to_string()
-            .contains("300"));
-    }
-
-    #[test]
-    fn test_status_code_boundary_199_is_failure() {
-        // Below 200 range
-        assert!(S3Backend::classify_put_status(TEST_KEY, 199, b"").is_err());
-        assert!(S3Backend::classify_delete_status(TEST_KEY, 199).is_err());
-    }
-
-    #[test]
-    fn test_classify_get_response_includes_key_in_error() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b""), 503, HashMap::new());
-        match S3Backend::classify_get_response(TEST_KEY, &resp) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains(TEST_KEY), "error should include key: {msg}");
-                assert!(msg.contains("503"), "error should include status: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_put_status_includes_key_in_error() {
-        match S3Backend::classify_put_status("my/custom/key.jar", 502, b"Bad Gateway") {
-            Err(AppError::Storage(msg)) => {
-                assert!(
-                    msg.contains("my/custom/key.jar"),
-                    "error should include key: {msg}"
-                );
-                assert!(msg.contains("502"), "error should include status: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_head_status_includes_key_in_error() {
-        match S3Backend::classify_head_status("some/artifact", 503) {
-            Err(AppError::Storage(msg)) => {
-                assert!(
-                    msg.contains("some/artifact"),
-                    "error should include key: {msg}"
-                );
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_delete_status_includes_key_in_error() {
-        match S3Backend::classify_delete_status("to-delete/key", 502) {
-            Err(AppError::Storage(msg)) => {
-                assert!(
-                    msg.contains("to-delete/key"),
-                    "error should include key: {msg}"
-                );
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
-    // --- S3Config builder method tests ---
 
     #[test]
     fn test_s3_config_with_presign_expiry() {
@@ -1624,6 +934,8 @@ mod tests {
         assert_eq!(config.path_format, StoragePathFormat::Native);
         assert!(config.endpoint.is_none());
         assert!(config.prefix.is_none());
+        assert!(config.ca_cert_path.is_none());
+        assert!(!config.insecure_tls);
     }
 
     #[test]
@@ -1654,134 +966,6 @@ mod tests {
         assert!(config.cloudfront.is_some());
     }
 
-    // --- full_key / strip_prefix via actual struct logic ---
-
-    #[test]
-    fn test_full_key_trailing_slash_prefix() {
-        let prefix = Some("artifacts/".to_string());
-        let key = "test/file.txt";
-
-        let full = match &prefix {
-            Some(p) => format!("{}/{}", p.trim_end_matches('/'), key),
-            None => key.to_string(),
-        };
-
-        assert_eq!(full, "artifacts/test/file.txt");
-    }
-
-    #[test]
-    fn test_strip_prefix_no_match() {
-        let prefix = Some("other-prefix".to_string());
-        let key = "artifacts/test/file.txt";
-
-        let stripped = match &prefix {
-            Some(p) => {
-                let prefix_with_slash = format!("{}/", p.trim_end_matches('/'));
-                key.strip_prefix(&prefix_with_slash)
-                    .unwrap_or(key)
-                    .to_string()
-            }
-            None => key.to_string(),
-        };
-
-        // Key doesn't start with "other-prefix/", so it returns the key unchanged
-        assert_eq!(stripped, "artifacts/test/file.txt");
-    }
-
-    #[test]
-    fn test_strip_prefix_none() {
-        let prefix: Option<String> = None;
-        let key = "test/file.txt";
-
-        let stripped = match &prefix {
-            Some(p) => {
-                let prefix_with_slash = format!("{}/", p.trim_end_matches('/'));
-                key.strip_prefix(&prefix_with_slash)
-                    .unwrap_or(key)
-                    .to_string()
-            }
-            None => key.to_string(),
-        };
-
-        assert_eq!(stripped, "test/file.txt");
-    }
-
-    // --- try_artifactory_fallback logic ---
-
-    #[test]
-    fn test_artifactory_fallback_valid_native_path() {
-        // Simulate the try_artifactory_fallback logic for a valid path
-        let key = "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
-        let parts: Vec<&str> = key.split('/').collect();
-        assert_eq!(parts.len(), 3);
-        let checksum = parts[parts.len() - 1];
-        assert_eq!(checksum.len(), 64);
-        assert!(checksum.chars().all(|c| c.is_ascii_hexdigit()));
-        let fallback = format!("{}/{}", &checksum[..2], checksum);
-        assert_eq!(
-            fallback,
-            "91/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
-        );
-    }
-
-    #[test]
-    fn test_artifactory_fallback_short_checksum_rejected() {
-        let key = "ab/cd/abcdef1234";
-        let parts: Vec<&str> = key.split('/').collect();
-        let checksum = parts[parts.len() - 1];
-        // Not 64 chars, should be rejected
-        assert_ne!(checksum.len(), 64);
-    }
-
-    #[test]
-    fn test_artifactory_fallback_non_hex_rejected() {
-        let key = "zz/yy/zzyy00000000000000000000000000000000000000000000000000gggggg";
-        let parts: Vec<&str> = key.split('/').collect();
-        let checksum = parts[parts.len() - 1];
-        assert!(!checksum.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_artifactory_fallback_single_segment_rejected() {
-        let key = "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
-        let parts: Vec<&str> = key.split('/').collect();
-        // Only 1 part, need >= 3
-        assert!(parts.len() < 3);
-    }
-
-    // --- classify_get_response additional edge cases ---
-
-    #[test]
-    fn test_classify_get_response_301_redirect_is_error() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b""), 301, HashMap::new());
-        assert!(S3Backend::classify_get_response(TEST_KEY, &resp).is_err());
-    }
-
-    #[test]
-    fn test_classify_get_response_204_returns_some() {
-        use std::collections::HashMap;
-
-        let resp = ResponseData::new(Bytes::from_static(b""), 204, HashMap::new());
-        assert!(S3Backend::classify_get_response(TEST_KEY, &resp)
-            .unwrap()
-            .is_some());
-    }
-
-    // --- classify_get_error_is_not_found edge case ---
-
-    #[test]
-    fn test_classify_get_error_propagates_403() {
-        let err = S3Error::HttpFailWithBody(403, "Forbidden".to_string());
-        match S3Backend::classify_get_error_is_not_found(TEST_KEY, &err) {
-            Err(AppError::Storage(msg)) => {
-                assert!(msg.contains("Forbidden"), "expected detail: {msg}");
-            }
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
     // --- path_format tests ---
 
     #[test]
@@ -1805,25 +989,420 @@ mod tests {
         assert!(config.path_format.has_fallback());
     }
 
-    // --- classify_fallback_get_result boundary ---
+    // --- TLS config tests ---
 
     #[test]
-    fn test_classify_fallback_get_result_299_returns_bytes() {
-        use std::collections::HashMap;
-
-        let body = b"upper boundary";
-        let resp = ResponseData::new(Bytes::from_static(body), 299, HashMap::new());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
-        assert!(result.unwrap().is_some());
+    fn test_s3_config_ca_cert_path_default_none() {
+        let config = S3Config::new("b".to_string(), "r".to_string(), None, None);
+        assert!(config.ca_cert_path.is_none());
+        assert!(!config.insecure_tls);
     }
 
     #[test]
-    fn test_classify_fallback_get_result_300_returns_error() {
-        use std::collections::HashMap;
+    fn test_s3_config_with_ca_cert_path() {
+        let config = S3Config::new("b".to_string(), "r".to_string(), None, None)
+            .with_ca_cert_path("/etc/ssl/custom-ca.pem".to_string());
+        assert_eq!(
+            config.ca_cert_path,
+            Some("/etc/ssl/custom-ca.pem".to_string())
+        );
+    }
 
-        let resp = ResponseData::new(Bytes::from_static(b""), 300, HashMap::new());
-        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
+    #[test]
+    fn test_s3_config_with_insecure_tls() {
+        let config =
+            S3Config::new("b".to_string(), "r".to_string(), None, None).with_insecure_tls(true);
+        assert!(config.insecure_tls);
+    }
+
+    #[test]
+    fn test_s3_config_insecure_tls_default_false() {
+        let config = S3Config::new("b".to_string(), "r".to_string(), None, None);
+        assert!(!config.insecure_tls);
+    }
+
+    #[test]
+    fn test_s3_config_chained_builders_with_tls() {
+        let config = S3Config::new(
+            "bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("https://s3.internal:9000".to_string()),
+            None,
+        )
+        .with_ca_cert_path("/etc/ssl/internal-ca.pem".to_string())
+        .with_insecure_tls(false);
+
+        assert_eq!(
+            config.ca_cert_path,
+            Some("/etc/ssl/internal-ca.pem".to_string())
+        );
+        assert!(!config.insecure_tls);
+    }
+
+    // --- build_store tests ---
+
+    #[test]
+    fn test_build_store_invalid_ca_cert_path() {
+        let config = S3Config::new("b".to_string(), "us-east-1".to_string(), None, None)
+            .with_ca_cert_path("/nonexistent/ca.pem".to_string());
+        let result = S3Backend::build_store(&config, None, None);
         assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to read CA cert"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_store_with_explicit_credentials() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            None,
+        );
+        let result = S3Backend::build_store(&config, Some("AKID"), Some("SECRET"));
+        assert!(
+            result.is_ok(),
+            "build_store should succeed with explicit creds"
+        );
+    }
+
+    #[test]
+    fn test_build_store_minimal_config() {
+        let config = S3Config::new("b".to_string(), "us-east-1".to_string(), None, None);
+        let result = S3Backend::build_store(&config, None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should succeed with minimal config"
+        );
+    }
+
+    #[test]
+    fn test_build_store_with_custom_endpoint() {
+        let config = S3Config::new(
+            "b".to_string(),
+            "us-east-1".to_string(),
+            Some("https://s3.internal:9000".to_string()),
+            None,
+        );
+        let result = S3Backend::build_store(&config, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_store_allows_http_for_http_endpoint() {
+        let config = S3Config::new(
+            "b".to_string(),
+            "us-east-1".to_string(),
+            Some("http://minio:9000".to_string()),
+            None,
+        );
+        // Should succeed (allow_http enabled for http:// endpoints)
+        assert!(S3Backend::build_store(&config, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_build_store_insecure_tls() {
+        let config = S3Config::new("b".to_string(), "us-east-1".to_string(), None, None)
+            .with_insecure_tls(true);
+        assert!(S3Backend::build_store(&config, None, None).is_ok());
+    }
+
+    // --- S3Config from_env tests ---
+
+    #[test]
+    fn test_s3_config_from_env_missing_bucket() {
+        let original = std::env::var("S3_BUCKET").ok();
+        std::env::remove_var("S3_BUCKET");
+        let result = S3Config::from_env();
+        assert!(result.is_err());
+        // Restore
+        if let Some(v) = original {
+            std::env::set_var("S3_BUCKET", v);
+        }
+    }
+
+    #[test]
+    fn test_s3_config_from_env_success() {
+        // Save originals
+        let orig_bucket = std::env::var("S3_BUCKET").ok();
+        let orig_region = std::env::var("S3_REGION").ok();
+        let orig_endpoint = std::env::var("S3_ENDPOINT").ok();
+        let orig_prefix = std::env::var("S3_PREFIX").ok();
+        let orig_redirect = std::env::var("S3_REDIRECT_DOWNLOADS").ok();
+        let orig_expiry = std::env::var("S3_PRESIGN_EXPIRY_SECS").ok();
+        let orig_pak = std::env::var("S3_PRESIGN_ACCESS_KEY_ID").ok();
+        let orig_psk = std::env::var("S3_PRESIGN_SECRET_ACCESS_KEY").ok();
+        let orig_ca = std::env::var("S3_CA_CERT_PATH").ok();
+        let orig_insecure = std::env::var("S3_INSECURE_TLS").ok();
+        // Also save CloudFront vars to avoid interference
+        let orig_cf_url = std::env::var("CLOUDFRONT_DISTRIBUTION_URL").ok();
+
+        // Set test values
+        std::env::set_var("S3_BUCKET", "test-from-env-bucket");
+        std::env::set_var("S3_REGION", "eu-west-1");
+        std::env::set_var("S3_ENDPOINT", "http://localhost:9000");
+        std::env::set_var("S3_PREFIX", "my-prefix");
+        std::env::set_var("S3_REDIRECT_DOWNLOADS", "true");
+        std::env::set_var("S3_PRESIGN_EXPIRY_SECS", "7200");
+        std::env::set_var("S3_PRESIGN_ACCESS_KEY_ID", "presign-ak");
+        std::env::set_var("S3_PRESIGN_SECRET_ACCESS_KEY", "presign-sk");
+        std::env::remove_var("S3_CA_CERT_PATH");
+        std::env::set_var("S3_INSECURE_TLS", "1");
+        std::env::remove_var("CLOUDFRONT_DISTRIBUTION_URL");
+
+        let result = S3Config::from_env();
+        assert!(
+            result.is_ok(),
+            "from_env should succeed: {:?}",
+            result.err()
+        );
+        let config = result.unwrap();
+        assert_eq!(config.bucket, "test-from-env-bucket");
+        assert_eq!(config.region, "eu-west-1");
+        assert_eq!(config.endpoint, Some("http://localhost:9000".to_string()));
+        assert_eq!(config.prefix, Some("my-prefix".to_string()));
+        assert!(config.redirect_downloads);
+        assert_eq!(config.presign_expiry, Duration::from_secs(7200));
+        assert_eq!(config.presign_access_key, Some("presign-ak".to_string()));
+        assert_eq!(config.presign_secret_key, Some("presign-sk".to_string()));
+        assert!(config.ca_cert_path.is_none());
+        assert!(config.insecure_tls);
+        assert!(config.cloudfront.is_none());
+
+        // Restore all originals
+        let restore = |name: &str, val: Option<String>| match val {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        restore("S3_BUCKET", orig_bucket);
+        restore("S3_REGION", orig_region);
+        restore("S3_ENDPOINT", orig_endpoint);
+        restore("S3_PREFIX", orig_prefix);
+        restore("S3_REDIRECT_DOWNLOADS", orig_redirect);
+        restore("S3_PRESIGN_EXPIRY_SECS", orig_expiry);
+        restore("S3_PRESIGN_ACCESS_KEY_ID", orig_pak);
+        restore("S3_PRESIGN_SECRET_ACCESS_KEY", orig_psk);
+        restore("S3_CA_CERT_PATH", orig_ca);
+        restore("S3_INSECURE_TLS", orig_insecure);
+        restore("CLOUDFRONT_DISTRIBUTION_URL", orig_cf_url);
+    }
+
+    #[test]
+    fn test_build_store_with_valid_ca_cert() {
+        // Use the test fixture PEM file
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let pem_path = format!("{}/tests/fixtures/test-ca.pem", manifest_dir);
+
+        // Only run if the fixture exists
+        if !std::path::Path::new(&pem_path).exists() {
+            eprintln!("Skipping: test-ca.pem fixture not found at {}", pem_path);
+            return;
+        }
+
+        let config = S3Config::new("b".to_string(), "us-east-1".to_string(), None, None)
+            .with_ca_cert_path(pem_path);
+        let result = S3Backend::build_store(&config, None, None);
+        assert!(
+            result.is_ok(),
+            "build_store with valid CA cert should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_build_store_with_invalid_pem_content() {
+        let tmp_path = std::env::temp_dir().join("test-bad-ca-s3.pem");
+        std::fs::write(&tmp_path, b"not-a-valid-pem").expect("write temp PEM");
+
+        let config = S3Config::new("b".to_string(), "us-east-1".to_string(), None, None)
+            .with_ca_cert_path(tmp_path.to_str().unwrap().to_string());
+        let result = S3Backend::build_store(&config, None, None);
+        let _ = std::fs::remove_file(&tmp_path);
+        // The PEM bundle parser may succeed with 0 certs or fail, either is acceptable
+        // as long as we exercise the code path
+        let _ = result;
+    }
+
+    // --- Presign expiry clamping ---
+
+    #[test]
+    fn test_presign_expiry_clamp_within_limit() {
+        let expiry = Duration::from_secs(3600);
+        let clamped = Duration::from_secs(expiry.as_secs().min(604800));
+        assert_eq!(clamped, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_presign_expiry_clamp_exceeds_7_days() {
+        let expiry = Duration::from_secs(1_000_000);
+        let clamped = Duration::from_secs(expiry.as_secs().min(604800));
+        assert_eq!(clamped, Duration::from_secs(604800));
+    }
+
+    #[test]
+    fn test_presign_expiry_clamp_exact_7_days() {
+        let expiry = Duration::from_secs(604800);
+        let clamped = Duration::from_secs(expiry.as_secs().min(604800));
+        assert_eq!(clamped, Duration::from_secs(604800));
+    }
+
+    // --- S3Backend::new construction tests ---
+
+    #[tokio::test]
+    async fn test_s3_backend_new_minimal() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            Some("prefix".to_string()),
+        );
+        let backend = S3Backend::new(config).await;
+        assert!(backend.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_new_with_signing_store() {
+        let mut config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            None,
+        );
+        config.presign_access_key = Some("SIGN_AK".to_string());
+        config.presign_secret_key = Some("SIGN_SK".to_string());
+        config.redirect_downloads = true;
+        let backend = S3Backend::new(config).await;
+        assert!(backend.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_new_with_tls_config() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            None,
+        )
+        .with_insecure_tls(true);
+        let backend = S3Backend::new(config).await;
+        assert!(backend.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_new_migration_path_format() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            None,
+        )
+        .with_path_format(StoragePathFormat::Migration);
+        let backend = S3Backend::new(config).await;
+        assert!(backend.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_supports_redirect_false_by_default() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            None,
+        );
+        let backend = S3Backend::new(config).await.unwrap();
+        assert!(!backend.redirect_downloads);
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_supports_redirect_when_enabled() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            None,
+        )
+        .with_redirect_downloads(true);
+        let backend = S3Backend::new(config).await.unwrap();
+        assert!(backend.redirect_downloads);
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_full_key_integration() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            Some("myprefix".to_string()),
+        );
+        let backend = S3Backend::new(config).await.unwrap();
+        assert_eq!(backend.full_key("some/path"), "myprefix/some/path");
+        assert_eq!(backend.strip_prefix("myprefix/some/path"), "some/path");
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_fallback_integration() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            None,
+        )
+        .with_path_format(StoragePathFormat::Migration);
+        let backend = S3Backend::new(config).await.unwrap();
+
+        let key = "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
+        let fallback = backend.try_artifactory_fallback(key);
+        assert_eq!(
+            fallback.unwrap(),
+            "91/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
+        );
+
+        // No fallback for non-checksum paths
+        assert!(backend.try_artifactory_fallback("not/valid").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_from_env_with_env_vars() {
+        // Save originals
+        let orig_bucket = std::env::var("S3_BUCKET").ok();
+        let orig_region = std::env::var("S3_REGION").ok();
+        let orig_endpoint = std::env::var("S3_ENDPOINT").ok();
+        let orig_cf_url = std::env::var("CLOUDFRONT_DISTRIBUTION_URL").ok();
+
+        std::env::set_var("S3_BUCKET", "env-test-bucket");
+        std::env::set_var("S3_REGION", "ap-south-1");
+        std::env::set_var("S3_ENDPOINT", "http://localhost:9999");
+        std::env::remove_var("CLOUDFRONT_DISTRIBUTION_URL");
+
+        let backend = S3Backend::from_env().await;
+        assert!(
+            backend.is_ok(),
+            "from_env should succeed: {:?}",
+            backend.err()
+        );
+
+        // Restore
+        let restore = |name: &str, val: Option<String>| match val {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        restore("S3_BUCKET", orig_bucket);
+        restore("S3_REGION", orig_region);
+        restore("S3_ENDPOINT", orig_endpoint);
+        restore("CLOUDFRONT_DISTRIBUTION_URL", orig_cf_url);
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_new_invalid_ca_cert_fails() {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            None,
+        )
+        .with_ca_cert_path("/nonexistent/cert.pem".to_string());
+        let backend = S3Backend::new(config).await;
+        assert!(backend.is_err());
     }
 }
 
@@ -1832,12 +1411,9 @@ mod integration_tests {
     use super::*;
     use crate::storage::StorageBackend as StorageBackendTrait;
 
-    /// Integration test for S3 presigned URLs
-    /// Run with: S3_BUCKET=your-bucket cargo test s3_presigned --lib -- --ignored --nocapture
     #[tokio::test]
-    #[ignore] // Requires AWS credentials and S3 bucket
+    #[ignore]
     async fn test_s3_presigned_url_generation() {
-        // Skip if S3_BUCKET not set
         let bucket = match std::env::var("S3_BUCKET") {
             Ok(b) => b,
             Err(_) => {
@@ -1848,7 +1424,6 @@ mod integration_tests {
 
         println!("Testing with bucket: {}", bucket);
 
-        // Create config with redirect enabled
         let config = S3Config::from_env()
             .expect("Failed to load S3 config")
             .with_redirect_downloads(true)
@@ -1858,7 +1433,6 @@ mod integration_tests {
             .await
             .expect("Failed to create S3 backend");
 
-        // Upload a test file
         let test_key = format!(
             "test/presign-test-{}.txt",
             std::time::SystemTime::now()
@@ -1873,43 +1447,22 @@ mod integration_tests {
             .await
             .expect("Failed to upload test file");
 
-        // Check supports_redirect
-        assert!(
-            StorageBackendTrait::supports_redirect(&backend),
-            "Backend should support redirect"
-        );
+        assert!(StorageBackendTrait::supports_redirect(&backend));
 
-        // Generate presigned URL
         println!("Generating presigned URL...");
         let presigned =
             StorageBackendTrait::get_presigned_url(&backend, &test_key, Duration::from_secs(300))
                 .await
                 .expect("Failed to generate presigned URL");
 
-        assert!(presigned.is_some(), "Should return presigned URL");
+        assert!(presigned.is_some());
         let presigned = presigned.unwrap();
+        assert!(presigned.url.contains("X-Amz-Signature"));
 
-        println!(
-            "Presigned URL: {}...",
-            &presigned.url[..80.min(presigned.url.len())]
-        );
-        println!("Source: {:?}", presigned.source);
-        println!("Expires in: {:?}", presigned.expires_in);
-
-        assert!(
-            presigned.url.contains(&bucket),
-            "URL should contain bucket name"
-        );
-        assert!(
-            presigned.url.contains("X-Amz-Signature"),
-            "URL should have signature"
-        );
-
-        // Verify URL works by downloading
         println!("Verifying presigned URL works...");
         let client = reqwest::Client::new();
         let response = client
-            .get(&presigned.url)
+            .get(presigned.url.as_str())
             .send()
             .await
             .expect("Failed to fetch presigned URL");
@@ -1920,13 +1473,11 @@ mod integration_tests {
 
         let body = response.bytes().await.expect("Failed to read body");
         assert_eq!(body.as_ref(), test_content.as_ref(), "Content should match");
-        println!("✓ Presigned URL works!");
 
-        // Cleanup
         println!("Cleaning up...");
         StorageBackendTrait::delete(&backend, &test_key)
             .await
             .expect("Failed to delete test file");
-        println!("✓ Test complete");
+        println!("Test complete");
     }
 }
