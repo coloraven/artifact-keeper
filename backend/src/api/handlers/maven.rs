@@ -136,6 +136,7 @@ fn checksum_suffix(ct: ChecksumType) -> &'static str {
         ChecksumType::Md5 => "md5",
         ChecksumType::Sha1 => "sha1",
         ChecksumType::Sha256 => "sha256",
+        ChecksumType::Sha512 => "sha512",
     }
 }
 
@@ -179,12 +180,14 @@ fn looks_like_maven_version(s: &str) -> bool {
 
 /// Check if a path is a checksum request. Returns the base path and checksum type.
 fn parse_checksum_path(path: &str) -> Option<(&str, ChecksumType)> {
-    if let Some(base) = path.strip_suffix(".sha1") {
+    if let Some(base) = path.strip_suffix(".sha512") {
+        Some((base, ChecksumType::Sha512))
+    } else if let Some(base) = path.strip_suffix(".sha256") {
+        Some((base, ChecksumType::Sha256))
+    } else if let Some(base) = path.strip_suffix(".sha1") {
         Some((base, ChecksumType::Sha1))
     } else if let Some(base) = path.strip_suffix(".md5") {
         Some((base, ChecksumType::Md5))
-    } else if let Some(base) = path.strip_suffix(".sha256") {
-        Some((base, ChecksumType::Sha256))
     } else {
         None
     }
@@ -195,13 +198,16 @@ enum ChecksumType {
     Md5,
     Sha1,
     Sha256,
+    Sha512,
 }
 
 fn content_type_for_path(path: &str) -> &'static str {
     if path.ends_with(".pom") || path.ends_with(".xml") {
-        "application/xml"
-    } else if path.ends_with(".jar") || path.ends_with(".war") {
+        "text/xml"
+    } else if path.ends_with(".jar") || path.ends_with(".war") || path.ends_with(".ear") {
         "application/java-archive"
+    } else if path.ends_with(".asc") {
+        "text/plain"
     } else {
         "application/octet-stream"
     }
@@ -266,7 +272,7 @@ async fn download(
         if let Ok(content) = storage.get(&meta_storage_key).await {
             return Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/xml")
+                .header(CONTENT_TYPE, "text/xml")
                 .header(CONTENT_LENGTH, content.len().to_string())
                 .body(Body::from(content))
                 .unwrap());
@@ -275,13 +281,108 @@ async fn download(
         // Fall back to dynamic generation for artifact-level metadata
         if let Some((group_id, artifact_id)) = parse_metadata_path(&path) {
             let xml =
-                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await?;
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/xml")
-                .header(CONTENT_LENGTH, xml.len().to_string())
-                .body(Body::from(xml))
-                .unwrap());
+                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await;
+            if let Ok(xml) = xml {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/xml")
+                    .header(CONTENT_LENGTH, xml.len().to_string())
+                    .body(Body::from(xml))
+                    .unwrap());
+            }
+        }
+
+        // Fallback: proxy metadata from upstream for remote repos
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let (content, _content_type) =
+                    proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
+                        .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/xml")
+                    .header(CONTENT_LENGTH, content.len().to_string())
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
+
+        // Virtual repo: merge metadata from all members
+        if repo.repo_type == RepositoryType::Virtual {
+            if let Some((group_id, artifact_id)) = parse_metadata_path(&path) {
+                let mut all_versions: Vec<String> = Vec::new();
+
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                for member in &members {
+                    // Try generating metadata from this member's artifacts
+                    if let Ok(xml) = generate_metadata_for_artifact(
+                        &state.db,
+                        member.id,
+                        &group_id,
+                        &artifact_id,
+                    )
+                    .await
+                    {
+                        if let Some((_, _, versions)) =
+                            crate::formats::maven::parse_metadata_versions(&xml)
+                        {
+                            all_versions.extend(versions);
+                        }
+                    }
+
+                    // For remote members, also try proxying metadata from upstream
+                    if member.repo_type == RepositoryType::Remote {
+                        if let (Some(upstream_url), Some(ref proxy)) =
+                            (member.upstream_url.as_deref(), &state.proxy_service)
+                        {
+                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                                proxy,
+                                member.id,
+                                &member.key,
+                                upstream_url,
+                                &path,
+                            )
+                            .await
+                            {
+                                if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                    if let Some((_, _, versions)) =
+                                        crate::formats::maven::parse_metadata_versions(xml_str)
+                                    {
+                                        all_versions.extend(versions);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !all_versions.is_empty() {
+                    all_versions.sort();
+                    all_versions.dedup();
+
+                    use crate::formats::maven_version;
+                    let sorted = maven_version::sort_maven_versions(&all_versions);
+                    let latest = sorted.last().unwrap().clone();
+                    let release = maven_version::latest_release(&sorted).cloned();
+
+                    let xml = generate_metadata_xml(
+                        &group_id,
+                        &artifact_id,
+                        &sorted,
+                        &latest,
+                        release.as_deref(),
+                    );
+
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/xml")
+                        .header(CONTENT_LENGTH, xml.len().to_string())
+                        .body(Body::from(xml))
+                        .unwrap());
+                }
+            }
         }
 
         // Metadata not found anywhere
@@ -369,7 +470,6 @@ async fn generate_metadata_for_artifact(
           AND am.metadata->>'groupId' = $2
           AND am.metadata->>'artifactId' = $3
           AND a.version IS NOT NULL
-        ORDER BY a.version
         "#,
         repo_id,
         group_id,
@@ -385,8 +485,13 @@ async fn generate_metadata_for_artifact(
         return Err(AppError::NotFound("No versions found".to_string()).into_response());
     }
 
-    let latest = versions.last().unwrap().clone();
-    let xml = generate_metadata_xml(group_id, artifact_id, &versions, &latest, Some(&latest));
+    use crate::formats::maven_version;
+
+    let sorted = maven_version::sort_maven_versions(&versions);
+    let latest = sorted.last().unwrap().clone();
+    let release = maven_version::latest_release(&sorted).cloned();
+
+    let xml = generate_metadata_xml(group_id, artifact_id, &sorted, &latest, release.as_deref());
 
     Ok(xml)
 }
@@ -399,7 +504,9 @@ async fn serve_artifact(
 ) -> Result<Response, Response> {
     let artifact = sqlx::query!(
         r#"
-        SELECT id, path, size_bytes, checksum_sha256, content_type, storage_key
+        SELECT id, path, size_bytes, checksum_sha256,
+               checksum_md5, checksum_sha1,
+               content_type, storage_key
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
@@ -543,13 +650,20 @@ async fn serve_artifact(
 
     let ct = content_type_for_path(path);
 
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, ct)
         .header(CONTENT_LENGTH, content.len().to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
-        .unwrap())
+        .header("X-Checksum-SHA256", &artifact.checksum_sha256);
+
+    if let Some(ref md5) = artifact.checksum_md5 {
+        builder = builder.header("X-Checksum-MD5", md5);
+    }
+    if let Some(ref sha1) = artifact.checksum_sha1 {
+        builder = builder.header("X-Checksum-SHA1", sha1);
+    }
+
+    Ok(builder.body(Body::from(content)).unwrap())
 }
 
 async fn serve_computed_checksum(
@@ -629,6 +743,12 @@ fn compute_checksum(data: &[u8], checksum_type: ChecksumType) -> String {
         }
         ChecksumType::Sha256 => {
             let mut hasher = Sha256::new();
+            hasher.update(data);
+            format!("{:x}", hasher.finalize())
+        }
+        ChecksumType::Sha512 => {
+            use sha2::Sha512;
+            let mut hasher = Sha512::new();
             hasher.update(data);
             format!("{:x}", hasher.finalize())
         }
@@ -1202,6 +1322,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_checksum_path_sha512() {
+        let result = parse_checksum_path("com/example/my-lib/1.0/my-lib-1.0.jar.sha512");
+        assert!(result.is_some());
+        let (base, ct) = result.unwrap();
+        assert_eq!(base, "com/example/my-lib/1.0/my-lib-1.0.jar");
+        assert!(matches!(ct, ChecksumType::Sha512));
+    }
+
+    #[test]
     fn test_parse_checksum_path_no_checksum_suffix() {
         let result = parse_checksum_path("com/example/my-lib/1.0/my-lib-1.0.jar");
         assert!(result.is_none());
@@ -1222,15 +1351,12 @@ mod tests {
 
     #[test]
     fn test_content_type_pom() {
-        assert_eq!(content_type_for_path("artifact.pom"), "application/xml");
+        assert_eq!(content_type_for_path("artifact.pom"), "text/xml");
     }
 
     #[test]
     fn test_content_type_xml() {
-        assert_eq!(
-            content_type_for_path("maven-metadata.xml"),
-            "application/xml"
-        );
+        assert_eq!(content_type_for_path("maven-metadata.xml"), "text/xml");
     }
 
     #[test]
@@ -1265,6 +1391,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_content_type_asc() {
+        assert_eq!(content_type_for_path("artifact.jar.asc"), "text/plain");
+    }
+
+    #[test]
+    fn test_content_type_ear() {
+        assert_eq!(
+            content_type_for_path("app-1.0.ear"),
+            "application/java-archive"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // compute_checksum
     // -----------------------------------------------------------------------
@@ -1279,6 +1418,14 @@ mod tests {
         // Verify determinism
         let result2 = compute_checksum(data, ChecksumType::Sha256);
         assert_eq!(result, result2);
+    }
+
+    #[test]
+    fn test_compute_checksum_sha512() {
+        let data = b"hello maven";
+        let result = compute_checksum(data, ChecksumType::Sha512);
+        assert_eq!(result.len(), 128); // SHA-512 produces 128 hex chars
+        assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -1504,6 +1651,11 @@ mod tests {
         assert_eq!(checksum_suffix(ChecksumType::Sha256), "sha256");
     }
 
+    #[test]
+    fn test_checksum_suffix_sha512() {
+        assert_eq!(checksum_suffix(ChecksumType::Sha512), "sha512");
+    }
+
     // -----------------------------------------------------------------------
     // gav_directory
     // -----------------------------------------------------------------------
@@ -1586,6 +1738,54 @@ mod tests {
         let coords =
             MavenHandler::parse_coordinates("com/example/mylib/1.0.0/mylib-1.0.0-javadoc.jar")
                 .unwrap();
+        assert!(!is_primary_maven_artifact(&coords));
+    }
+
+    #[test]
+    fn test_is_primary_maven_artifact_aar() {
+        let coords = MavenCoordinates {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            version: "1.0".into(),
+            classifier: None,
+            extension: "aar".into(),
+        };
+        assert!(is_primary_maven_artifact(&coords));
+    }
+
+    #[test]
+    fn test_is_primary_maven_artifact_pom_only() {
+        let coords = MavenCoordinates {
+            group_id: "com.example".into(),
+            artifact_id: "parent".into(),
+            version: "1.0".into(),
+            classifier: None,
+            extension: "pom".into(),
+        };
+        assert!(!is_primary_maven_artifact(&coords));
+    }
+
+    #[test]
+    fn test_is_primary_maven_artifact_sources() {
+        let coords = MavenCoordinates {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            version: "1.0".into(),
+            classifier: Some("sources".into()),
+            extension: "jar".into(),
+        };
+        assert!(!is_primary_maven_artifact(&coords));
+    }
+
+    #[test]
+    fn test_is_primary_maven_artifact_javadoc() {
+        let coords = MavenCoordinates {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            version: "1.0".into(),
+            classifier: Some("javadoc".into()),
+            extension: "jar".into(),
+        };
         assert!(!is_primary_maven_artifact(&coords));
     }
 
