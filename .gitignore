@@ -104,3 +104,6 @@ scripts/sso-e2e/sso-config-ids.env
 
 # Git worktrees
 .worktrees/
+
+# Superpowers brainstorming artifacts (Claude Code)
+docs/superpowers/
