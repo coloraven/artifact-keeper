@@ -400,7 +400,7 @@ fn filter_repositories<'a>(
 }
 
 /// Run import from Artifactory export directory
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn run_import(
     format: &str,
     verbose: bool,
@@ -452,6 +452,16 @@ async fn run_import(
         return show_dry_run_preview(format, &importer, &repos_to_import);
     }
 
+    error(
+        format,
+        "Migration import is not yet implemented. \
+         Repository creation, artifact upload, and security data import \
+         are planned for a future release. \
+         Use 'ak migrate analyze' to preview what would be imported.",
+    );
+    return Err("Migration import is not yet implemented".into());
+
+    #[allow(unreachable_code)]
     let (total_imported, total_failed) =
         import_artifacts(format, verbose, &importer, &repos_to_import)?;
 

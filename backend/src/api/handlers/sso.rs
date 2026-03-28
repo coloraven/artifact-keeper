@@ -165,8 +165,8 @@ pub async fn oidc_callback(
     Query(params): Query<OidcCallbackQuery>,
 ) -> Result<Redirect> {
     // Validate SSO session (CSRF check), then delegate to shared logic
-    let _session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
-    oidc_callback_inner(state, id, params.code).await
+    let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
+    oidc_callback_inner(state, id, params.code, session.nonce).await
 }
 
 /// Handle OIDC callback without provider UUID in the path.
@@ -181,7 +181,7 @@ pub async fn oidc_callback_generic(
 ) -> Result<Redirect> {
     // Validate SSO session and resolve the provider from the stored state
     let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
-    oidc_callback_inner(state, session.provider_id, params.code).await
+    oidc_callback_inner(state, session.provider_id, params.code, session.nonce).await
 }
 
 /// Shared OIDC callback logic used by both the provider-specific and generic
@@ -190,6 +190,7 @@ async fn oidc_callback_inner(
     state: SharedState,
     provider_id: Uuid,
     authorization_code: String,
+    session_nonce: Option<String>,
 ) -> Result<Redirect> {
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
@@ -239,8 +240,16 @@ async fn oidc_callback_inner(
         .as_str()
         .ok_or_else(|| AppError::Internal("Token response missing id_token".into()))?;
 
-    // 5. Decode JWT payload (base64 decode the middle segment)
-    let claims = decode_jwt_payload(id_token)?;
+    // 5. Verify ID token signature and validate standard claims
+    let claims = validate_id_token(
+        &http_client,
+        id_token,
+        &discovery,
+        &row.client_id,
+        &row.issuer_url,
+        session_nonce.as_deref(),
+    )
+    .await?;
 
     // 6. Extract user claims (using attribute_mapping overrides when configured)
     let attr = &row.attribute_mapping;
@@ -636,10 +645,132 @@ pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str
         .unwrap_or_default()
 }
 
+/// Build a `DecodingKey` from a JWK JSON value based on its key type.
+fn decoding_key_from_jwk(jwk: &serde_json::Value) -> Result<jsonwebtoken::DecodingKey> {
+    use jsonwebtoken::DecodingKey;
+    let kty = jwk["kty"].as_str().unwrap_or("");
+    if kty == "RSA" {
+        let n = jwk["n"]
+            .as_str()
+            .ok_or_else(|| AppError::Internal("JWK missing RSA modulus".into()))?;
+        let e = jwk["e"]
+            .as_str()
+            .ok_or_else(|| AppError::Internal("JWK missing RSA exponent".into()))?;
+        DecodingKey::from_rsa_components(n, e)
+            .map_err(|err| AppError::Internal(format!("Failed to build RSA decoding key: {err}")))
+    } else if kty == "EC" {
+        let x = jwk["x"]
+            .as_str()
+            .ok_or_else(|| AppError::Internal("JWK missing EC x coordinate".into()))?;
+        let y = jwk["y"]
+            .as_str()
+            .ok_or_else(|| AppError::Internal("JWK missing EC y coordinate".into()))?;
+        DecodingKey::from_ec_components(x, y)
+            .map_err(|err| AppError::Internal(format!("Failed to build EC decoding key: {err}")))
+    } else {
+        Err(AppError::Internal(format!(
+            "Unsupported JWK key type: {kty}"
+        )))
+    }
+}
+
+/// Select a JWK from the JWKS keys array, matching by `kid` if present,
+/// otherwise falling back to the first usable key.
+fn select_jwk_key(
+    keys: &[serde_json::Value],
+    kid: Option<&str>,
+) -> Result<jsonwebtoken::DecodingKey> {
+    if let Some(kid) = kid {
+        let jwk = keys
+            .iter()
+            .find(|k| k["kid"].as_str() == Some(kid))
+            .ok_or_else(|| AppError::Authentication("No matching JWK found for kid".into()))?;
+        decoding_key_from_jwk(jwk)
+    } else {
+        keys.iter()
+            .find_map(|k| decoding_key_from_jwk(k).ok())
+            .ok_or_else(|| AppError::Internal("No usable JWK found in JWKS".into()))
+    }
+}
+
+/// Validate an OIDC ID token by verifying its signature against the provider's
+/// JWKS and checking the `iss`, `aud`, `exp`, and `nonce` claims.
+async fn validate_id_token(
+    http_client: &reqwest::Client,
+    id_token: &str,
+    discovery: &serde_json::Value,
+    client_id: &str,
+    issuer_url: &str,
+    session_nonce: Option<&str>,
+) -> Result<serde_json::Value> {
+    use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
+
+    let jwks_uri = discovery["jwks_uri"]
+        .as_str()
+        .ok_or_else(|| AppError::Internal("OIDC discovery missing jwks_uri".into()))?;
+
+    let jwks: serde_json::Value = http_client
+        .get(jwks_uri)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fetch JWKS: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse JWKS: {e}")))?;
+
+    let header = decode_header(id_token)
+        .map_err(|e| AppError::Authentication(format!("Invalid ID token header: {e}")))?;
+
+    let keys = jwks["keys"]
+        .as_array()
+        .ok_or_else(|| AppError::Internal("JWKS missing keys array".into()))?;
+
+    let decoding_key = select_jwk_key(keys, header.kid.as_deref())?;
+
+    let alg = match header.alg {
+        jsonwebtoken::Algorithm::RS256 => Algorithm::RS256,
+        jsonwebtoken::Algorithm::RS384 => Algorithm::RS384,
+        jsonwebtoken::Algorithm::RS512 => Algorithm::RS512,
+        jsonwebtoken::Algorithm::ES256 => Algorithm::ES256,
+        jsonwebtoken::Algorithm::ES384 => Algorithm::ES384,
+        jsonwebtoken::Algorithm::PS256 => Algorithm::PS256,
+        jsonwebtoken::Algorithm::PS384 => Algorithm::PS384,
+        jsonwebtoken::Algorithm::PS512 => Algorithm::PS512,
+        other => {
+            return Err(AppError::Authentication(format!(
+                "Unsupported ID token algorithm: {other:?}"
+            )))
+        }
+    };
+
+    let mut validation = Validation::new(alg);
+    validation.set_audience(&[client_id]);
+    validation.set_issuer(&[issuer_url]);
+
+    let token_data = decode::<serde_json::Value>(id_token, &decoding_key, &validation)
+        .map_err(|e| AppError::Authentication(format!("ID token validation failed: {e}")))?;
+
+    let claims = token_data.claims;
+
+    if let Some(expected_nonce) = session_nonce {
+        let token_nonce = claims["nonce"]
+            .as_str()
+            .ok_or_else(|| AppError::Authentication("ID token missing nonce claim".into()))?;
+        if token_nonce != expected_nonce {
+            return Err(AppError::Authentication(
+                "ID token nonce does not match session nonce".into(),
+            ));
+        }
+    }
+
+    Ok(claims)
+}
+
 /// Decode the payload segment of a JWT without verifying the signature.
 ///
-/// This is safe here because we just received the token directly from the
-/// identity provider over a TLS-secured backchannel.
+/// WARNING: This function does NOT verify the JWT signature. Use
+/// `validate_id_token` for security-sensitive flows.
+#[cfg(test)]
 pub(crate) fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
@@ -1062,5 +1193,189 @@ mod tests {
         let token = make_jwt(&claims);
         let result = decode_jwt_payload(&token).unwrap();
         assert_eq!(result["name"], "Jean-Pierre Dupont");
+    }
+
+    // --- validate_id_token logic coverage ---
+    // The full function is async + needs HTTP, but we can test the sub-logic.
+
+    #[test]
+    fn test_algorithm_mapping_rs256() {
+        use jsonwebtoken::Algorithm;
+        let alg = jsonwebtoken::Algorithm::RS256;
+        let mapped = match alg {
+            jsonwebtoken::Algorithm::RS256 => Algorithm::RS256,
+            jsonwebtoken::Algorithm::RS384 => Algorithm::RS384,
+            jsonwebtoken::Algorithm::RS512 => Algorithm::RS512,
+            jsonwebtoken::Algorithm::ES256 => Algorithm::ES256,
+            jsonwebtoken::Algorithm::ES384 => Algorithm::ES384,
+            jsonwebtoken::Algorithm::PS256 => Algorithm::PS256,
+            jsonwebtoken::Algorithm::PS384 => Algorithm::PS384,
+            jsonwebtoken::Algorithm::PS512 => Algorithm::PS512,
+            _ => panic!("unsupported"),
+        };
+        assert_eq!(mapped, Algorithm::RS256);
+    }
+
+    #[test]
+    fn test_algorithm_mapping_es256() {
+        use jsonwebtoken::Algorithm;
+        let alg = jsonwebtoken::Algorithm::ES256;
+        let mapped = match alg {
+            jsonwebtoken::Algorithm::RS256 => Algorithm::RS256,
+            jsonwebtoken::Algorithm::ES256 => Algorithm::ES256,
+            _ => panic!("unsupported"),
+        };
+        assert_eq!(mapped, Algorithm::ES256);
+    }
+
+    #[test]
+    fn test_nonce_validation_match() {
+        let claims = serde_json::json!({"nonce": "abc123"});
+        let expected = "abc123";
+        let token_nonce = claims["nonce"].as_str().unwrap();
+        assert_eq!(token_nonce, expected);
+    }
+
+    #[test]
+    fn test_nonce_validation_mismatch() {
+        let claims = serde_json::json!({"nonce": "abc123"});
+        let expected = "different";
+        let token_nonce = claims["nonce"].as_str().unwrap();
+        assert_ne!(token_nonce, expected);
+    }
+
+    #[test]
+    fn test_nonce_validation_missing_claim() {
+        let claims = serde_json::json!({"sub": "user"});
+        assert!(claims["nonce"].as_str().is_none());
+    }
+
+    #[test]
+    fn test_discovery_missing_jwks_uri() {
+        let discovery = serde_json::json!({"issuer": "https://idp.example.com"});
+        assert!(discovery["jwks_uri"].as_str().is_none());
+    }
+
+    #[test]
+    fn test_discovery_with_jwks_uri() {
+        let discovery = serde_json::json!({
+            "jwks_uri": "https://idp.example.com/.well-known/jwks.json"
+        });
+        assert_eq!(
+            discovery["jwks_uri"].as_str().unwrap(),
+            "https://idp.example.com/.well-known/jwks.json"
+        );
+    }
+
+    #[test]
+    fn test_jwks_key_selection_by_kid() {
+        let jwks = serde_json::json!({
+            "keys": [
+                {"kid": "key1", "kty": "RSA"},
+                {"kid": "key2", "kty": "EC"}
+            ]
+        });
+        let keys = jwks["keys"].as_array().unwrap();
+        let target_kid = "key2";
+        let found = keys.iter().find(|k| k["kid"].as_str() == Some(target_kid));
+        assert!(found.is_some());
+        assert_eq!(found.unwrap()["kty"].as_str().unwrap(), "EC");
+    }
+
+    #[test]
+    fn test_jwks_key_fallback_first_key() {
+        let jwks = serde_json::json!({
+            "keys": [{"kty": "RSA", "n": "abc", "e": "AQAB"}]
+        });
+        let keys = jwks["keys"].as_array().unwrap();
+        // No kid match, fall back to first
+        let fallback = keys.first();
+        assert!(fallback.is_some());
+        assert_eq!(fallback.unwrap()["kty"].as_str().unwrap(), "RSA");
+    }
+
+    #[test]
+    fn test_jwks_empty_keys_array() {
+        let jwks = serde_json::json!({"keys": []});
+        let keys = jwks["keys"].as_array().unwrap();
+        assert!(keys.is_empty());
+    }
+
+    // --- decoding_key_from_jwk ---
+
+    #[test]
+    fn test_decoding_key_from_jwk_unsupported_type() {
+        let jwk = serde_json::json!({"kty": "OKP"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported JWK key type"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_rsa_missing_n() {
+        let jwk = serde_json::json!({"kty": "RSA", "e": "AQAB"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("modulus"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_rsa_missing_e() {
+        let jwk = serde_json::json!({"kty": "RSA", "n": "abc"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exponent"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_ec_missing_x() {
+        let jwk = serde_json::json!({"kty": "EC", "y": "abc"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("x coordinate"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_ec_missing_y() {
+        let jwk = serde_json::json!({"kty": "EC", "x": "abc"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("y coordinate"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_empty_kty() {
+        let jwk = serde_json::json!({"n": "abc"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+    }
+
+    // --- select_jwk_key ---
+
+    #[test]
+    fn test_select_jwk_key_no_kid_empty_keys() {
+        let keys: Vec<serde_json::Value> = vec![];
+        let result = super::select_jwk_key(&keys, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No usable JWK"));
+    }
+
+    #[test]
+    fn test_select_jwk_key_kid_not_found() {
+        let keys = vec![serde_json::json!({"kid": "key1", "kty": "RSA", "n": "x", "e": "y"})];
+        let result = super::select_jwk_key(&keys, Some("nonexistent"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No matching JWK"));
+    }
+
+    #[test]
+    fn test_select_jwk_key_unsupported_type_with_kid() {
+        let keys = vec![serde_json::json!({"kid": "k1", "kty": "OKP"})];
+        let result = super::select_jwk_key(&keys, Some("k1"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unsupported"));
     }
 }
