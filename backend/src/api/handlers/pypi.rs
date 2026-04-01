@@ -19,6 +19,7 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -27,6 +28,7 @@ use tracing::{debug, info};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
@@ -537,12 +539,18 @@ async fn fetch_from_pypi_remote(
     let normalized = PypiHandler::normalize_name(project);
 
     let index_path = format!("simple/{}/", normalized);
-    let (index_bytes, _ct) =
+    let (index_bytes, _ct, effective_url) =
         proxy_helpers::proxy_fetch_uncached(proxy, repo_id, repo_key, upstream_url, &index_path)
             .await?;
 
     let index_html = String::from_utf8_lossy(&index_bytes);
-    let file_url = find_upstream_url_for_file(&index_html, filename);
+
+    // Use the effective URL (after redirects) as the base for resolving
+    // relative hrefs. Some registries (Nexus, Artifactory) redirect the
+    // index request, and the relative paths in the HTML are relative to
+    // the final serving URL, not the originally requested URL.
+    let full_index_url = effective_url;
+    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url));
 
     let fallback = || {
         (
@@ -551,20 +559,47 @@ async fn fetch_from_pypi_remote(
         )
     };
 
+    // Validate resolved URL against SSRF before making the outbound request.
+    // A malicious upstream index could contain hrefs pointing to internal
+    // addresses (169.254.169.254, localhost, Docker service names, etc.).
+    if let Some(ref url) = file_url {
+        if let Err(e) = validate_outbound_url(url, "PyPI upstream file URL") {
+            tracing::warn!(
+                "SSRF check rejected resolved file URL '{}' from upstream index: {}",
+                url,
+                e
+            );
+            // Fall through to the fallback path instead of fetching the
+            // potentially malicious URL.
+            return Err(AppError::Validation(format!(
+                "Upstream index contains a disallowed URL: {}",
+                e
+            ))
+            .into_response());
+        }
+    }
+
+    // Use a stable cache key (simple/{project}/{filename}) regardless of the
+    // actual upstream URL. Nexus/devpi resolve to paths like
+    // packages/requests/2.31.0/requests-2.31.0.tar.gz which differ from the
+    // simple/ convention. A stable cache key ensures the cache-check
+    // optimization in serve_file works for all upstream registry types.
+    let local_cache_path = format!("simple/{}/{}", normalized, filename);
+
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
-        // Absolute URL from the index (e.g.
-        // https://files.pythonhosted.org/packages/.../file.whl).
-        // Split into scheme+host base and path so proxy_fetch can
-        // cache it under the repo key.
         Some(pair) => pair,
-        // No absolute URL found, or the URL had no path component.
-        // The upstream may be another AK instance that uses relative
-        // paths. Fall back to the simple/{project}/{filename} convention.
         None => fallback(),
     };
 
-    let (content, _content_type) =
-        proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, &fetch_base, &fetch_path).await?;
+    let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
+        proxy,
+        repo_id,
+        repo_key,
+        &fetch_base,
+        &fetch_path,
+        &local_cache_path,
+    )
+    .await?;
 
     Ok(content)
 }
@@ -955,31 +990,79 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+// ---------------------------------------------------------------------------
+// Static regexes (compiled once, reused across requests)
+// ---------------------------------------------------------------------------
+
+static HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r##"<a\s+[^>]*?href="([^"#]+)"##).unwrap());
+
+static REWRITE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"<a\s+([^>]*?)href="([^"]+)"([^>]*)>"#).unwrap());
+
+static METADATA_ATTR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"\s*data-(?:dist-info-metadata|core-metadata)="[^"]*""#).unwrap());
+
 /// Split a URL into its base (scheme + host) and path components.
 ///
 /// For example, `https://files.pythonhosted.org/packages/ab/cd/file.whl` splits
 /// into `("https://files.pythonhosted.org", "packages/ab/cd/file.whl")`.
 /// Returns `None` if the URL has no `://` scheme separator or no path after the
 /// host.
-fn split_url_base_and_path(url: &str) -> Option<(String, String)> {
-    let scheme_end = url.find("://")?;
-    let after_scheme = &url[scheme_end + 3..];
-    let slash_pos = after_scheme.find('/')?;
-    let split = scheme_end + 3 + slash_pos;
-    Some((url[..split].to_string(), url[split + 1..].to_string()))
+fn split_url_base_and_path(url_str: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url_str).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let base = format!("{}://{}", parsed.scheme(), parsed.authority());
+    let path = parsed.path().strip_prefix('/').unwrap_or(parsed.path());
+    if path.is_empty() {
+        return None;
+    }
+    Some((base, path.to_string()))
 }
 
 /// Look up the original download URL for a given filename in upstream simple
 /// index HTML. Returns the full absolute URL (e.g.,
 /// `https://files.pythonhosted.org/packages/.../six-1.16.0.whl`) or `None` if
 /// no matching link is found. Hash fragments are stripped from the returned URL.
-fn find_upstream_url_for_file(index_html: &str, filename: &str) -> Option<String> {
-    let re = Regex::new(r##"<a\s+[^>]*?href="(https?://[^"#]+)"##).unwrap();
-    for caps in re.captures_iter(index_html) {
-        let url = &caps[1];
-        let url_filename = url.rsplit('/').next().unwrap_or("");
-        if url_filename == filename {
-            return Some(url.to_string());
+///
+/// Supports both absolute URLs (`https://...`) and relative paths
+/// (`../../packages/file.tar.gz` or `packages/file.tar.gz`). Relative paths
+/// are resolved against `index_url`, which is the full URL of the simple index
+/// page that was fetched (e.g.,
+/// `https://nexus.example.com/repository/pypi/simple/requests/`).
+///
+/// Registries like Sonatype Nexus, Artifactory, and devpi commonly use relative
+/// hrefs in their simple index HTML instead of absolute URLs.
+fn find_upstream_url_for_file(
+    index_html: &str,
+    filename: &str,
+    index_url: Option<&str>,
+) -> Option<String> {
+    for caps in HREF_RE.captures_iter(index_html) {
+        let href = &caps[1];
+        let href_filename = href.rsplit('/').next().unwrap_or("");
+        if href_filename != filename {
+            continue;
+        }
+
+        // Already an absolute URL, return as-is.
+        if href.starts_with("http://") || href.starts_with("https://") {
+            return Some(href.to_string());
+        }
+
+        // Relative or root-relative path: resolve against the index page URL.
+        // Only return HTTP/HTTPS results to prevent javascript:, data:, file://
+        // and other non-HTTP schemes from being promoted to fetch targets.
+        if let Some(base) = index_url {
+            if let Ok(base_url) = url::Url::parse(base) {
+                if let Ok(resolved) = base_url.join(href) {
+                    if resolved.scheme() == "http" || resolved.scheme() == "https" {
+                        return Some(resolved.as_str().to_string());
+                    }
+                    continue;
+                }
+            }
         }
     }
     None
@@ -1006,53 +1089,45 @@ fn find_upstream_url_for_file(index_html: &str, filename: &str) -> Option<String
 /// returns 404, which pip treats as a hard error since the index promised the
 /// metadata was available.
 fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
-    // Match <a href="..."> patterns where the URL is either:
-    //   1. An absolute URL (http:// or https://)
-    //   2. A root-relative path starting with /pypi/ (from a local upstream repo)
-    let re = Regex::new(r#"<a\s+([^>]*?)href="(https?://[^"]+|/pypi/[^"]+)"([^>]*)>"#).unwrap();
     let normalized = PypiHandler::normalize_name(project);
 
-    // Matches data-dist-info-metadata="..." and data-core-metadata="..."
-    // attributes that we need to strip from proxied links.
-    let metadata_attr_re =
-        Regex::new(r#"\s*data-(?:dist-info-metadata|core-metadata)="[^"]*""#).unwrap();
+    REWRITE_RE
+        .replace_all(html, |caps: &regex::Captures| {
+            let before_href = &caps[1];
+            let full_url = &caps[2];
+            let after_href = &caps[3];
 
-    re.replace_all(html, |caps: &regex::Captures| {
-        let before_href = &caps[1];
-        let full_url = &caps[2];
-        let after_href = &caps[3];
+            // Split off the fragment (#sha256=...) if present
+            let (url_path, fragment) = match full_url.find('#') {
+                Some(pos) => (&full_url[..pos], &full_url[pos..]),
+                None => (full_url, ""),
+            };
 
-        // Split off the fragment (#sha256=...) if present
-        let (url_path, fragment) = match full_url.find('#') {
-            Some(pos) => (&full_url[..pos], &full_url[pos..]),
-            None => (full_url, ""),
-        };
+            // Extract the filename from the URL path
+            let filename = url_path.rsplit('/').next().unwrap_or(url_path);
 
-        // Extract the filename from the URL path
-        let filename = url_path.rsplit('/').next().unwrap_or(url_path);
+            if filename.is_empty() {
+                // Not a file URL, leave unchanged
+                return caps[0].to_string();
+            }
 
-        if filename.is_empty() {
-            // Not a file URL, leave unchanged
-            return caps[0].to_string();
-        }
+            let rewritten = format!(
+                "/pypi/{}/simple/{}/{}{}",
+                repo_key, normalized, filename, fragment
+            );
 
-        let rewritten = format!(
-            "/pypi/{}/simple/{}/{}{}",
-            repo_key, normalized, filename, fragment
-        );
+            // Strip PEP 658 metadata attributes. The proxy does not cache or
+            // serve .metadata files, so advertising them causes pip to fail
+            // with a 404 when it tries to fetch the promised metadata.
+            let before_cleaned = METADATA_ATTR_RE.replace_all(before_href, "");
+            let after_cleaned = METADATA_ATTR_RE.replace_all(after_href, "");
 
-        // Strip PEP 658 metadata attributes. The proxy does not cache or
-        // serve .metadata files, so advertising them causes pip to fail
-        // with a 404 when it tries to fetch the promised metadata.
-        let before_cleaned = metadata_attr_re.replace_all(before_href, "");
-        let after_cleaned = metadata_attr_re.replace_all(after_href, "");
-
-        format!(
-            "<a {}href=\"{}\"{}>",
-            before_cleaned, rewritten, after_cleaned
-        )
-    })
-    .into_owned()
+            format!(
+                "<a {}href=\"{}\"{}>",
+                before_cleaned, rewritten, after_cleaned
+            )
+        })
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -1132,11 +1207,13 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_preserves_relative_urls() {
+    fn test_rewrite_rewrites_relative_urls() {
+        // Relative URLs should now be rewritten to local proxy paths
+        // (previously these were left unchanged, which broke Nexus/devpi remotes)
         let html = r#"<a href="numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
-        // Relative URLs should be left unchanged
-        assert_eq!(result, html);
+        assert!(result
+            .contains(r#"href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123""#));
     }
 
     #[test]
@@ -1236,8 +1313,8 @@ mod tests {
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         // Absolute URL is rewritten
         assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz#sha256=aaa""#));
-        // Relative URL is left unchanged
-        assert!(result.contains(r#"href="pkg-2.0.tar.gz#sha256=bbb""#));
+        // Relative URL is now also rewritten (needed for Nexus/devpi remotes)
+        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-2.0.tar.gz#sha256=bbb""#));
     }
 
     #[test]
@@ -1306,8 +1383,10 @@ mod tests {
         assert!(
             result.contains(r#"href="/pypi/remote/simple/numpy/numpy-2.0.0.tar.gz#sha256=bbb""#)
         );
-        // Plain relative URL is left unchanged
-        assert!(result.contains(r#"href="numpy-3.0.0.tar.gz#sha256=ccc""#));
+        // Plain relative URL is now also rewritten (needed for Nexus/devpi)
+        assert!(
+            result.contains(r#"href="/pypi/remote/simple/numpy/numpy-3.0.0.tar.gz#sha256=ccc""#)
+        );
     }
 
     #[test]
@@ -1413,6 +1492,48 @@ mod tests {
         assert!(!result.contains("data-dist-info-metadata"));
     }
 
+    #[test]
+    fn test_rewrite_relative_dotdot_href() {
+        // Nexus-style relative href should be rewritten to local proxy path
+        let html = r#"<a href="../../packages/requests-2.31.0.tar.gz#sha256=abc">requests-2.31.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "pypi-remote", "requests");
+        assert!(result.contains(
+            r#"href="/pypi/pypi-remote/simple/requests/requests-2.31.0.tar.gz#sha256=abc""#
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_root_relative_href() {
+        // Root-relative href (/packages/...) should also be rewritten
+        let html =
+            r#"<a href="/packages/ab/cd/six-1.16.0.tar.gz#sha256=abc">six-1.16.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "repo", "six");
+        assert!(result.contains(r#"href="/pypi/repo/simple/six/six-1.16.0.tar.gz#sha256=abc""#));
+    }
+
+    #[test]
+    fn test_rewrite_plain_relative_href() {
+        // Plain relative href (packages/file.tar.gz) from devpi
+        let html = r#"<a href="packages/pkg-1.0.tar.gz#sha256=abc">pkg-1.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "devpi-remote", "pkg");
+        assert!(
+            result.contains(r#"href="/pypi/devpi-remote/simple/pkg/pkg-1.0.tar.gz#sha256=abc""#)
+        );
+    }
+
+    #[test]
+    fn test_rewrite_mixed_absolute_and_relative_hrefs() {
+        let html = concat!(
+            r#"<a href="https://files.example.com/pkg-1.0.whl#sha256=aaa">pkg-1.0.whl</a>"#,
+            "\n",
+            r#"<a href="../../packages/pkg-1.0.tar.gz#sha256=bbb">pkg-1.0.tar.gz</a>"#,
+        );
+        let result = rewrite_upstream_urls(html, "repo", "pkg");
+        // Both should be rewritten to local proxy paths
+        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=aaa""#));
+        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz#sha256=bbb""#));
+    }
+
     // -----------------------------------------------------------------------
     // find_upstream_url_for_file
     // -----------------------------------------------------------------------
@@ -1420,7 +1541,7 @@ mod tests {
     #[test]
     fn test_find_upstream_url_basic() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=abc">six-1.16.0-py2.py3-none-any.whl</a>"#;
-        let result = find_upstream_url_for_file(html, "six-1.16.0-py2.py3-none-any.whl");
+        let result = find_upstream_url_for_file(html, "six-1.16.0-py2.py3-none-any.whl", None);
         assert_eq!(
             result,
             Some(
@@ -1433,15 +1554,15 @@ mod tests {
     #[test]
     fn test_find_upstream_url_no_match() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/six-1.16.0.tar.gz#sha256=abc">six-1.16.0.tar.gz</a>"#;
-        let result = find_upstream_url_for_file(html, "six-1.15.0.tar.gz");
+        let result = find_upstream_url_for_file(html, "six-1.15.0.tar.gz", None);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn test_find_upstream_url_relative_ignored() {
-        // Relative URLs (from local AK repos) should not match
+    fn test_find_upstream_url_relative_ignored_without_index_url() {
+        // Relative URLs cannot be resolved without an index URL
         let html = r#"<a href="/pypi/local/simple/six/six-1.16.0.tar.gz#sha256=abc">six-1.16.0.tar.gz</a>"#;
-        let result = find_upstream_url_for_file(html, "six-1.16.0.tar.gz");
+        let result = find_upstream_url_for_file(html, "six-1.16.0.tar.gz", None);
         assert_eq!(result, None);
     }
 
@@ -1452,7 +1573,7 @@ mod tests {
             "\n",
             r#"<a href="https://files.pythonhosted.org/packages/b/six-1.16.0-py2.py3-none-any.whl#sha256=bbb">six-1.16.0-py2.py3-none-any.whl</a>"#,
         );
-        let result = find_upstream_url_for_file(html, "six-1.16.0-py2.py3-none-any.whl");
+        let result = find_upstream_url_for_file(html, "six-1.16.0-py2.py3-none-any.whl", None);
         assert_eq!(
             result,
             Some(
@@ -1465,7 +1586,7 @@ mod tests {
     #[test]
     fn test_find_upstream_url_with_data_attrs() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/numpy-2.0.0.whl#sha256=abc" data-requires-python="&gt;=3.9">numpy-2.0.0.whl</a>"#;
-        let result = find_upstream_url_for_file(html, "numpy-2.0.0.whl");
+        let result = find_upstream_url_for_file(html, "numpy-2.0.0.whl", None);
         assert_eq!(
             result,
             Some("https://files.pythonhosted.org/packages/numpy-2.0.0.whl".to_string())
@@ -1488,7 +1609,7 @@ mod tests {
 </html>
 "#;
         let result =
-            find_upstream_url_for_file(raw_upstream_html, "six-1.16.0-py2.py3-none-any.whl");
+            find_upstream_url_for_file(raw_upstream_html, "six-1.16.0-py2.py3-none-any.whl", None);
         assert_eq!(
             result,
             Some(
@@ -1497,7 +1618,7 @@ mod tests {
             )
         );
 
-        let result = find_upstream_url_for_file(raw_upstream_html, "six-1.16.0.tar.gz");
+        let result = find_upstream_url_for_file(raw_upstream_html, "six-1.16.0.tar.gz", None);
         assert_eq!(
             result,
             Some("https://files.pythonhosted.org/packages/94/e7/six-1.16.0.tar.gz".to_string())
@@ -1507,9 +1628,7 @@ mod tests {
     #[test]
     fn test_find_upstream_url_fails_on_rewritten_html() {
         // After rewrite_upstream_urls(), all absolute URLs become local
-        // /pypi/... paths. find_upstream_url_for_file must return None for
-        // these, confirming that the download handler needs the raw upstream
-        // HTML (not the rewritten cached copy) to discover file URLs.
+        // /pypi/... paths. Without an index_url, these cannot be resolved.
         let rewritten_html = r#"<!DOCTYPE html>
 <html>
 <head><title>Links for six</title></head>
@@ -1519,7 +1638,147 @@ mod tests {
 </body>
 </html>
 "#;
-        let result = find_upstream_url_for_file(rewritten_html, "six-1.16.0-py2.py3-none-any.whl");
+        let result =
+            find_upstream_url_for_file(rewritten_html, "six-1.16.0-py2.py3-none-any.whl", None);
+        assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_upstream_url_for_file - relative URL resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_upstream_url_relative_dotdot_path() {
+        // Nexus-style relative href with ../../ prefix.
+        // Base: /repository/pypi/simple/requests/
+        //   ../ => /repository/pypi/simple/
+        //   ../ => /repository/pypi/
+        //   packages/... => /repository/pypi/packages/requests-2.31.0.tar.gz
+        let html = r#"<a href="../../packages/requests-2.31.0.tar.gz#sha256=abc">requests-2.31.0.tar.gz</a>"#;
+        let index_url = "https://nexus.example.com/repository/pypi/simple/requests/";
+        let result = find_upstream_url_for_file(html, "requests-2.31.0.tar.gz", Some(index_url));
+        assert_eq!(
+            result,
+            Some(
+                "https://nexus.example.com/repository/pypi/packages/requests-2.31.0.tar.gz"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_relative_plain_path() {
+        // Simple relative path without ../ prefix
+        let html = r#"<a href="packages/pkg-1.0.tar.gz#sha256=abc">pkg-1.0.tar.gz</a>"#;
+        let index_url = "https://devpi.local/root/pypi/simple/pkg/";
+        let result = find_upstream_url_for_file(html, "pkg-1.0.tar.gz", Some(index_url));
+        assert_eq!(
+            result,
+            Some("https://devpi.local/root/pypi/simple/pkg/packages/pkg-1.0.tar.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_root_relative_path() {
+        // Root-relative path starting with /
+        let html =
+            r#"<a href="/packages/ab/cd/six-1.16.0.tar.gz#sha256=abc">six-1.16.0.tar.gz</a>"#;
+        let index_url = "https://nexus.example.com/repository/pypi/simple/six/";
+        let result = find_upstream_url_for_file(html, "six-1.16.0.tar.gz", Some(index_url));
+        assert_eq!(
+            result,
+            Some("https://nexus.example.com/packages/ab/cd/six-1.16.0.tar.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_relative_multiple_dotdot() {
+        // Multiple levels of ../ traversal (Artifactory-style deep paths).
+        // Base: /api/pypi/pypi-remote/simple/numpy/
+        //   ../  => /api/pypi/pypi-remote/simple/
+        //   ../  => /api/pypi/pypi-remote/
+        //   ../  => /api/pypi/
+        //   packages/... => /api/pypi/packages/numpy/1.24.0/numpy-1.24.0.tar.gz
+        let html = r#"<a href="../../../packages/numpy/1.24.0/numpy-1.24.0.tar.gz#sha256=abc">numpy-1.24.0.tar.gz</a>"#;
+        let index_url = "https://artifactory.corp.com/api/pypi/pypi-remote/simple/numpy/";
+        let result = find_upstream_url_for_file(html, "numpy-1.24.0.tar.gz", Some(index_url));
+        assert_eq!(
+            result,
+            Some(
+                "https://artifactory.corp.com/api/pypi/packages/numpy/1.24.0/numpy-1.24.0.tar.gz"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_relative_prefers_absolute_first() {
+        // When both absolute and relative URLs exist, the first match wins.
+        // Absolute URLs are found and returned without needing resolution.
+        let html = concat!(
+            r#"<a href="https://files.pythonhosted.org/packages/six-1.16.0.tar.gz#sha256=aaa">six-1.16.0.tar.gz</a>"#,
+            "\n",
+            r#"<a href="../../packages/six-1.16.0.tar.gz#sha256=bbb">six-1.16.0.tar.gz</a>"#,
+        );
+        let index_url = "https://nexus.example.com/repository/pypi/simple/six/";
+        let result = find_upstream_url_for_file(html, "six-1.16.0.tar.gz", Some(index_url));
+        assert_eq!(
+            result,
+            Some("https://files.pythonhosted.org/packages/six-1.16.0.tar.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_nexus_full_index() {
+        // Simulates a real Nexus simple index page with relative hrefs.
+        // ../../ from /repository/pypi/simple/requests/ resolves to
+        // /repository/pypi/ so the final path is
+        // /repository/pypi/packages/requests/2.31.0/requests-2.31.0.tar.gz
+        let html = r#"<!DOCTYPE html>
+<html>
+<head><title>Links for requests</title></head>
+<body>
+<h1>Links for requests</h1>
+<a href="../../packages/requests/2.31.0/requests-2.31.0-py3-none-any.whl#sha256=aaa">requests-2.31.0-py3-none-any.whl</a><br/>
+<a href="../../packages/requests/2.31.0/requests-2.31.0.tar.gz#sha256=bbb">requests-2.31.0.tar.gz</a><br/>
+<a href="../../packages/requests/2.32.0/requests-2.32.0-py3-none-any.whl#sha256=ccc">requests-2.32.0-py3-none-any.whl</a><br/>
+</body>
+</html>
+"#;
+        let index_url = "https://nexus.example.com/repository/pypi/simple/requests/";
+        let result = find_upstream_url_for_file(html, "requests-2.31.0.tar.gz", Some(index_url));
+        assert_eq!(
+            result,
+            Some(
+                "https://nexus.example.com/repository/pypi/packages/requests/2.31.0/requests-2.31.0.tar.gz"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_relative_no_match() {
+        // Relative URLs present but no filename match
+        let html = r#"<a href="../../packages/other-1.0.tar.gz#sha256=abc">other-1.0.tar.gz</a>"#;
+        let index_url = "https://nexus.example.com/repository/pypi/simple/other/";
+        let result = find_upstream_url_for_file(html, "nonexistent-1.0.tar.gz", Some(index_url));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_upstream_url_rejects_javascript_scheme() {
+        let html = r#"<a href="javascript:fetch('http://internal/secret')/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#;
+        let index_url = "https://registry.example.com/simple/pkg/";
+        let result = find_upstream_url_for_file(html, "pkg-1.0.tar.gz", Some(index_url));
+        // javascript: hrefs must not produce a fetchable URL
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_upstream_url_rejects_data_scheme() {
+        let html = r#"<a href="data:application/octet-stream;base64,abc/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#;
+        let index_url = "https://registry.example.com/simple/pkg/";
+        let result = find_upstream_url_for_file(html, "pkg-1.0.tar.gz", Some(index_url));
         assert_eq!(result, None);
     }
 
