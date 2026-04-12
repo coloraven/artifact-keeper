@@ -173,6 +173,12 @@ pub struct Config {
     /// user can try again. Default: 30.
     pub account_lockout_duration_minutes: i64,
 
+    /// Number of previous passwords to remember per user. When a user changes
+    /// their password, the new password is checked against the last N hashes
+    /// and rejected if it matches any of them. Set to 0 to disable password
+    /// history checking. Default: 0 (disabled).
+    pub password_history_count: u32,
+
     /// Number of days after which a local user's password expires and must
     /// be changed. Set to 0 to disable password expiration. Default: 0.
     pub password_expiry_days: u32,
@@ -251,6 +257,7 @@ redacted_debug!(Config {
     show rate_limit_exempt_service_accounts,
     show account_lockout_threshold,
     show account_lockout_duration_minutes,
+    show password_history_count,
     show password_expiry_days,
     show password_min_length,
     show password_max_length,
@@ -365,6 +372,7 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
+            password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
             password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
             password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
@@ -1212,5 +1220,62 @@ mod tests {
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PASSWORD_HISTORY_COUNT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_password_history_count_default_zero() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_password_history_count_parsed() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "12");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 12);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_invalid_falls_back() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "not-a-number");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_clamped_to_max_24() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "100");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_at_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "24");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_below_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "10");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 10);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
     }
 }
