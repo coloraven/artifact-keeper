@@ -56,6 +56,36 @@ pub fn record_scanner_health_check_failure(scanner: &str, reason: &str) {
     .increment(1);
 }
 
+/// Record a scan that succeeded at the scanner level but failed to persist
+/// its package inventory in full (#1157). The scan row is marked
+/// `inventory_status = 'partial'` and this counter increments so operator
+/// dashboards can alert on "scans succeed but SBOMs are degraded" without
+/// having to poll the scan_results table directly. `scan_type` matches the
+/// label used in `record_security_scan` (e.g. `"trivy"`, `"openscap"`) so
+/// the two metrics can be correlated.
+pub fn record_scan_inventory_failure(scan_type: &str) {
+    counter!(
+        "scan_inventory_failures_total",
+        "scan_type" => scan_type.to_string()
+    )
+    .increment(1);
+}
+
+/// Companion to `record_scan_inventory_failure`. Increments on every
+/// successful `scan_packages` persistence. Exposing both counters lets
+/// SRE alerts target the failure *ratio*
+/// (`failures / (failures + success)`) rather than the raw failure rate,
+/// which is brittle under traffic changes (low-traffic instances can
+/// produce a few failures without being degraded; high-traffic instances
+/// can produce many failures and still be healthy in ratio terms).
+pub fn record_scan_inventory_success(scan_type: &str) {
+    counter!(
+        "scan_inventory_success_total",
+        "scan_type" => scan_type.to_string()
+    )
+    .increment(1);
+}
+
 /// Record a webhook delivery event.
 pub fn record_webhook_delivery(event: &str, success: bool) {
     let status = if success { "success" } else { "failure" };
@@ -232,6 +262,18 @@ mod tests {
     fn test_record_scanner_health_check_failure_does_not_panic() {
         record_scanner_health_check_failure("trivy", "unreachable");
         record_scanner_health_check_failure("trivy", "unhealthy");
+    }
+
+    #[test]
+    fn test_record_scan_inventory_failure_does_not_panic() {
+        record_scan_inventory_failure("trivy");
+        record_scan_inventory_failure("openscap");
+    }
+
+    #[test]
+    fn test_record_scan_inventory_success_does_not_panic() {
+        record_scan_inventory_success("trivy");
+        record_scan_inventory_success("openscap");
     }
 
     #[test]

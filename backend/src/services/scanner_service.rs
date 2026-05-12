@@ -2194,18 +2194,66 @@ impl ScannerService {
                     // marked as failed because a non-critical INSERT
                     // tripped over a constraint. SBOM generation falls back
                     // to scan_findings when the inventory is empty.
+                    //
+                    // #1157: when persistence fails, set
+                    // `inventory_status = 'partial'` on the scan_result row
+                    // and increment the `scan_inventory_failures_total`
+                    // counter so operator dashboards can alert on degraded
+                    // SBOMs. The scan itself still completes (status =
+                    // 'completed', counts are accurate) so customers don't
+                    // get false-positive scan-failed pages.
                     if !packages.is_empty() {
-                        if let Err(e) = self
+                        match self
                             .scan_result_service
                             .create_packages(scan_result.id, artifact_id, &packages)
                             .await
                         {
-                            warn!(
-                                "Failed to persist scan_packages for scan {}: {}. \
-                                 Findings were persisted; SBOM generation will fall \
-                                 back to the findings-derived component list.",
-                                scan_result.id, e
-                            );
+                            Ok(_) => {
+                                // Companion success counter so SRE alerting
+                                // can compute the failure ratio
+                                // `failures / (failures + success)` instead
+                                // of alerting on raw failure counts (review
+                                // #1188-R1: ratio is robust to traffic
+                                // changes; raw counter is not).
+                                crate::services::metrics_service::record_scan_inventory_success(
+                                    scanner.scan_type(),
+                                );
+                            }
+                            Err(e) => {
+                                // error! (not warn!): this is the precise
+                                // event `scan_inventory_failures_total`
+                                // targets for alerting. warn! would hide it
+                                // in benign log filters.
+                                error!(
+                                    "Failed to persist scan_packages for scan {}: {}. \
+                                     Findings were persisted; SBOM generation will fall \
+                                     back to the findings-derived component list. \
+                                     Marking inventory_status='partial'.",
+                                    scan_result.id, e
+                                );
+                                crate::services::metrics_service::record_scan_inventory_failure(
+                                    scanner.scan_type(),
+                                );
+                                if let Err(set_err) = self
+                                    .scan_result_service
+                                    .set_inventory_status(
+                                        scan_result.id,
+                                        crate::services::scan_result_service::InventoryStatus::Partial,
+                                    )
+                                    .await
+                                {
+                                    // Status-update failure means the metric
+                                    // and the DB row now disagree — operator
+                                    // dashboards will alert on a row that
+                                    // still reads inventory_status='complete'.
+                                    // error! so the gap is grep-able during
+                                    // an incident.
+                                    error!(
+                                        "Failed to set inventory_status='partial' on scan {}: {}",
+                                        scan_result.id, set_err
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -2256,6 +2304,30 @@ impl ScannerService {
                             started_at,
                         )
                         .await?;
+
+                    // #1188-R3: the inventory_status column documents
+                    // `'failed'` as "scan itself failed", kept distinct from
+                    // `'partial'` so dashboards can split "scanner crashed"
+                    // from "scanner ran but inventory broken". fail_scan
+                    // above only touches `status`; reflect the crash state
+                    // in `inventory_status` too so the column is actually
+                    // populated by every path the CHECK constraint allows.
+                    // Non-fatal: the scan_result row is already in the
+                    // failed state and the security score still recomputes
+                    // correctly; we log on failure so the gap is grep-able.
+                    if let Err(set_err) = self
+                        .scan_result_service
+                        .set_inventory_status(
+                            scan_result.id,
+                            crate::services::scan_result_service::InventoryStatus::Failed,
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to set inventory_status='failed' on scan {}: {}",
+                            scan_result.id, set_err
+                        );
+                    }
 
                     // Mark as flagged on failure (conservative)
                     if let Err(e) = sqlx::query!(
