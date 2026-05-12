@@ -118,10 +118,7 @@ pub(crate) fn merge_packages_for_batch(packages: &[RawPackage]) -> Vec<RawPackag
     let mut index: HashMap<(&str, &str), usize> = HashMap::new();
     let mut out: Vec<RawPackage> = Vec::with_capacity(packages.len());
     for pkg in packages {
-        let key = (
-            pkg.name.as_str(),
-            pkg.version.as_deref().unwrap_or(""),
-        );
+        let key = (pkg.name.as_str(), pkg.version.as_deref().unwrap_or(""));
         match index.get(&key) {
             Some(&idx) => {
                 let existing = &mut out[idx];
@@ -2516,12 +2513,11 @@ mod tests {
             // The typed helper rules out the typo case at compile time
             // (see InventoryStatus), so this test goes around it to verify
             // the DB-level CHECK still catches direct writes.
-            let result =
-                sqlx::query("UPDATE scan_results SET inventory_status = $2 WHERE id = $1")
-                    .bind(scan.id)
-                    .bind("garbage")
-                    .execute(&pool)
-                    .await;
+            let result = sqlx::query("UPDATE scan_results SET inventory_status = $2 WHERE id = $1")
+                .bind(scan.id)
+                .bind("garbage")
+                .execute(&pool)
+                .await;
             assert!(result.is_err(), "CHECK must reject unknown value");
 
             cleanup_repo(&pool, repo_id).await;
