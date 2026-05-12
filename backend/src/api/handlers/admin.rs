@@ -853,7 +853,7 @@ fn rescan_inflight_semaphore() -> &'static Arc<Semaphore> {
     request_body(content = RescanForInventoryRequest, description = "Optional; empty body uses defaults"),
     responses(
         (status = 200, description = "Rescans enqueued", body = RescanForInventoryResponse),
-        (status = 401, description = "Admin privileges required"),
+        (status = 403, description = "Admin privileges required"),
         (status = 503, description = "Scanner service not configured"),
     ),
     security(("bearer_auth" = []))

@@ -16,16 +16,14 @@
 --     already be on a pre-#1188 binary. Do NOT roll the DB back while
 --     any new binary is still serving traffic.
 --
--- EXPECTED MIGRATION DURATION (review #1188-R2 SRE):
---   * NOT VALID FK add: milliseconds (catalog-only).
---   * VALIDATE CONSTRAINT: full seqscan of scan_packages with PK probes
---     into scan_results(id, artifact_id). Approximate at ~100k rows/sec
---     on commodity SSD: 3-8 minutes for a 30M-row scan_packages
---     (100k-artifact instance with 300-package lockfiles). Lock is
---     SHARE UPDATE EXCLUSIVE so reads and writes proceed; only other
---     DDL on the table queues. Plan deploys accordingly.
---   * ADD COLUMN ... DEFAULT 'complete': metadata-only on PG >= 11.
---   * Partial-index build: ~milliseconds (empty at build time).
+-- EXPECTED MIGRATION DURATION:
+--   * This file (087): all operations are catalog-only / metadata-only
+--     or build against empty partial-index predicates. Total runtime
+--     is milliseconds even on a 30M-row scan_packages, so the
+--     auto-wrapped transaction commits immediately.
+--   * Migration 088 (`VALIDATE CONSTRAINT scan_packages_scan_result_
+--     artifact_fk`): 3-8 minutes on a 30M-row table under SHARE UPDATE
+--     EXCLUSIVE (DML proceeds; only other DDL queues). See 088 header.
 --
 -- =========================================================================
 -- 1. Composite FK enforcing scan_packages.artifact_id matches the parent
@@ -79,16 +77,23 @@ $$;
 -- Wrapped in DO so re-running the migration on a partially-applied DB is
 -- a no-op rather than an error.
 --
--- Two-phase add (NOT VALID then VALIDATE CONSTRAINT) to keep deploys
--- online on large scan_packages tables (review #1188-R1: ~30M rows in a
--- 100k-artifact instance, a single-phase ADD CONSTRAINT would hold
--- SHARE ROW EXCLUSIVE on scan_packages for the full validation scan and
--- block writes). The two-phase form:
---   - ADD CONSTRAINT ... NOT VALID is instant: catalog-only.
---   - VALIDATE CONSTRAINT scans the table under SHARE UPDATE EXCLUSIVE,
---     which does NOT block reads or writes (only other DDL / VALIDATE).
--- Drifted rows that pre-date the FK still fail loudly at VALIDATE time,
--- preserving the original "fail loudly on inconsistent data" property.
+-- Two-phase add (NOT VALID here, VALIDATE in migration 088) to keep
+-- deploys online on large scan_packages tables. Review #1188-R3 (DB +
+-- adversarial) found that putting VALIDATE in the same file would
+-- defeat the split: sqlx 0.8 wraps each migration in a single
+-- transaction (no per-file opt-out without an undocumented directive),
+-- and the SHARE ROW EXCLUSIVE lock that NOT VALID briefly acquires
+-- would be held until commit -- i.e. through the entire VALIDATE scan
+-- -- blocking DML on scan_packages for 3-8 minutes on a 30M-row table.
+--
+-- Splitting into two files means each ALTER runs in its own
+-- transaction:
+--   * 087 (this file): NOT VALID add. Catalog-only, commits in ms.
+--   * 088: VALIDATE CONSTRAINT. Holds SHARE UPDATE EXCLUSIVE for the
+--     scan duration; SUE does NOT block reads or writes.
+-- Drifted rows still fail loudly at VALIDATE time (migration 088
+-- errors and the deploy stops), preserving the original "fail loudly
+-- on inconsistent data" property.
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -105,11 +110,6 @@ BEGIN
     END IF;
 END
 $$;
-
--- Validate the constraint immediately. Idempotent: VALIDATE CONSTRAINT
--- on an already-validated constraint is a no-op (catalog flag check).
-ALTER TABLE scan_packages
-    VALIDATE CONSTRAINT scan_packages_scan_result_artifact_fk;
 
 -- =========================================================================
 -- 2. inventory_status column on scan_results (#1157).

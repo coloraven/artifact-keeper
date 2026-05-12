@@ -2305,6 +2305,30 @@ impl ScannerService {
                         )
                         .await?;
 
+                    // #1188-R3: the inventory_status column documents
+                    // `'failed'` as "scan itself failed", kept distinct from
+                    // `'partial'` so dashboards can split "scanner crashed"
+                    // from "scanner ran but inventory broken". fail_scan
+                    // above only touches `status`; reflect the crash state
+                    // in `inventory_status` too so the column is actually
+                    // populated by every path the CHECK constraint allows.
+                    // Non-fatal: the scan_result row is already in the
+                    // failed state and the security score still recomputes
+                    // correctly; we log on failure so the gap is grep-able.
+                    if let Err(set_err) = self
+                        .scan_result_service
+                        .set_inventory_status(
+                            scan_result.id,
+                            crate::services::scan_result_service::InventoryStatus::Failed,
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to set inventory_status='failed' on scan {}: {}",
+                            scan_result.id, set_err
+                        );
+                    }
+
                     // Mark as flagged on failure (conservative)
                     if let Err(e) = sqlx::query!(
                         "UPDATE artifacts SET quarantine_status = 'flagged' WHERE id = $1",

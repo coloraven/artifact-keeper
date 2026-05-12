@@ -115,10 +115,13 @@ pub(crate) fn merge_packages_for_batch(packages: &[RawPackage]) -> Vec<RawPackag
     use std::collections::HashMap;
     // (name, version_for_dedup) -> index into the output Vec. The
     // dedup key matches the SQL unique index: COALESCE(version, '').
-    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    let mut index: HashMap<(&str, &str), usize> = HashMap::new();
     let mut out: Vec<RawPackage> = Vec::with_capacity(packages.len());
     for pkg in packages {
-        let key = (pkg.name.clone(), pkg.version.clone().unwrap_or_default());
+        let key = (
+            pkg.name.as_str(),
+            pkg.version.as_deref().unwrap_or(""),
+        );
         match index.get(&key) {
             Some(&idx) => {
                 let existing = &mut out[idx];
@@ -848,7 +851,7 @@ impl ScanResultService {
         inventory_status: InventoryStatus,
     ) -> Result<()> {
         let status_str = inventory_status.as_db_str();
-        sqlx::query!(
+        let result = sqlx::query!(
             r#"
             UPDATE scan_results
             SET inventory_status = $2
@@ -861,6 +864,17 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Surface missing-row writes as an error rather than silent
+        // success (#1188-R3): the orchestrator's failure-then-status
+        // path depends on this UPDATE landing; a row deleted between
+        // create_packages failure and set_inventory_status would
+        // otherwise lose the partial state silently.
+        if result.rows_affected() != 1 {
+            return Err(AppError::NotFound(format!(
+                "scan_result {scan_id} not found while setting inventory_status"
+            )));
+        }
+
         Ok(())
     }
 
@@ -868,30 +882,41 @@ impl ScanResultService {
     /// `scan_packages` table creation (migration 085), so an admin caller
     /// can enqueue rescans to populate the inventory (#1155).
     ///
-    /// "Predates" is captured by the absence of any `scan_packages` row
-    /// for the artifact's latest scan, not by a timestamp comparison
-    /// against migration 085's apply time: callers may have legitimate
-    /// post-#903 scans that produced zero inventory rows (e.g. a scanner
-    /// that doesn't enumerate packages, like OpenSCAP), and a timestamp
-    /// filter would re-scan those too. The empty-inventory test catches
-    /// exactly the artifacts the SBOM read path falls back on.
+    /// Semantics: an artifact is "missing inventory" when its LATEST
+    /// completed scan has no `scan_packages` rows tied to it (#1188-R3).
+    /// Earlier versions of this query looked at `scan_packages` across
+    /// all scans of the artifact, which incorrectly excluded artifacts
+    /// whose old scan had rows but whose most recent rescan failed to
+    /// persist packages -- exactly the degraded state the backfill is
+    /// for.
+    ///
+    /// Legitimate empty-inventory scanners (e.g. OpenSCAP) will still
+    /// surface here; that is acceptable because rescanning them is a
+    /// no-op for the package list and runs cheap.
     ///
     /// The query is bounded by `limit` because operator endpoints are
     /// dispatch-and-return: a 100k-artifact backfill that streams every
     /// row inline would tie up an HTTP worker thread. The handler chunks
     /// the work by re-calling this method until it returns < limit.
+    /// Results are ordered by `artifact_id` for stable iteration across
+    /// polled calls.
     pub async fn list_artifacts_missing_inventory(&self, limit: i64) -> Result<Vec<Uuid>> {
         let rows = sqlx::query_scalar!(
             r#"
-            SELECT DISTINCT sr.artifact_id
-            FROM scan_results sr
-            JOIN artifacts a ON a.id = sr.artifact_id
-            WHERE sr.status = 'completed'
-              AND NOT a.is_deleted
-              AND NOT EXISTS (
-                  SELECT 1 FROM scan_packages sp
-                  WHERE sp.artifact_id = sr.artifact_id
-              )
+            WITH latest_scan AS (
+                SELECT DISTINCT ON (sr.artifact_id)
+                    sr.artifact_id, sr.id
+                FROM scan_results sr
+                JOIN artifacts a ON a.id = sr.artifact_id
+                WHERE sr.status = 'completed' AND NOT a.is_deleted
+                ORDER BY sr.artifact_id, sr.created_at DESC
+            )
+            SELECT artifact_id AS "artifact_id!"
+            FROM latest_scan ls
+            WHERE NOT EXISTS (
+                SELECT 1 FROM scan_packages sp WHERE sp.scan_result_id = ls.id
+            )
+            ORDER BY artifact_id
             LIMIT $1
             "#,
             limit,
@@ -2582,6 +2607,88 @@ mod tests {
             assert!(
                 !missing.contains(&modern_aid),
                 "modern artifact must not be flagged as missing inventory"
+            );
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #1188-R3: an artifact whose older scan had packages but whose
+        /// most recent rescan did not (e.g. inventory persistence failed)
+        /// must still be flagged. The earlier implementation looked at
+        /// scan_packages across all scans of the artifact and would
+        /// incorrectly exclude this case.
+        #[tokio::test]
+        async fn list_artifacts_missing_inventory_uses_latest_scan_semantics() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "regressed").await;
+
+            // Older scan: completed AND has a package row.
+            let old_scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create old scan");
+            svc.create_packages(
+                old_scan.id,
+                aid,
+                &[RawPackage {
+                    name: "lodash".into(),
+                    version: Some("4.17.21".into()),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                }],
+            )
+            .await
+            .expect("old inventory");
+            svc.complete_scan(
+                old_scan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("v1"),
+                chrono::Utc::now() - chrono::Duration::days(30),
+            )
+            .await
+            .expect("complete old scan");
+
+            // Newer scan: completed but no scan_packages rows (simulates
+            // a degraded post-#1157 rescan that flipped inventory_status
+            // to 'partial' without persisting any package rows).
+            let new_scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create new scan");
+            svc.complete_scan(
+                new_scan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("v1"),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("complete new scan");
+
+            let missing = svc
+                .list_artifacts_missing_inventory(100)
+                .await
+                .expect("list missing");
+
+            assert!(
+                missing.contains(&aid),
+                "artifact with degraded latest scan must be flagged \
+                 even though an older scan still has package rows"
             );
 
             cleanup_repo(&pool, repo_id).await;
