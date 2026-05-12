@@ -21,27 +21,123 @@ use std::time::Duration;
 // Base URL from request headers
 // ---------------------------------------------------------------------------
 
+/// Pure parser for `AK_EXTERNAL_URL`. Returns `Some(trimmed_url)` only when
+/// the value is a syntactically valid `http`/`https` absolute URL with no
+/// embedded userinfo. Kept separate from [`configured_external_url`] so the
+/// validation rules can be unit-tested without poisoning the process-wide
+/// `OnceLock`.
+fn parse_external_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = match url::Url::parse(trimmed) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(
+                value = %trimmed,
+                error = %e,
+                "AK_EXTERNAL_URL is not a valid URL; ignoring"
+            );
+            return None;
+        }
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        tracing::warn!(
+            value = %trimmed,
+            scheme = parsed.scheme(),
+            "AK_EXTERNAL_URL scheme must be http or https; ignoring"
+        );
+        return None;
+    }
+    if parsed.host_str().map_or(true, str::is_empty) {
+        tracing::warn!(
+            value = %trimmed,
+            "AK_EXTERNAL_URL must have a host; ignoring"
+        );
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        tracing::warn!(
+            value = %trimmed,
+            "AK_EXTERNAL_URL must not contain embedded credentials; ignoring"
+        );
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Operator-configured external base URL, read once from `AK_EXTERNAL_URL`
+/// and cached for the process lifetime. When set, this overrides whatever
+/// `request_base_url` derives from request headers.
+///
+/// Set this in deployments where reverse-proxy header forwarding cannot be
+/// trusted (or is unconfigured) and the Docker / Cargo / NuGet / Git LFS
+/// client must receive a stable, externally reachable URL in the
+/// `WWW-Authenticate: Bearer realm=...` challenge and other client-facing
+/// links. See #1021.
+///
+/// Trailing slashes are stripped so callers can build paths uniformly with
+/// `format!("{base}/v2/token")`. The value is validated with `url::Url::parse`
+/// at first access: the scheme must be `http` or `https`, a host must be
+/// present, and embedded credentials are rejected. Invalid values are logged
+/// and the override is treated as unset (handlers fall back to headers).
+fn configured_external_url() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let raw = std::env::var("AK_EXTERNAL_URL").ok()?;
+            parse_external_url(&raw)
+        })
+        .as_deref()
+}
+
 /// Derive the external base URL from reverse-proxy headers.
 ///
-/// Checks `X-Forwarded-Proto` for the scheme (defaults to `"http"`) and
-/// `X-Forwarded-Host` then `Host` for the hostname (defaults to
-/// `"localhost"`). If the host value already contains a scheme prefix it is
-/// returned as-is to avoid duplication.
+/// Resolution order (#1021):
+/// 1. `AK_EXTERNAL_URL` environment variable, if set. Operator-supplied
+///    external URL; takes precedence over request headers. This is the
+///    correct setting when the backend cannot be trusted to receive
+///    correct `X-Forwarded-*` headers from the ingress, or when several
+///    layers of proxies make header forwarding fragile.
+/// 2. `X-Forwarded-Host` + `X-Forwarded-Proto`. Standard Helm-chart ingress
+///    setup.
+/// 3. The `Host` request header. Vulnerable to host-header spoofing if no
+///    upstream sanitizes it; acceptable as a development fallback. In
+///    production, set `AK_EXTERNAL_URL` or configure the ingress to set
+///    `X-Forwarded-Host` so a hostile client cannot redirect Docker / Cargo
+///    / NuGet clients to an attacker-controlled token endpoint by tampering
+///    with the `Host` header.
+/// 4. `http://localhost`. Last-resort fallback so handlers do not panic.
+///
+/// If a host value already carries an embedded scheme it is returned as-is
+/// to avoid `http://https://...` duplication.
 ///
 /// Most format handlers need to construct absolute URLs for clients (OCI,
 /// NuGet, npm, Cargo, Git LFS, SSO/OIDC). This function centralizes the
 /// header inspection logic so each handler does not duplicate it.
 pub fn request_base_url(headers: &HeaderMap) -> String {
+    // 1. Operator-supplied override (env var). #1021.
+    if let Some(external) = configured_external_url() {
+        return external.to_string();
+    }
+
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("http");
 
-    let host = headers
+    let forwarded_host = headers
         .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
+        .and_then(|v| v.to_str().ok());
+
+    let host = match forwarded_host {
+        Some(h) => h,
+        None => headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost"),
+    };
 
     if host.contains("://") {
         host.to_string()
@@ -1667,6 +1763,90 @@ mod tests {
         );
     }
 
+    // ── parse_external_url tests (#1021) ─────────────────────────────
+    // Tested via the pure parser rather than the OnceLock-cached
+    // configured_external_url() so multiple tests can run in parallel
+    // without poisoning the process-wide cache.
+
+    #[test]
+    fn test_parse_external_url_https() {
+        assert_eq!(
+            parse_external_url("https://registry.example.com"),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_http() {
+        assert_eq!(
+            parse_external_url("http://localhost:8080"),
+            Some("http://localhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_strips_trailing_slash() {
+        assert_eq!(
+            parse_external_url("https://registry.example.com/"),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_trims_whitespace() {
+        assert_eq!(
+            parse_external_url("  https://registry.example.com/  "),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_empty_rejected() {
+        assert_eq!(parse_external_url(""), None);
+        assert_eq!(parse_external_url("   "), None);
+        assert_eq!(parse_external_url("/"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_missing_scheme_rejected() {
+        assert_eq!(parse_external_url("registry.example.com"), None);
+        assert_eq!(parse_external_url("//registry.example.com"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_non_http_scheme_rejected() {
+        assert_eq!(parse_external_url("ftp://registry.example.com"), None);
+        assert_eq!(parse_external_url("file:///etc/passwd"), None);
+        assert_eq!(parse_external_url("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_embedded_credentials_rejected() {
+        assert_eq!(
+            parse_external_url("https://user:pass@registry.example.com"),
+            None
+        );
+        assert_eq!(
+            parse_external_url("https://user@registry.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_invalid_garbage_rejected() {
+        assert_eq!(parse_external_url("https://"), None);
+        assert_eq!(parse_external_url("not a url at all"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_with_path_preserved() {
+        // Some deployments host the registry under a path prefix.
+        assert_eq!(
+            parse_external_url("https://example.com/registry"),
+            Some("https://example.com/registry".to_string())
+        );
+    }
+
     // ── build_remote_repo tests ──────────────────────────────────────
 
     #[test]
@@ -2688,6 +2868,8 @@ mod tests {
                 rate_limit_api_per_window: 5000,
                 rate_limit_search_per_window: 300,
                 rate_limit_presign_per_window: 30,
+                rate_limit_password_change_per_window: 5,
+                rate_limit_password_change_window_secs: 900,
                 rate_limit_window_secs: 60,
                 rate_limit_exempt_usernames: Vec::new(),
                 rate_limit_exempt_service_accounts: false,
