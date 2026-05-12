@@ -9,6 +9,29 @@ use crate::models::security::{
     Severity,
 };
 
+/// Inventory persistence outcome for a scan_result row (#1157, #1188-R1).
+///
+/// Values mirror the CHECK constraint on `scan_results.inventory_status`
+/// (migration 087). Encoding the closed set as an enum at the boundary
+/// prevents typos (e.g. `"Partial"` vs `"partial"`) from reaching the DB
+/// and surfacing as a generic constraint-violation error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryStatus {
+    Complete,
+    Partial,
+    Failed,
+}
+
+impl InventoryStatus {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            InventoryStatus::Complete => "complete",
+            InventoryStatus::Partial => "partial",
+            InventoryStatus::Failed => "failed",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
 // ---------------------------------------------------------------------------
@@ -815,11 +838,16 @@ impl ScanResultService {
     /// Called by the scanner orchestrator when `create_packages` returns
     /// an error: the scan itself succeeded, the SBOM is degraded, and the
     /// operator-visible state needs to reflect that without rewriting any
-    /// of the count fields owned by `complete_scan`. Values are validated
-    /// by the CHECK constraint on the column (migration 087); passing an
-    /// unknown value surfaces as a Database error rather than silently
-    /// corrupting the column.
-    pub async fn set_inventory_status(&self, scan_id: Uuid, inventory_status: &str) -> Result<()> {
+    /// of the count fields owned by `complete_scan`. Taking a typed
+    /// `InventoryStatus` rather than `&str` rules out typo-class bugs at
+    /// the call site; the CHECK constraint on the column remains the
+    /// belt-and-suspenders defence against schema drift.
+    pub async fn set_inventory_status(
+        &self,
+        scan_id: Uuid,
+        inventory_status: InventoryStatus,
+    ) -> Result<()> {
+        let status_str = inventory_status.as_db_str();
         sqlx::query!(
             r#"
             UPDATE scan_results
@@ -827,7 +855,7 @@ impl ScanResultService {
             WHERE id = $1
             "#,
             scan_id,
-            inventory_status,
+            status_str,
         )
         .execute(&self.db)
         .await
@@ -2428,7 +2456,7 @@ mod tests {
                     .expect("read inventory_status default");
             assert_eq!(initial, "complete");
 
-            svc.set_inventory_status(scan.id, "partial")
+            svc.set_inventory_status(scan.id, InventoryStatus::Partial)
                 .await
                 .expect("set partial");
 
@@ -2443,11 +2471,11 @@ mod tests {
             cleanup_repo(&pool, repo_id).await;
         }
 
-        /// The CHECK constraint on inventory_status rejects unknown values.
-        /// Guards against accidental typos in callers that bypass the
-        /// service helper.
+        /// The CHECK constraint on inventory_status rejects unknown values
+        /// even when the service helper is bypassed (defence in depth for
+        /// any code path that writes the column via raw SQL).
         #[tokio::test]
-        async fn set_inventory_status_rejects_unknown_value() {
+        async fn inventory_status_check_constraint_rejects_unknown_value() {
             let Some(pool) = db_helpers::try_pool().await else {
                 return;
             };
@@ -2460,7 +2488,15 @@ mod tests {
                 .await
                 .expect("create scan");
 
-            let result = svc.set_inventory_status(scan.id, "garbage").await;
+            // The typed helper rules out the typo case at compile time
+            // (see InventoryStatus), so this test goes around it to verify
+            // the DB-level CHECK still catches direct writes.
+            let result =
+                sqlx::query("UPDATE scan_results SET inventory_status = $2 WHERE id = $1")
+                    .bind(scan.id)
+                    .bind("garbage")
+                    .execute(&pool)
+                    .await;
             assert!(result.is_err(), "CHECK must reject unknown value");
 
             cleanup_repo(&pool, repo_id).await;

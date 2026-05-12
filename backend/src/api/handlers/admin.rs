@@ -6,7 +6,8 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -822,23 +823,36 @@ pub struct RescanForInventoryResponse {
 /// tasks. Callers poll the response.artifacts_enqueued value across
 /// repeated calls to drive a full backfill, stopping when a call
 /// returns zero.
+/// Bound on simultaneously in-flight rescan tasks across all calls of
+/// the rescan-for-inventory endpoint. Each permit corresponds to one
+/// background scan; the cap exists so a polling admin (or a stolen
+/// admin token) cannot pin every Tokio worker on scanner I/O and
+/// starve normal upload traffic. 16 leaves headroom for parallel
+/// rescans on a default 8-vCPU runtime without monopolising the pool.
+const RESCAN_INFLIGHT_CAP: usize = 16;
+
+fn rescan_inflight_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(RESCAN_INFLIGHT_CAP)))
+}
+
 #[utoipa::path(
     post,
     path = "/rescan-for-inventory",
     context_path = "/api/v1/admin",
     tag = "admin",
-    request_body = RescanForInventoryRequest,
+    request_body(content = RescanForInventoryRequest, description = "Optional; empty body uses defaults"),
     responses(
         (status = 200, description = "Rescans enqueued", body = RescanForInventoryResponse),
         (status = 401, description = "Admin privileges required"),
-        (status = 503, description = "Scanner service not configured"),
+        (status = 503, description = "Scanner service not configured, or backfill queue saturated"),
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn rescan_for_inventory(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Json(body): Json<RescanForInventoryRequest>,
+    body: Option<Json<RescanForInventoryRequest>>,
 ) -> Result<Json<RescanForInventoryResponse>> {
     if !auth.is_admin {
         return Err(AppError::Authorization(
@@ -856,7 +870,8 @@ pub async fn rescan_for_inventory(
     // caller asks for. The default of 100 matches the typical operator
     // pace: each rescan eats scanner capacity, so 100 is enough to keep
     // a backfill moving without crowding out new uploads.
-    let limit = body.limit.unwrap_or(100).clamp(1, 1000);
+    let requested_limit = body.as_ref().and_then(|b| b.0.limit).unwrap_or(100);
+    let limit = requested_limit.clamp(1, 1000);
 
     let scan_result_service =
         crate::services::scan_result_service::ScanResultService::new(state.db.clone());
@@ -865,9 +880,31 @@ pub async fn rescan_for_inventory(
         .await?;
     let enqueued = artifact_ids.len() as i64;
 
+    tracing::info!(
+        actor_user_id = %auth.user_id,
+        actor_username = %auth.username,
+        limit,
+        enqueued,
+        "admin.rescan_for_inventory: dispatching background rescans"
+    );
+
+    let semaphore = rescan_inflight_semaphore().clone();
     for artifact_id in artifact_ids {
         let scanner_for_spawn = scanner.clone();
+        let permit_sem = semaphore.clone();
         tokio::spawn(async move {
+            // Acquire a permit before doing scanner work. Bounds total
+            // in-flight rescans across all callers of this endpoint so
+            // a tight polling loop can't pin every Tokio worker. The
+            // permit is held for the duration of the scan and released
+            // on task completion (success or failure).
+            let _permit = match permit_sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    // Semaphore closed: only happens at process shutdown.
+                    return;
+                }
+            };
             // Use `force = true` (via scan_artifact_with_options) so the
             // repo's scan-enabled config doesn't block the backfill. The
             // operator already chose to rescan; respecting per-repo config

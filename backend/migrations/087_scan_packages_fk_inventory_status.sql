@@ -54,11 +54,18 @@ $$;
 
 -- Step 1b: composite FK on scan_packages.
 -- Wrapped in DO so re-running the migration on a partially-applied DB is
--- a no-op rather than an error. NOT VALID is intentionally NOT used: the
--- table is small enough that a full scan during constraint creation is
--- acceptable, and we want immediate enforcement on existing rows. If a
--- prior write created a drifted row, the migration will fail loudly here,
--- which is the desired behaviour.
+-- a no-op rather than an error.
+--
+-- Two-phase add (NOT VALID then VALIDATE CONSTRAINT) to keep deploys
+-- online on large scan_packages tables (review #1188-R1: ~30M rows in a
+-- 100k-artifact instance, a single-phase ADD CONSTRAINT would hold
+-- SHARE ROW EXCLUSIVE on scan_packages for the full validation scan and
+-- block writes). The two-phase form:
+--   - ADD CONSTRAINT ... NOT VALID is instant: catalog-only.
+--   - VALIDATE CONSTRAINT scans the table under SHARE UPDATE EXCLUSIVE,
+--     which does NOT block reads or writes (only other DDL / VALIDATE).
+-- Drifted rows that pre-date the FK still fail loudly at VALIDATE time,
+-- preserving the original "fail loudly on inconsistent data" property.
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -70,10 +77,16 @@ BEGIN
             ADD CONSTRAINT scan_packages_scan_result_artifact_fk
             FOREIGN KEY (scan_result_id, artifact_id)
             REFERENCES scan_results (id, artifact_id)
-            ON DELETE CASCADE;
+            ON DELETE CASCADE
+            NOT VALID;
     END IF;
 END
 $$;
+
+-- Validate the constraint immediately. Idempotent: VALIDATE CONSTRAINT
+-- on an already-validated constraint is a no-op (catalog flag check).
+ALTER TABLE scan_packages
+    VALIDATE CONSTRAINT scan_packages_scan_result_artifact_fk;
 
 -- =========================================================================
 -- 2. inventory_status column on scan_results (#1157).
@@ -105,7 +118,11 @@ $$;
 -- Operators querying the new column will see 'complete' for legacy rows;
 -- that is consistent with the read-path fallback to scan_findings, which
 -- only applies when scan_packages is genuinely empty.
-
+--
+-- Requires Postgres >= 11 (verified against project README minimum). On
+-- PG 11+ ADD COLUMN ... NOT NULL DEFAULT <constant> is metadata-only
+-- (no table rewrite); on PG <= 10 it would rewrite scan_results under
+-- ACCESS EXCLUSIVE which is unacceptable on production-sized tables.
 ALTER TABLE scan_results
     ADD COLUMN IF NOT EXISTS inventory_status TEXT NOT NULL DEFAULT 'complete'
     CHECK (inventory_status IN ('complete', 'partial', 'failed'));
@@ -114,6 +131,11 @@ ALTER TABLE scan_results
 -- query. Partial index over the non-default value: keeps the index tiny
 -- (the common case is 'complete') while supporting WHERE inventory_status
 -- = 'partial' and WHERE inventory_status = 'failed' scans.
+--
+-- Build is online-safe even without CONCURRENTLY: the ADD COLUMN above
+-- sets every existing row to 'complete', so this partial index has zero
+-- entries to copy at create time. The SHARE lock is held only for the
+-- empty-scan duration (milliseconds even on the largest scan_results).
 CREATE INDEX IF NOT EXISTS idx_scan_results_inventory_status
     ON scan_results (inventory_status)
     WHERE inventory_status <> 'complete';
