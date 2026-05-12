@@ -3622,4 +3622,81 @@ mod tests {
             Some(weird)
         );
     }
+
+    // -------------------------------------------------------------------
+    // #1183: behaviour-pin tests for the streaming-migration handlers.
+    //
+    // The slow-path remote fetch in five handlers (maven catch-all,
+    // goproxy `.zip`, gitlfs blob, alpine `.apk`, debian pool) was
+    // migrated from the buffered `proxy_fetch` helper to the streaming
+    // `proxy_fetch_streaming` helper in #1181 to avoid the OOM kills
+    // tracked in #895 / #737. The migration is invisible to existing
+    // tests because both helpers return the same `Response` type and
+    // the streaming helper has its own coverage via
+    // `proxy_service::tests` — a silent rebase that swapped
+    // `proxy_fetch_streaming` back to `proxy_fetch` would compile and
+    // pass the suite while quietly re-introducing the OOM regression.
+    //
+    // These tests read each handler's source at test time (the file
+    // is part of the same crate so the path is stable) and assert
+    // that the remote-fetch arm still calls `proxy_fetch_streaming`.
+    // Failure here means a contributor must either fix the regression
+    // or, if the migration is intentionally being rolled back, delete
+    // the matching test and document the reason in the PR.
+    //
+    // The matched substring is intentionally narrow (the
+    // `proxy_helpers::proxy_fetch_streaming(` token) so a passing
+    // mention in a comment or a different helper does not satisfy it.
+    // -------------------------------------------------------------------
+
+    const STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming(";
+
+    /// One pin test per handler. Kept as separate `#[test]` functions
+    /// (rather than a single loop) so a CI failure points directly at
+    /// the regressing handler. The macro keeps the surface area small
+    /// and stops the five near-identical functions from tripping the
+    /// 3% duplication gate.
+    macro_rules! streaming_pin_test {
+        ($name:ident, $module_file:literal, $what:literal) => {
+            #[test]
+            fn $name() {
+                let src = include_str!($module_file);
+                assert!(
+                    src.contains(STREAMING_CALL_TOKEN),
+                    "{} handler MUST call `{}` for {} (#1183). A revert \
+                     to the buffered `proxy_fetch` helper would re-introduce \
+                     the OOM regression closed by #895/#1181.",
+                    $module_file,
+                    STREAMING_CALL_TOKEN,
+                    $what,
+                );
+            }
+        };
+    }
+
+    streaming_pin_test!(
+        test_maven_remote_fetch_uses_streaming_helper_1183,
+        "maven.rs",
+        "the remote catch-all download"
+    );
+    streaming_pin_test!(
+        test_goproxy_remote_fetch_uses_streaming_helper_1183,
+        "goproxy.rs",
+        "the remote `@v/<ver>.zip` download"
+    );
+    streaming_pin_test!(
+        test_gitlfs_remote_fetch_uses_streaming_helper_1183,
+        "gitlfs.rs",
+        "the remote LFS blob download (large binaries)"
+    );
+    streaming_pin_test!(
+        test_alpine_remote_fetch_uses_streaming_helper_1183,
+        "alpine.rs",
+        "the remote `.apk` download"
+    );
+    streaming_pin_test!(
+        test_debian_remote_fetch_uses_streaming_helper_1183,
+        "debian.rs",
+        "the remote pool `.deb` download"
+    );
 }

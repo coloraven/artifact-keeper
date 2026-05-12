@@ -100,7 +100,39 @@ struct CacheMetadataTemplate {
 ///   The `http_client::base_client_builder()` read timeout caps the
 ///   total wait; operators with tight storage budgets should verify
 ///   that timeout matches their upstream's tolerance.
+/// * **HTTP/2 client flow-control window (#1184).** The 4 MiB tee cap
+///   bounds memory between upstream reader and storage writer, but
+///   on the *client* side hyper's HTTP/2 flow-control window adds
+///   another in-flight slice that is NOT part of this channel.
+///   With reqwest's current defaults this codebase does not call
+///   `http2_adaptive_window`, so the per-stream window is fixed at
+///   `SETTINGS_INITIAL_WINDOW_SIZE` (64 KiB). One in-flight frame
+///   bounded by `SETTINGS_MAX_FRAME_SIZE` (peer-advertised, default
+///   16 KiB, ceiling 16 MiB) sits on top of the window, so the
+///   per-stream HTTP/2 overhead is conservatively ~128 KiB under
+///   default tuning. Practical worst case under the documented
+///   1 GiB pod limit is ~10 concurrent slow HTTP/2 clients =
+///   ~1.3 MiB on top of the ~14 MiB per-request peak above, i.e.
+///   ~15 MiB total. Well within budget; operators sizing pod memory
+///   should still account for the per-stream window when calculating
+///   concurrency limits, not just `TEE_CHANNEL_DEPTH * chunk_size`.
+///   The OOM-relief contract holds because the flow-control window
+///   itself is bounded by hyper.
 const TEE_CHANNEL_DEPTH: usize = 64;
+
+/// Maximum bytes per chunk forwarded through the tee channel.
+///
+/// `TEE_CHANNEL_DEPTH * TEE_MAX_CHUNK_BYTES` is the hard upper bound on the
+/// memory held in the reader -> writer channel. Without splitting, an upstream
+/// that hands us a multi-megabyte frame (HTTP/1.1 chunked with a large
+/// `Transfer-Encoding` chunk, or an HTTP/2 peer that advertises a large
+/// `SETTINGS_MAX_FRAME_SIZE`) would let `64 * upstream_chunk` blow past the
+/// documented 4 MiB cap. Splitting at this boundary inside the tee makes the
+/// budget claim a property of the code, not a property of the upstream.
+///
+/// 64 KiB matches the conservative chunk size assumed by the 4 MiB / request
+/// docstring above. Smaller upstream chunks pass through unchanged.
+const TEE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Validate the upstream response status code for the streaming path.
 /// Extracted from [`ProxyService::read_upstream_response_streaming`] so
@@ -170,6 +202,14 @@ fn extract_streaming_headers(
 ///   drops, and the writer commits or aborts whatever it has buffered.
 ///   No leaked temp files (FilesystemBackend cleans up via the
 ///   `put_stream` error path).
+///
+/// Error categories (#1185):
+/// * Upstream stream errors observed mid-body are wrapped as
+///   [`AppError::BadGateway`] before being forwarded to the writer
+///   channel and surfaced to the client. This keeps operator log /
+///   metric buckets honest: a flaky mirror does not inflate the
+///   `STORAGE_ERROR` rate, and a genuine cache backend failure does
+///   not get hidden as `BAD_GATEWAY`.
 fn tee_upstream_to_cache(
     upstream: BoxStream<'static, Result<Bytes>>,
     storage: Arc<StorageService>,
@@ -248,18 +288,45 @@ fn tee_upstream_to_cache(
     let tee_stream = async_stream::try_stream! {
         let mut upstream = upstream;
         while let Some(chunk_result) = upstream.next().await {
-            // Clone the result to feed both consumers (the chunk's
-            // inner Bytes is a cheap Arc-like clone).
-            let storage_msg = match &chunk_result {
-                Ok(bytes) => Ok(bytes.clone()),
-                Err(e) => Err(AppError::Storage(format!("upstream stream error: {}", e))),
-            };
-            // Best-effort send: if the writer is gone, drop the
-            // caching half. The client still gets the data.
-            if tx.send(storage_msg).await.is_err() {
-                // writer dropped its rx; stop trying to feed it
+            match chunk_result {
+                Ok(mut bytes) => {
+                    // #1184: cap the per-channel-message size so an upstream
+                    // that hands us a multi-megabyte chunk does not blow
+                    // past the documented `TEE_CHANNEL_DEPTH * 64 KiB`
+                    // memory budget. Splitting preserves byte order and the
+                    // total payload; the client sees the same bytes, just
+                    // in smaller pieces. `Bytes::split_to` is a cheap
+                    // reference-count adjustment, not a copy.
+                    while !bytes.is_empty() {
+                        let take = bytes.len().min(TEE_MAX_CHUNK_BYTES);
+                        let slice = bytes.split_to(take);
+                        // Best-effort send to the cache writer. If the
+                        // writer is gone (it already failed and dropped
+                        // its receiver), drop the caching half silently
+                        // and keep yielding to the client.
+                        let _ = tx.send(Ok(slice.clone())).await;
+                        yield slice;
+                    }
+                }
+                Err(e) => {
+                    // #1185: upstream stream errors are upstream/network
+                    // failures, not storage failures. Tagging them
+                    // `BadGateway` on the writer channel lets operators
+                    // bucket them correctly in logs / metrics (the
+                    // previous `Storage` tag hid upstream incidents inside
+                    // the storage error rate). The cache writer treats
+                    // any Err it observes as a reason to abandon the
+                    // cache regardless of category. The original error
+                    // surfaces to the client unchanged — handlers map it
+                    // to a 502 via `map_proxy_error` on the request path.
+                    let storage_msg = Err(AppError::BadGateway(format!(
+                        "upstream stream error: {}",
+                        e
+                    )));
+                    let _ = tx.send(storage_msg).await;
+                    Err(e)?;
+                }
             }
-            yield chunk_result?;
         }
         // upstream EOF: drop tx so the writer sees end-of-stream
         drop(tx);
@@ -3535,5 +3602,232 @@ mod tests {
         assert_eq!(writes.len(), 1);
         let metadata: CacheMetadata = serde_json::from_slice(&writes[0].1).unwrap();
         assert_eq!(metadata.size_bytes as u64, total_expected);
+    }
+
+    /// #1185 regression (client side): on upstream error mid-body the
+    /// tee MUST (a) surface the *original* error to the client (the
+    /// BadGateway re-tag is only on the writer-channel side; the
+    /// handler maps the client-side error to a 502 via
+    /// `map_proxy_error`) and (b) NOT promote partial bytes to a
+    /// cache hit. The category assertion lives in
+    /// [`test_tee_writer_sees_bad_gateway_category_on_upstream_error`];
+    /// keeping the two concerns in separate tests makes a future
+    /// regression bisectable.
+    #[tokio::test]
+    async fn test_tee_upstream_error_surfaces_original_error_and_blocks_caching() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        // Inject an upstream error directly (simulates a `reqwest`
+        // bytes_stream yielding `Err` mid-body).
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"ok-prefix")),
+            Err(AppError::Internal("simulated upstream reset".to_string())),
+        ]));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        // First chunk OK.
+        let first = client.next().await.expect("first chunk").expect("ok");
+        assert_eq!(first.as_ref(), b"ok-prefix");
+
+        // Second poll yields the *original* upstream error variant
+        // unchanged. We assert the variant explicitly so a future
+        // refactor that silently re-tags the client-side error
+        // (which would change handler error mapping) trips this test.
+        match client.next().await {
+            Some(Err(AppError::Internal(_))) => {}
+            other => panic!(
+                "expected upstream `AppError::Internal` to surface to \
+                 client unchanged; got {:?}",
+                other
+            ),
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "upstream error MUST NOT promote partial bytes to a cache hit"
+        );
+    }
+
+    /// #1185 regression: the BadGateway wrapping is observable on the
+    /// writer channel side. We assert by recording the put_stream
+    /// chunks; on upstream error the writer sees `Err(BadGateway(_))`
+    /// not `Err(Storage(_))`, so `put_stream` returns Err and the
+    /// metadata-sidecar branch is skipped.
+    ///
+    /// This complements the client-facing test above by pinning the
+    /// behaviour on the storage-writer side of the tee.
+    #[tokio::test]
+    async fn test_tee_writer_sees_bad_gateway_category_on_upstream_error() {
+        /// Recording backend that captures the FIRST error category it
+        /// sees on the put_stream input. Used to assert the tee's
+        /// error wrapping reaches the writer task with the right tag.
+        struct CategoryRecordingBackend {
+            seen_error: tokio::sync::Mutex<Option<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ServiceStorageBackend for CategoryRecordingBackend {
+            async fn put(&self, _: &str, _: Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _: &str) -> Result<Bytes> {
+                Err(AppError::NotFound("n/a".into()))
+            }
+            async fn exists(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn list(&self, _: Option<&str>) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn copy(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn size(&self, _: &str) -> Result<u64> {
+                Ok(0)
+            }
+            async fn put_stream(
+                &self,
+                _: &str,
+                stream: ServiceBoxStream<'static, Result<Bytes>>,
+            ) -> Result<ServicePutStreamResult> {
+                use futures::StreamExt;
+                tokio::pin!(stream);
+                while let Some(chunk) = stream.next().await {
+                    if let Err(e) = chunk {
+                        // Variant name is stable across the codebase.
+                        let tag = match &e {
+                            AppError::BadGateway(_) => "BadGateway",
+                            AppError::Storage(_) => "Storage",
+                            AppError::Internal(_) => "Internal",
+                            other => {
+                                let s = format!("{:?}", other);
+                                Box::leak(s.into_boxed_str()) as &'static str
+                            }
+                        };
+                        *self.seen_error.lock().await = Some(tag.to_string());
+                        return Err(e);
+                    }
+                }
+                Ok(ServicePutStreamResult {
+                    checksum_sha256: String::new(),
+                    bytes_written: 0,
+                })
+            }
+        }
+
+        let backend = Arc::new(CategoryRecordingBackend {
+            seen_error: tokio::sync::Mutex::new(None),
+        });
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"prefix")),
+            Err(AppError::Internal("upstream reset".to_string())),
+        ]));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+        while client.next().await.is_some() {}
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let seen = backend.seen_error.lock().await.clone();
+        assert_eq!(
+            seen.as_deref(),
+            Some("BadGateway"),
+            "tee MUST wrap upstream errors as BadGateway before forwarding \
+             to the writer channel; got {:?}",
+            seen
+        );
+    }
+
+    /// #1184 regression: pin the TEE_CHANNEL_DEPTH constant so a
+    /// future "let's just raise the buffer" change must come with a
+    /// fresh OOM-budget review. Bumping the cap silently would
+    /// invalidate the documented worst-case calculation.
+    #[test]
+    fn test_tee_channel_depth_pinned_for_oom_budget() {
+        assert_eq!(
+            TEE_CHANNEL_DEPTH, 64,
+            "TEE_CHANNEL_DEPTH is part of the per-request OOM budget; \
+             see the const's docstring for the full calculation and \
+             #1184 for the HTTP/2 flow-control overhead. Update the \
+             docstring before changing this value."
+        );
+        assert_eq!(
+            TEE_MAX_CHUNK_BYTES,
+            64 * 1024,
+            "TEE_MAX_CHUNK_BYTES * TEE_CHANNEL_DEPTH bounds the per-request \
+             tee memory; changing it changes the OOM budget. Update the \
+             docstring before changing this value."
+        );
+    }
+
+    /// #1184 regression: an upstream chunk larger than `TEE_MAX_CHUNK_BYTES`
+    /// MUST be split before being forwarded to the cache writer, so the
+    /// `TEE_CHANNEL_DEPTH * TEE_MAX_CHUNK_BYTES` memory bound holds
+    /// regardless of upstream framing. The client must still observe the
+    /// same total bytes in order.
+    #[tokio::test]
+    async fn test_tee_splits_oversize_upstream_chunks_to_cap_memory() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        // Upstream hands us a single 200 KiB chunk. With a 64 KiB cap that
+        // must surface to the client as four pieces (64 + 64 + 64 + 8 KiB).
+        let big = Bytes::from(vec![0xABu8; 200 * 1024]);
+        let upstream: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::iter(vec![Ok(big.clone())]));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        let mut pieces: Vec<Bytes> = Vec::new();
+        while let Some(item) = client.next().await {
+            pieces.push(item.expect("ok chunk"));
+        }
+        assert_eq!(
+            pieces.len(),
+            4,
+            "200 KiB / 64 KiB cap => 4 client pieces, got {}",
+            pieces.len()
+        );
+        for (i, p) in pieces.iter().enumerate() {
+            let expected = if i < 3 {
+                64 * 1024
+            } else {
+                200 * 1024 - 3 * 64 * 1024
+            };
+            assert_eq!(
+                p.len(),
+                expected,
+                "piece {} length: got {}, expected {}",
+                i,
+                p.len(),
+                expected
+            );
+        }
+        let total: usize = pieces.iter().map(|p| p.len()).sum();
+        assert_eq!(total, big.len(), "client must receive every byte");
     }
 }
