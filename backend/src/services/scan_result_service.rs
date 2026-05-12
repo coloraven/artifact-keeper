@@ -530,6 +530,7 @@ impl ScanResultService {
         info: i32,
         scanner_version: Option<&str>,
         started_at: chrono::DateTime<chrono::Utc>,
+        scan_completeness: &str,
     ) -> Result<()> {
         sqlx::query!(
             r#"
@@ -538,7 +539,8 @@ impl ScanResultService {
                 critical_count = $3, high_count = $4, medium_count = $5,
                 low_count = $6, info_count = $7, completed_at = NOW(),
                 scanner_version = COALESCE($8, scanner_version),
-                started_at = $9
+                started_at = $9,
+                scan_completeness = $10
             WHERE id = $1
             "#,
             scan_id,
@@ -550,6 +552,7 @@ impl ScanResultService {
             info,
             scanner_version,
             started_at,
+            scan_completeness,
         )
         .execute(&self.db)
         .await
@@ -2024,6 +2027,7 @@ mod tests {
                 0,
                 Some("test-scanner-1.0"),
                 chrono::Utc::now(),
+                "complete",
             )
             .await
             .expect("complete source scan");
@@ -2555,6 +2559,7 @@ mod tests {
                 0,
                 Some("v1"),
                 chrono::Utc::now(),
+                "complete",
             )
             .await
             .expect("complete legacy");
@@ -2587,6 +2592,7 @@ mod tests {
                 0,
                 Some("v1"),
                 chrono::Utc::now(),
+                "complete",
             )
             .await
             .expect("complete modern");
@@ -2651,6 +2657,7 @@ mod tests {
                 0,
                 Some("v1"),
                 chrono::Utc::now() - chrono::Duration::days(30),
+                "complete",
             )
             .await
             .expect("complete old scan");
@@ -2672,6 +2679,7 @@ mod tests {
                 0,
                 Some("v1"),
                 chrono::Utc::now(),
+                "complete",
             )
             .await
             .expect("complete new scan");
