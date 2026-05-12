@@ -829,6 +829,15 @@ pub struct RescanForInventoryResponse {
 /// admin token) cannot pin every Tokio worker on scanner I/O and
 /// starve normal upload traffic. 16 leaves headroom for parallel
 /// rescans on a default 8-vCPU runtime without monopolising the pool.
+///
+/// Back-pressure model: dispatch is unbounded (`tokio::spawn` per
+/// artifact), but each task awaits a permit before doing scanner work.
+/// A tight polling loop will accumulate parked tasks proportional to
+/// the dispatch rate; the resulting memory is bounded by the operator
+/// pacing because each call returns immediately and exposes
+/// `artifacts_enqueued`. We do NOT acquire pre-spawn / 503-on-contention
+/// here: the dispatch-and-return contract is the point of the endpoint
+/// (callers poll until `artifacts_enqueued == 0`).
 const RESCAN_INFLIGHT_CAP: usize = 16;
 
 fn rescan_inflight_semaphore() -> &'static Arc<Semaphore> {
@@ -845,7 +854,7 @@ fn rescan_inflight_semaphore() -> &'static Arc<Semaphore> {
     responses(
         (status = 200, description = "Rescans enqueued", body = RescanForInventoryResponse),
         (status = 401, description = "Admin privileges required"),
-        (status = 503, description = "Scanner service not configured, or backfill queue saturated"),
+        (status = 503, description = "Scanner service not configured"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -898,12 +907,12 @@ pub async fn rescan_for_inventory(
             // a tight polling loop can't pin every Tokio worker. The
             // permit is held for the duration of the scan and released
             // on task completion (success or failure).
+            // Nothing in this binary calls `close()` on the semaphore, so
+            // the only way `acquire_owned` errors is if a future change
+            // adds an explicit shutdown path. Bail quietly if that happens.
             let _permit = match permit_sem.acquire_owned().await {
                 Ok(p) => p,
-                Err(_) => {
-                    // Semaphore closed: only happens at process shutdown.
-                    return;
-                }
+                Err(_) => return,
             };
             // Use `force = true` (via scan_artifact_with_options) so the
             // repo's scan-enabled config doesn't block the backfill. The

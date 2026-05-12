@@ -4,6 +4,29 @@
 -- same two tables and ship in the same release, keeping the migration
 -- numbering tight. Each section is self-contained and idempotent.
 --
+-- DEPLOY ORDERING (review #1188-R2 SRE):
+--   * Migrate forward first, THEN roll the binary forward. The new code
+--     paths (set_inventory_status, record_scan_inventory_success/failure)
+--     reference columns added here; running a post-#1188 binary against
+--     a pre-087 schema crashes scan persistence on every degraded scan.
+--   * Binary rollback to pre-#1188 is safe against a post-087 schema:
+--     the column has DEFAULT 'complete' and old code never reads it.
+--   * Schema rollback (DROP COLUMN inventory_status, DROP CONSTRAINT
+--     scan_packages_scan_result_artifact_fk) requires every replica to
+--     already be on a pre-#1188 binary. Do NOT roll the DB back while
+--     any new binary is still serving traffic.
+--
+-- EXPECTED MIGRATION DURATION (review #1188-R2 SRE):
+--   * NOT VALID FK add: milliseconds (catalog-only).
+--   * VALIDATE CONSTRAINT: full seqscan of scan_packages with PK probes
+--     into scan_results(id, artifact_id). Approximate at ~100k rows/sec
+--     on commodity SSD: 3-8 minutes for a 30M-row scan_packages
+--     (100k-artifact instance with 300-package lockfiles). Lock is
+--     SHARE UPDATE EXCLUSIVE so reads and writes proceed; only other
+--     DDL on the table queues. Plan deploys accordingly.
+--   * ADD COLUMN ... DEFAULT 'complete': metadata-only on PG >= 11.
+--   * Partial-index build: ~milliseconds (empty at build time).
+--
 -- =========================================================================
 -- 1. Composite FK enforcing scan_packages.artifact_id matches the parent
 --    scan_results.artifact_id (#1154).
