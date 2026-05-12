@@ -137,6 +137,62 @@ pub fn record_cleanup(cleanup_type: &str, items_removed: u64) {
         .increment(items_removed);
 }
 
+/// Record an email dispatch that was dropped by the per-event rate limiter.
+/// `reason` is the [`crate::services::email_rate_limiter::RateLimitDecision`]
+/// label (`"recipient"` or `"domain"`); the `"allowed"` decision does not
+/// trigger this counter. Fix for #1169.
+pub fn record_email_dispatch_rate_limited(reason: &str) {
+    counter!(
+        "email_dispatch_rate_limited_total",
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Allow-list of event-type strings allowed as a Prometheus label on
+/// the email-dispatch counters. Anything outside this set collapses to
+/// `"other"` before becoming a label so a future emitter cannot blow up
+/// cardinality with a `format!("event.{id}")` string.
+const KNOWN_EMAIL_EVENT_TYPES: &[&str] = &[
+    "artifact.created",
+    "artifact.uploaded",
+    "artifact.deleted",
+    "scan.completed",
+    "scan.failed",
+    "repository.created",
+    "repository.deleted",
+    "license.violation",
+    "vulnerability.detected",
+];
+
+/// Collapse an arbitrary event-type string to a bounded label set. See
+/// [`KNOWN_EMAIL_EVENT_TYPES`] for the contract. Comparison is ASCII
+/// case-insensitive so a producer that publishes `"Artifact.Uploaded"`
+/// is still recognized and reported under the canonical lowercase
+/// label (rather than silently bucketing into `"other"`).
+fn bounded_email_event_type(event_type: &str) -> &'static str {
+    for known in KNOWN_EMAIL_EVENT_TYPES {
+        if known.eq_ignore_ascii_case(event_type) {
+            return known;
+        }
+    }
+    "other"
+}
+
+/// Record a per-recipient email dispatch attempt (post-limiter,
+/// pre-SMTP). Paired with `email_dispatch_rate_limited_total`: the two
+/// counters share the per-recipient unit so `attempted + rate_limited`
+/// equals total per-recipient tries. `event_type` is collapsed to a
+/// bounded allow-list (`KNOWN_EMAIL_EVENT_TYPES`) so a future emitter
+/// cannot blow up Prometheus cardinality. Fix for #1172.
+pub fn record_email_dispatch_attempted(event_type: &str) {
+    counter!(
+        "email_dispatch_attempted_total",
+        "event_type" => bounded_email_event_type(event_type)
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +274,49 @@ mod tests {
     #[test]
     fn test_record_webhook_dead_letter_does_not_panic() {
         record_webhook_dead_letter("artifact.uploaded");
+    }
+
+    #[test]
+    fn test_record_email_dispatch_rate_limited_does_not_panic() {
+        record_email_dispatch_rate_limited("recipient");
+        record_email_dispatch_rate_limited("domain");
+    }
+
+    #[test]
+    fn test_record_email_dispatch_attempted_does_not_panic() {
+        record_email_dispatch_attempted("artifact.uploaded");
+    }
+
+    #[test]
+    fn test_bounded_email_event_type_passes_known() {
+        assert_eq!(
+            bounded_email_event_type("artifact.uploaded"),
+            "artifact.uploaded"
+        );
+        assert_eq!(bounded_email_event_type("scan.completed"), "scan.completed");
+        assert_eq!(
+            bounded_email_event_type("vulnerability.detected"),
+            "vulnerability.detected"
+        );
+    }
+
+    #[test]
+    fn test_bounded_email_event_type_collapses_unknown_to_other() {
+        // High-cardinality input must not become a distinct label.
+        assert_eq!(bounded_email_event_type("event.uuid-12345"), "other");
+        assert_eq!(bounded_email_event_type(""), "other");
+        assert_eq!(bounded_email_event_type("anything.else"), "other");
+    }
+
+    #[test]
+    fn test_bounded_email_event_type_is_ascii_case_insensitive() {
+        // A future emitter publishing `"Artifact.Uploaded"` should still
+        // map to the canonical lowercase label, not silently collapse
+        // into the "other" bucket.
+        assert_eq!(
+            bounded_email_event_type("Artifact.Uploaded"),
+            "artifact.uploaded"
+        );
+        assert_eq!(bounded_email_event_type("SCAN.COMPLETED"), "scan.completed");
     }
 }

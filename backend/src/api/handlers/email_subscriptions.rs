@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::repository_service::RepositoryService;
 
 /// Defense-in-depth cap on how many recipient addresses one subscription
@@ -120,6 +121,53 @@ pub struct EmailSubscriptionListResponse {
     pub subscriptions: Vec<EmailSubscriptionResponse>,
 }
 
+/// Fire-and-forget audit log for email subscription mutations (#1170).
+///
+/// Pattern follows the 2026-03-23 audit sprint shape (see
+/// `api::handlers::auth::audit_auth`): write failures are swallowed at
+/// `warn!` level so an audit-store hiccup never turns into a 500 on the
+/// caller's mutating request. The subscription is already committed
+/// (we audit AFTER the SQL) so a missed audit row is the lesser evil.
+///
+/// `resource_type = Repository, resource_id = repository_id` so audit
+/// queries scoped to a repository surface the subscription mutation
+/// (per the issue spec). `subscription_id` is carried in `details` so
+/// the row is still traceable back to the specific subscription.
+async fn audit_subscription_mutation(
+    state: &SharedState,
+    action: AuditAction,
+    actor_user_id: Uuid,
+    repository_id: Uuid,
+    subscription_id: Uuid,
+    extra_details: serde_json::Value,
+) {
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "subscription_id".to_string(),
+        serde_json::Value::String(subscription_id.to_string()),
+    );
+    if let serde_json::Value::Object(extras) = extra_details {
+        for (k, v) in extras {
+            details.insert(k, v);
+        }
+    }
+
+    let entry = AuditEntry::new(action, ResourceType::Repository)
+        .user(actor_user_id)
+        .resource(repository_id)
+        .details(serde_json::Value::Object(details));
+
+    if let Err(e) = AuditService::new(state.db.clone()).log(entry).await {
+        tracing::warn!(
+            error = %e,
+            action = action.as_str(),
+            repository_id = %repository_id,
+            subscription_id = %subscription_id,
+            "Failed to write email subscription audit log; mutation already committed"
+        );
+    }
+}
+
 /// Require that the caller can mutate email subscriptions on this repository.
 ///
 /// 1. Authenticated.
@@ -183,6 +231,24 @@ pub(crate) fn validate_recipients(recipients: &[String]) -> Result<()> {
     }
     for addr in recipients {
         let trimmed = addr.trim();
+        // Reject log-forgery payloads before any other check: a recipient
+        // like `"victim@x.com\n[ERROR] forged"` is syntactically a valid
+        // email by the @-count rule below but is a log-forgery payload
+        // (it survives into the dispatcher's `tracing::warn!` lines).
+        // The dispatcher additionally sanitizes at log time, but rejecting
+        // at write time prevents bad rows from ever landing.
+        //
+        // Bans: ASCII control range AND Unicode line/paragraph separators
+        // (U+2028, U+2029) and U+0085 NEL. The latter are general-category
+        // Zl/Zp/Cc-but-not-C0 and `char::is_control()` does NOT cover the
+        // separators, yet many log viewers render them as newlines.
+        let forbidden =
+            |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{0085}');
+        if addr.chars().any(forbidden) {
+            return Err(AppError::Validation(
+                "recipient contains control or line-separator characters".to_string(),
+            ));
+        }
         let bad = trimmed.is_empty()
             || !trimmed.contains('@')
             || trimmed.starts_with('@')
@@ -301,6 +367,24 @@ pub async fn create_subscription(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // #1170: audit log AFTER successful insert. recipient_count is
+    // surfaced so SOC 2 auditors can spot a sub being created with a
+    // wide fan-out without reading the raw recipient list (which is
+    // PII).
+    audit_subscription_mutation(
+        &state,
+        AuditAction::EmailSubscriptionCreated,
+        auth.user_id,
+        repo.id,
+        row.id,
+        serde_json::json!({
+            "recipient_count": row.recipients.len(),
+            "event_types": row.event_types,
+            "enabled": row.enabled,
+        }),
+    )
+    .await;
+
     Ok(Json(row.into()))
 }
 
@@ -352,6 +436,18 @@ pub async fn delete_subscription(
             subscription_id, key
         )));
     }
+
+    // #1170: audit AFTER the row is gone. Match the create-side shape so
+    // an audit consumer can pair the two events on `subscription_id`.
+    audit_subscription_mutation(
+        &state,
+        AuditAction::EmailSubscriptionDeleted,
+        auth.user_id,
+        repo.id,
+        subscription_id,
+        serde_json::json!({}),
+    )
+    .await;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -694,6 +790,60 @@ mod tests {
             AppError::Validation(msg) => assert!(msg.contains("plain-no-at")),
             other => panic!("expected Validation, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_newline_in_address() {
+        // Log-forgery prevention: a stored recipient that survives into
+        // the dispatcher's tracing logs could otherwise inject fake log
+        // lines. Reject at write time.
+        let err = validate_recipients(&["victim@x.com\n[ERROR] fake".to_string()]).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("control")),
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_carriage_return() {
+        let err = validate_recipients(&["a\rb@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_ansi_escape() {
+        // ESC (0x1b) is a control char; rejection prevents ANSI-colored
+        // log forgery in terminal log viewers.
+        let err = validate_recipients(&["a\x1b[31m@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_null_byte() {
+        let err = validate_recipients(&["a\0b@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_unicode_line_separator() {
+        // U+2028 LINE SEPARATOR: NOT an ASCII control char so
+        // `is_control()` alone would miss it. Many log viewers render
+        // it as a newline, enabling the same forgery as `\n`.
+        let err = validate_recipients(&["a\u{2028}b@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_unicode_paragraph_separator() {
+        let err = validate_recipients(&["a\u{2029}b@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_nel() {
+        // U+0085 NEXT LINE: ECMA-48 line terminator.
+        let err = validate_recipients(&["a\u{0085}b@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
     }
 
     #[test]
