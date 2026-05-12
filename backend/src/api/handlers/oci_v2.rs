@@ -103,12 +103,13 @@ fn auth_challenge_quoted_value(value: &str) -> String {
 
 fn www_authenticate_header(host: &str, scope: Option<&str>) -> String {
     let realm = auth_challenge_quoted_value(&format!("{host}/v2/token"));
+    let service = OCI_TOKEN_SERVICE;
     match scope {
         Some(s) => {
             let scope = auth_challenge_quoted_value(s);
-            format!("Bearer realm=\"{realm}\",service=\"artifact-keeper\",scope=\"{scope}\"")
+            format!("Bearer realm=\"{realm}\",service=\"{service}\",scope=\"{scope}\"")
         }
-        None => format!("Bearer realm=\"{realm}\",service=\"artifact-keeper\""),
+        None => format!("Bearer realm=\"{realm}\",service=\"{service}\""),
     }
 }
 
@@ -220,14 +221,19 @@ fn extract_form_credentials(headers: &HeaderMap, body: &Bytes) -> Option<(String
     Some((username, password))
 }
 
-fn validate_token(
+async fn validate_token(
     db: &PgPool,
     config: &crate::config::Config,
     headers: &HeaderMap,
 ) -> Result<crate::services::auth_service::Claims, ()> {
     let token = extract_bearer_token(headers).ok_or(())?;
     let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-    auth_service.validate_access_token(&token).map_err(|_| ())
+    // Replica-safe variant (#1173): consults the DB credential-change watermark
+    // so a credential change on replica A is honoured on replica B.
+    auth_service
+        .validate_access_token_async(&token)
+        .await
+        .map_err(|_| ())
 }
 
 /// Credential extracted from an OCI request's Authorization header.
@@ -270,7 +276,13 @@ async fn authenticate_oci(
     match credential {
         OciCredential::Bearer(token) => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-            auth_service.validate_access_token(&token).map_err(|_| ())
+            // Replica-safe (#1173): same rationale as the auth middleware. A
+            // Bearer token presented to OCI must be rejected if the user's
+            // credentials changed on a peer replica after the token was minted.
+            auth_service
+                .validate_access_token_async(&token)
+                .await
+                .map_err(|_| ())
         }
         OciCredential::Basic { username, password } => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
@@ -827,13 +839,23 @@ fn build_oci_proxy_response(
 
 #[derive(Deserialize)]
 struct TokenQuery {
-    #[allow(dead_code)]
+    /// Service the client is requesting a token for. Per the OCI/Distribution
+    /// token spec, this must match the `service` value the server advertises
+    /// in its `WWW-Authenticate` challenge (`OCI_TOKEN_SERVICE`, hard-coded to
+    /// `"artifact-keeper"` at the challenge site). Missing is allowed for
+    /// backward compatibility with clients that pre-date the validation.
     service: Option<String>,
     #[allow(dead_code)]
     scope: Option<String>,
     #[allow(dead_code)]
     account: Option<String>,
 }
+
+/// Service identifier the OCI handler advertises in `WWW-Authenticate` and
+/// expects to see in the `?service=` query parameter on `/v2/token` (#1175).
+/// Kept as a module-level constant so the challenge-building sites and the
+/// validation site cannot drift.
+const OCI_TOKEN_SERVICE: &str = "artifact-keeper";
 
 #[derive(Serialize)]
 struct TokenResponse {
@@ -846,9 +868,18 @@ struct TokenResponse {
 async fn token(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Query(_query): Query<TokenQuery>,
+    Query(query): Query<TokenQuery>,
     body: Bytes,
 ) -> Response {
+    // Per the OCI Distribution token spec, clients must request a token
+    // scoped to the same `service` the server advertises. Reject mismatches
+    // with 400 DENIED. Allow a missing `service` so curl-style and older
+    // Docker clients that omit the query keep working (#1175).
+    if let Some(requested) = query.service.as_deref() {
+        if requested != OCI_TOKEN_SERVICE {
+            return oci_error(StatusCode::BAD_REQUEST, "DENIED", "service mismatch");
+        }
+    }
     // Credential extraction order, per the OCI Distribution Spec + OAuth2:
     //   1. HTTP Basic Auth header (the original code path; works for `docker
     //      login` / `curl -u`).
@@ -864,8 +895,16 @@ async fn token(
     {
         Some(c) => c,
         None => {
-            // Also try Bearer token (docker may send existing token)
-            if let Ok(claims) = validate_token(&state.db, &state.config, &headers) {
+            // Also try Bearer token (docker may send existing token).
+            // We have to distinguish "no Authorization header at all" from
+            // "Authorization header present but validation failed" so that a
+            // client holding a revoked/expired/credential-changed JWT gets a
+            // 401 instead of silently being downgraded to the anonymous
+            // (public-pull) token. The `validate_token` async call now
+            // consults the DB credential-change watermark (#1173), so a
+            // deactivated user's token fails here too.
+            let had_bearer_header = extract_bearer_token(&headers).is_some();
+            if let Ok(claims) = validate_token(&state.db, &state.config, &headers).await {
                 let auth_service =
                     AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
                 // `AND is_active = true` mirrors `auth_service::authenticate`,
@@ -920,6 +959,19 @@ async fn token(
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(serde_json::to_string(&resp).unwrap()))
                     .unwrap();
+            }
+
+            // If the caller presented a Bearer token but it failed to
+            // validate (e.g. credential change on a peer replica, account
+            // deactivated), reject with 401 instead of silently downgrading
+            // to anonymous. Falling through to anonymous would mask the
+            // revocation and hand the caller a usable pull token.
+            if had_bearer_header {
+                return oci_error(
+                    StatusCode::UNAUTHORIZED,
+                    "UNAUTHORIZED",
+                    "invalid credentials",
+                );
             }
 
             // No credentials and no existing token. Issue an anonymous pull
@@ -1037,7 +1089,10 @@ fn version_check_ok() -> Response {
 
 async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     // Accept Bearer token (standard Docker client flow)
-    if validate_token(&state.db, &state.config, &headers).is_ok() {
+    if validate_token(&state.db, &state.config, &headers)
+        .await
+        .is_ok()
+    {
         return version_check_ok();
     }
 
@@ -5501,5 +5556,101 @@ mod oci_manifest_refs_tests {
         }"#;
         let children = extract_child_digests(body);
         assert_eq!(children, vec!["sha256:aaaa", "sha256:bbbb"]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #1175: /v2/token `service` query parameter validation.
+//
+// The OCI Distribution token spec requires the server to validate that the
+// `service` query value matches what was advertised in the WWW-Authenticate
+// challenge. Mismatched values must be rejected with 400 DENIED; missing
+// values stay accepted for backward compatibility with curl-style clients.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod token_service_query_validation_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn token_with_mismatched_service_returns_400() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let storage_dir = std::env::temp_dir().join(format!("oci-svc-mismatch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool, storage_dir.to_str().unwrap());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/token?service=victim.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let app = router().with_state(state);
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "mismatched service must return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_with_matching_service_returns_anonymous_200() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let storage_dir = std::env::temp_dir().join(format!("oci-svc-match-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool, storage_dir.to_str().unwrap());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/token?service={OCI_TOKEN_SERVICE}"))
+            .body(Body::empty())
+            .unwrap();
+        let app = router().with_state(state);
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "matching service must issue anonymous pull token"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_without_service_param_returns_anonymous_200() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let storage_dir = std::env::temp_dir().join(format!("oci-svc-missing-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool, storage_dir.to_str().unwrap());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/token")
+            .body(Body::empty())
+            .unwrap();
+        let app = router().with_state(state);
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "missing service param stays accepted (backward compat)"
+        );
     }
 }
