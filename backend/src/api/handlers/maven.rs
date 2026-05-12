@@ -1128,19 +1128,18 @@ async fn serve_artifact(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let (content, content_type) =
-                        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, path)
-                            .await?;
-
-                    let ct =
-                        content_type.unwrap_or_else(|| content_type_for_path(path).to_string());
-
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, ct)
-                        .header(CONTENT_LENGTH, content.len().to_string())
-                        .body(Body::from(content))
-                        .unwrap());
+                    // #895: stream large bodies; pass content_type_for_path
+                    // so .pom -> text/xml, .jar -> application/java-archive
+                    // when upstream omits Content-Type (closes review N2).
+                    return proxy_helpers::proxy_fetch_streaming(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        path,
+                        content_type_for_path(path),
+                    )
+                    .await;
                 }
             }
             // Virtual repo: try each member in priority order

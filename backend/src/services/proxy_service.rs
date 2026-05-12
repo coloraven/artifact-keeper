@@ -81,6 +81,25 @@ struct CacheMetadataTemplate {
 /// Slow storage applies moderate backpressure to the client read loop
 /// rather than queueing unbounded memory; fast storage drains promptly
 /// so the client sees no extra latency.
+///
+/// Backend-specific notes (#895 perf review):
+///
+/// * **S3 backend.** `object_store::WriteMultipart` allocates an
+///   additional ~10 MiB part buffer on top of this 4 MiB tee cap, so
+///   the actual per-request peak on the S3 path is ~14 MiB rather
+///   than 4 MiB. Still a >35× reduction vs. the 500 MiB+ buffered
+///   path.
+/// * **Upstream backpressure.** When storage falls behind, this
+///   channel fills; `tx.send().await` blocks, which stops draining
+///   the `reqwest::bytes_stream`, which closes the TCP window to
+///   upstream. This is the correct backpressure for OOM relief, but
+///   it can hold an upstream socket open longer than the buffered
+///   path did. Mirrors with aggressive per-connection idle timeouts
+///   (Maven Central, dl-cdn.alpinelinux.org) may close the
+///   connection if storage fsync exceeds the mirror's idle window.
+///   The `http_client::base_client_builder()` read timeout caps the
+///   total wait; operators with tight storage budgets should verify
+///   that timeout matches their upstream's tolerance.
 const TEE_CHANNEL_DEPTH: usize = 64;
 
 /// Validate the upstream response status code for the streaming path.

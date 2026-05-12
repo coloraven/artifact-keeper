@@ -591,22 +591,18 @@ async fn download_object(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("objects/{}", oid);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    // #895: stream large LFS blobs (the whole reason LFS
+                    // exists). Default Content-Type matches the buffered
+                    // handler's prior fallback.
+                    return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        "application/octet-stream",
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
 

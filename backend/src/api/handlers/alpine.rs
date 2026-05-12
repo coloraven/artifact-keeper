@@ -680,18 +680,19 @@ async fn try_proxy_apk(
         _ => return Ok(None),
     };
     let upstream_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
-    let (content, content_type) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path).await?;
-    Ok(Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                "Content-Type",
-                content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-            )
-            .body(Body::from(content))
-            .unwrap(),
-    ))
+    // #895: stream large .apk bodies (a few MiB to ~100 MiB for LLVM-class
+    // packages). Default Content-Type matches the buffered handler's
+    // prior fallback.
+    proxy_helpers::proxy_fetch_streaming(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        "application/octet-stream",
+    )
+    .await
+    .map(Some)
 }
 
 // ---------------------------------------------------------------------------

@@ -856,16 +856,18 @@ async fn pool_download(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("pool/{}/{}", component, path);
-                    // #895: streaming variant so the .deb body never
-                    // buffers in memory. Without this a 200 MiB .deb on
-                    // a 1 GiB pod under concurrent load OOMs the
-                    // backend.
+                    // #895: stream .deb bodies. Default Content-Type
+                    // matches the IANA registration for Debian packages
+                    // (apt clients don't care; the registration just
+                    // gives downstream proxies a meaningful Content-Type
+                    // when upstream omits it).
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        "application/vnd.debian.binary-package",
                     )
                     .await;
                 }

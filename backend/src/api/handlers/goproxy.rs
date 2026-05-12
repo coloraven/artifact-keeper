@@ -723,22 +723,19 @@ async fn download_zip(
                 {
                     let encoded = encode_module_path(module);
                     let upstream_path = format!("{}/@v/{}.zip", encoded, version);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    // #895: stream large module .zip; default Content-Type
+                    // matches the buffered handler's prior fallback so the
+                    // Go toolchain still sees `application/zip` when
+                    // upstream omits the header (review N2).
+                    return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo.key,
                         upstream_url,
                         &upstream_path,
+                        "application/zip",
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/zip".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
 
