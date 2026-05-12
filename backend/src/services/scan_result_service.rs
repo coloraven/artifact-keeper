@@ -71,6 +71,54 @@ pub(crate) fn convert_should_noop(updated_row_present: bool) -> bool {
     !updated_row_present
 }
 
+/// Dedupe a slice of `RawPackage` by `(name, version)` so a single UNNEST
+/// INSERT does not land two rows that collide on the
+/// `(scan_result_id, name, COALESCE(version, ''))` unique index (#1158).
+///
+/// Postgres rejects `ON CONFLICT DO UPDATE` if the same target row is
+/// affected twice within one statement (`command cannot affect row a
+/// second time`), and the per-row insert path used to paper over this by
+/// running each INSERT in its own statement. With a batched UNNEST the
+/// dedup has to happen Rust-side. The merge rule mirrors the SQL
+/// `DO UPDATE ... COALESCE(scan_packages.col, EXCLUDED.col)`: the first
+/// payload wins on every column, except where a later payload supplies a
+/// non-null value for a column the first payload left as None. This
+/// preserves the "more specific wins" behaviour without inventing an
+/// ordering rule.
+///
+/// Pulled out of `create_packages` so the merge semantics can be
+/// unit-tested without a live database.
+pub(crate) fn merge_packages_for_batch(packages: &[RawPackage]) -> Vec<RawPackage> {
+    use std::collections::HashMap;
+    // (name, version_for_dedup) -> index into the output Vec. The
+    // dedup key matches the SQL unique index: COALESCE(version, '').
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    let mut out: Vec<RawPackage> = Vec::with_capacity(packages.len());
+    for pkg in packages {
+        let key = (pkg.name.clone(), pkg.version.clone().unwrap_or_default());
+        match index.get(&key) {
+            Some(&idx) => {
+                let existing = &mut out[idx];
+                // COALESCE first non-null wins on each optional column.
+                if existing.purl.is_none() {
+                    existing.purl = pkg.purl.clone();
+                }
+                if existing.license.is_none() {
+                    existing.license = pkg.license.clone();
+                }
+                if existing.source_target.is_none() {
+                    existing.source_target = pkg.source_target.clone();
+                }
+            }
+            None => {
+                index.insert(key, out.len());
+                out.push(pkg.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Build a DashboardSummary from raw count values.
 pub(crate) fn build_dashboard_summary(
     repos_with_scanning: i64,
@@ -596,89 +644,235 @@ impl ScanResultService {
     // -----------------------------------------------------------------------
 
     /// Batch insert the full package inventory for a completed scan (#903).
-    /// Each row is one package the scanner saw — vulnerable or not — so
-    /// the SBOM read path can return the complete dep tree.
+    /// Each row is one package the scanner saw, vulnerable or not, so the
+    /// SBOM read path can return the complete dep tree.
+    ///
+    /// Implementation (#1158): a single
+    /// `INSERT ... SELECT * FROM UNNEST($1::text[], $2::text[], ...) ...`
+    /// statement replaces the per-row loop. One round-trip regardless of
+    /// package count (300+ for express-style lockfiles, 1000+ for Java
+    /// multi-modules), and the statement is atomic: either all surviving
+    /// rows (after ON CONFLICT dedup) commit or none do, which closes the
+    /// "partial-write on row N" hole the original per-row implementation
+    /// left open.
     ///
     /// Conflict handling: the unique index is
     /// `(scan_result_id, name, COALESCE(version, ''))`. When a scanner
     /// emits the same `(name, version)` twice within a single report (e.g.
     /// Trivy listing a Maven artifact both in its standalone Packages
     /// block AND inline on a vulnerability row, often with one PURL set
-    /// and the other empty) the second insert promotes any newly-supplied
-    /// `purl`, `license`, or `source_target` value over a previously-NULL
-    /// row. `ON CONFLICT DO NOTHING` would lose whichever value lost the
-    /// race; `DO UPDATE ... COALESCE(scan_packages.col, EXCLUDED.col)`
-    /// keeps the first non-null value, which is the closest thing to
-    /// "more specific wins" without inventing an ordering rule.
+    /// and the other empty) the conflict resolution uses
+    /// `DO UPDATE ... COALESCE(scan_packages.col, EXCLUDED.col)` so any
+    /// newly-supplied `purl`, `license`, or `source_target` value promotes
+    /// over a previously-NULL row. `ON CONFLICT DO NOTHING` would lose
+    /// whichever value lost the race; this keeps the first non-null value,
+    /// the closest thing to "more specific wins" without inventing an
+    /// ordering rule.
     pub async fn create_packages(
         &self,
         scan_result_id: Uuid,
         artifact_id: Uuid,
         packages: &[RawPackage],
     ) -> Result<()> {
-        for pkg in packages {
-            sqlx::query!(
-                r#"
-                INSERT INTO scan_packages (scan_result_id, artifact_id, name,
-                    version, purl, license, source_target)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (scan_result_id, name, COALESCE(version, ''))
-                    DO UPDATE SET
-                        purl = COALESCE(scan_packages.purl, EXCLUDED.purl),
-                        license = COALESCE(scan_packages.license, EXCLUDED.license),
-                        source_target = COALESCE(scan_packages.source_target,
-                                                 EXCLUDED.source_target)
-                "#,
-                scan_result_id,
-                artifact_id,
-                pkg.name,
-                pkg.version,
-                pkg.purl,
-                pkg.license,
-                pkg.source_target,
-            )
-            .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        if packages.is_empty() {
+            return Ok(());
         }
+
+        // Postgres rejects ON CONFLICT DO UPDATE that would touch the
+        // same row twice in one statement, so dedupe the input before
+        // building the UNNEST arrays. See `merge_packages_for_batch`
+        // for the COALESCE-first-non-null-wins merge rule.
+        let deduped = merge_packages_for_batch(packages);
+
+        // Build parallel arrays for UNNEST. Postgres expects each unnest
+        // column as its own array; `name` is NOT NULL but `version`,
+        // `purl`, `license`, and `source_target` are nullable. UNNEST over
+        // `text[]` propagates NULL elements correctly so Option<String>
+        // values pass through unchanged.
+        let names: Vec<&str> = deduped.iter().map(|p| p.name.as_str()).collect();
+        let versions: Vec<Option<&str>> = deduped.iter().map(|p| p.version.as_deref()).collect();
+        let purls: Vec<Option<&str>> = deduped.iter().map(|p| p.purl.as_deref()).collect();
+        let licenses: Vec<Option<&str>> = deduped.iter().map(|p| p.license.as_deref()).collect();
+        let source_targets: Vec<Option<&str>> =
+            deduped.iter().map(|p| p.source_target.as_deref()).collect();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO scan_packages (scan_result_id, artifact_id, name,
+                version, purl, license, source_target)
+            SELECT $1, $2, name, version, purl, license, source_target
+            FROM UNNEST(
+                $3::text[],
+                $4::text[],
+                $5::text[],
+                $6::text[],
+                $7::text[]
+            ) AS t(name, version, purl, license, source_target)
+            ON CONFLICT (scan_result_id, name, COALESCE(version, ''))
+                DO UPDATE SET
+                    purl = COALESCE(scan_packages.purl, EXCLUDED.purl),
+                    license = COALESCE(scan_packages.license, EXCLUDED.license),
+                    source_target = COALESCE(scan_packages.source_target,
+                                             EXCLUDED.source_target)
+            "#,
+            scan_result_id,
+            artifact_id,
+            &names as &[&str],
+            &versions as &[Option<&str>],
+            &purls as &[Option<&str>],
+            &licenses as &[Option<&str>],
+            &source_targets as &[Option<&str>],
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         Ok(())
     }
 
     /// Batch insert findings for a completed scan.
+    ///
+    /// Implementation (#1158): single-statement UNNEST insert, same shape
+    /// as `create_packages`. Atomic: row N+1 cannot land while row N
+    /// failed, so the `findings_count` written by `complete_scan` and the
+    /// actual `scan_findings` row count stay in lockstep.
     pub async fn create_findings(
         &self,
         scan_result_id: Uuid,
         artifact_id: Uuid,
         findings: &[RawFinding],
     ) -> Result<()> {
-        for finding in findings {
-            let severity_str = severity_to_db_string(finding.severity);
-
-            sqlx::query!(
-                r#"
-                INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
-                    description, cve_id, affected_component, affected_version, fixed_version,
-                    source, source_url)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                "#,
-                scan_result_id,
-                artifact_id,
-                severity_str,
-                finding.title,
-                finding.description,
-                finding.cve_id,
-                finding.affected_component,
-                finding.affected_version,
-                finding.fixed_version,
-                finding.source,
-                finding.source_url,
-            )
-            .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        if findings.is_empty() {
+            return Ok(());
         }
 
+        let severities: Vec<String> = findings
+            .iter()
+            .map(|f| severity_to_db_string(f.severity))
+            .collect();
+        let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
+        let descriptions: Vec<Option<&str>> =
+            findings.iter().map(|f| f.description.as_deref()).collect();
+        let cve_ids: Vec<Option<&str>> = findings.iter().map(|f| f.cve_id.as_deref()).collect();
+        let affected_components: Vec<Option<&str>> = findings
+            .iter()
+            .map(|f| f.affected_component.as_deref())
+            .collect();
+        let affected_versions: Vec<Option<&str>> = findings
+            .iter()
+            .map(|f| f.affected_version.as_deref())
+            .collect();
+        let fixed_versions: Vec<Option<&str>> = findings
+            .iter()
+            .map(|f| f.fixed_version.as_deref())
+            .collect();
+        let sources: Vec<Option<&str>> = findings.iter().map(|f| f.source.as_deref()).collect();
+        let source_urls: Vec<Option<&str>> =
+            findings.iter().map(|f| f.source_url.as_deref()).collect();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
+                description, cve_id, affected_component, affected_version, fixed_version,
+                source, source_url)
+            SELECT $1, $2, severity, title, description,
+                   cve_id, affected_component, affected_version, fixed_version,
+                   source, source_url
+            FROM UNNEST(
+                $3::text[],
+                $4::text[],
+                $5::text[],
+                $6::text[],
+                $7::text[],
+                $8::text[],
+                $9::text[],
+                $10::text[],
+                $11::text[]
+            ) AS t(severity, title, description, cve_id, affected_component,
+                   affected_version, fixed_version, source, source_url)
+            "#,
+            scan_result_id,
+            artifact_id,
+            &severities as &[String],
+            &titles as &[&str],
+            &descriptions as &[Option<&str>],
+            &cve_ids as &[Option<&str>],
+            &affected_components as &[Option<&str>],
+            &affected_versions as &[Option<&str>],
+            &fixed_versions as &[Option<&str>],
+            &sources as &[Option<&str>],
+            &source_urls as &[Option<&str>],
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         Ok(())
+    }
+
+    /// Update the `inventory_status` column on a scan_results row (#1157).
+    ///
+    /// Called by the scanner orchestrator when `create_packages` returns
+    /// an error: the scan itself succeeded, the SBOM is degraded, and the
+    /// operator-visible state needs to reflect that without rewriting any
+    /// of the count fields owned by `complete_scan`. Values are validated
+    /// by the CHECK constraint on the column (migration 087); passing an
+    /// unknown value surfaces as a Database error rather than silently
+    /// corrupting the column.
+    pub async fn set_inventory_status(&self, scan_id: Uuid, inventory_status: &str) -> Result<()> {
+        sqlx::query!(
+            r#"
+            UPDATE scan_results
+            SET inventory_status = $2
+            WHERE id = $1
+            "#,
+            scan_id,
+            inventory_status,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Find artifact IDs whose latest completed scan predates the
+    /// `scan_packages` table creation (migration 085), so an admin caller
+    /// can enqueue rescans to populate the inventory (#1155).
+    ///
+    /// "Predates" is captured by the absence of any `scan_packages` row
+    /// for the artifact's latest scan, not by a timestamp comparison
+    /// against migration 085's apply time: callers may have legitimate
+    /// post-#903 scans that produced zero inventory rows (e.g. a scanner
+    /// that doesn't enumerate packages, like OpenSCAP), and a timestamp
+    /// filter would re-scan those too. The empty-inventory test catches
+    /// exactly the artifacts the SBOM read path falls back on.
+    ///
+    /// The query is bounded by `limit` because operator endpoints are
+    /// dispatch-and-return: a 100k-artifact backfill that streams every
+    /// row inline would tie up an HTTP worker thread. The handler chunks
+    /// the work by re-calling this method until it returns < limit.
+    pub async fn list_artifacts_missing_inventory(&self, limit: i64) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT sr.artifact_id
+            FROM scan_results sr
+            JOIN artifacts a ON a.id = sr.artifact_id
+            WHERE sr.status = 'completed'
+              AND NOT a.is_deleted
+              AND NOT EXISTS (
+                  SELECT 1 FROM scan_packages sp
+                  WHERE sp.artifact_id = sr.artifact_id
+              )
+            LIMIT $1
+            "#,
+            limit,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows)
     }
 
     /// Get findings for a scan result with pagination.
@@ -1490,6 +1684,157 @@ mod tests {
         assert_eq!(target_counts_from_source(&s), (4, 0, 1, 1, 1, 1));
     }
 
+    // =======================================================================
+    // merge_packages_for_batch (#1158)
+    //
+    // Pure dedup helper that prevents the UNNEST INSERT from violating the
+    // Postgres "ON CONFLICT cannot affect a row twice" rule. The merge rule
+    // mirrors the SQL `DO UPDATE ... COALESCE(scan_packages.col, EXCLUDED.col)`.
+    // =======================================================================
+
+    #[test]
+    fn test_merge_packages_empty_input_returns_empty() {
+        let out = merge_packages_for_batch(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_merge_packages_no_duplicates_preserves_order() {
+        let pkgs = vec![
+            RawPackage {
+                name: "a".into(),
+                version: Some("1".into()),
+                purl: None,
+                license: None,
+                source_target: None,
+            },
+            RawPackage {
+                name: "b".into(),
+                version: Some("2".into()),
+                purl: None,
+                license: None,
+                source_target: None,
+            },
+        ];
+        let out = merge_packages_for_batch(&pkgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "a");
+        assert_eq!(out[1].name, "b");
+    }
+
+    #[test]
+    fn test_merge_packages_dedupes_by_name_and_version() {
+        let pkgs = vec![
+            RawPackage {
+                name: "express".into(),
+                version: Some("4.18.2".into()),
+                purl: None,
+                license: Some("MIT".into()),
+                source_target: None,
+            },
+            RawPackage {
+                name: "express".into(),
+                version: Some("4.18.2".into()),
+                purl: Some("pkg:npm/express@4.18.2".into()),
+                license: None,
+                source_target: Some("package-lock.json".into()),
+            },
+        ];
+        let out = merge_packages_for_batch(&pkgs);
+        assert_eq!(out.len(), 1);
+        // First payload supplied license; survives.
+        assert_eq!(out[0].license.as_deref(), Some("MIT"));
+        // First payload had None for purl/source_target; second payload
+        // promotes those values via COALESCE-on-merge.
+        assert_eq!(out[0].purl.as_deref(), Some("pkg:npm/express@4.18.2"));
+        assert_eq!(out[0].source_target.as_deref(), Some("package-lock.json"));
+    }
+
+    #[test]
+    fn test_merge_packages_null_version_dedupes_against_empty_string() {
+        // SQL unique index is on COALESCE(version, ''). The Rust helper
+        // must match: two rows with version=None collapse, just as two
+        // rows with version=Some("") would have under the SQL constraint.
+        let pkgs = vec![
+            RawPackage {
+                name: "noversion".into(),
+                version: None,
+                purl: None,
+                license: Some("BSD".into()),
+                source_target: None,
+            },
+            RawPackage {
+                name: "noversion".into(),
+                version: None,
+                purl: Some("pkg:generic/noversion".into()),
+                license: None,
+                source_target: None,
+            },
+        ];
+        let out = merge_packages_for_batch(&pkgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].license.as_deref(), Some("BSD"));
+        assert_eq!(out[0].purl.as_deref(), Some("pkg:generic/noversion"));
+    }
+
+    #[test]
+    fn test_merge_packages_first_non_null_wins_on_every_column() {
+        // Three duplicate payloads, each supplying a different optional
+        // column. Final merged row carries the first non-null seen for
+        // every column.
+        let pkgs = vec![
+            RawPackage {
+                name: "p".into(),
+                version: Some("1".into()),
+                purl: Some("first-purl".into()),
+                license: None,
+                source_target: None,
+            },
+            RawPackage {
+                name: "p".into(),
+                version: Some("1".into()),
+                purl: Some("second-purl".into()),
+                license: Some("first-license".into()),
+                source_target: None,
+            },
+            RawPackage {
+                name: "p".into(),
+                version: Some("1".into()),
+                purl: None,
+                license: Some("second-license".into()),
+                source_target: Some("first-source".into()),
+            },
+        ];
+        let out = merge_packages_for_batch(&pkgs);
+        assert_eq!(out.len(), 1);
+        // First non-null per column from the input order.
+        assert_eq!(out[0].purl.as_deref(), Some("first-purl"));
+        assert_eq!(out[0].license.as_deref(), Some("first-license"));
+        assert_eq!(out[0].source_target.as_deref(), Some("first-source"));
+    }
+
+    #[test]
+    fn test_merge_packages_different_versions_kept_separate() {
+        let pkgs = vec![
+            RawPackage {
+                name: "p".into(),
+                version: Some("1".into()),
+                purl: None,
+                license: None,
+                source_target: None,
+            },
+            RawPackage {
+                name: "p".into(),
+                version: Some("2".into()),
+                purl: None,
+                license: None,
+                source_target: None,
+            },
+        ];
+        let out = merge_packages_for_batch(&pkgs);
+        assert_eq!(out.len(), 2);
+    }
+
     #[test]
     fn test_convert_should_noop_returns_true_when_update_missed() {
         // updated.is_some() == false means the WHERE status='running' guard
@@ -1777,6 +2122,431 @@ mod tests {
                 .expect("recalculate_score idempotent");
             assert_eq!(score2.repository_id, repo_id);
             assert_eq!(score2.id, score.id);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        // ===================================================================
+        // #1158: UNNEST batch insert correctness for create_packages and
+        // create_findings. Each test seeds a scan, batch-inserts via the
+        // new code path, and verifies the row count + dedup behaviour.
+        // ===================================================================
+
+        /// Inserting N packages in a single UNNEST call lands N rows.
+        #[tokio::test]
+        async fn create_packages_batch_inserts_all_rows() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "pkgs").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+
+            // 250 packages is enough to be obviously batched, while staying
+            // well under any Postgres parameter limits (UNNEST sends each
+            // column as a single array param, so we use 5 params total
+            // regardless of N).
+            let pkgs: Vec<RawPackage> = (0..250)
+                .map(|i| RawPackage {
+                    name: format!("pkg-{i}"),
+                    version: Some(format!("1.0.{i}")),
+                    purl: Some(format!("pkg:generic/pkg-{i}@1.0.{i}")),
+                    license: Some("MIT".to_string()),
+                    source_target: Some("test".to_string()),
+                })
+                .collect();
+
+            svc.create_packages(scan.id, aid, &pkgs)
+                .await
+                .expect("batch insert");
+
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_packages WHERE scan_result_id = $1")
+                    .bind(scan.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count packages");
+            assert_eq!(count, 250);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// Calling create_packages with an empty slice is a no-op (no query
+        /// executed, no error). Guards against UNNEST behaviour on
+        /// zero-length arrays, which can otherwise insert a stray row.
+        #[tokio::test]
+        async fn create_packages_empty_slice_is_noop() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "empty").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+
+            svc.create_packages(scan.id, aid, &[])
+                .await
+                .expect("empty insert");
+
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_packages WHERE scan_result_id = $1")
+                    .bind(scan.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count packages");
+            assert_eq!(count, 0);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// ON CONFLICT DO UPDATE on (scan_result_id, name, COALESCE(version, ''))
+        /// dedupes duplicates within the same batch. The COALESCE-on-update
+        /// branch promotes the previously-NULL purl/license/source_target.
+        #[tokio::test]
+        async fn create_packages_dedupes_within_batch() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "dedup").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+
+            // Three rows, all the same (name, version). Mimics Trivy
+            // emitting the same package both in its Packages block and
+            // inline on a vulnerability row.
+            let pkgs = vec![
+                RawPackage {
+                    name: "express".into(),
+                    version: Some("4.18.2".into()),
+                    purl: None,
+                    license: Some("MIT".into()),
+                    source_target: None,
+                },
+                RawPackage {
+                    name: "express".into(),
+                    version: Some("4.18.2".into()),
+                    purl: Some("pkg:npm/express@4.18.2".into()),
+                    license: None,
+                    source_target: Some("package-lock.json".into()),
+                },
+                RawPackage {
+                    name: "express".into(),
+                    version: Some("4.18.2".into()),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                },
+            ];
+            svc.create_packages(scan.id, aid, &pkgs)
+                .await
+                .expect("dedup insert");
+
+            let row: (i64, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT COUNT(*)::BIGINT, MAX(purl), MAX(license), MAX(source_target) \
+                 FROM scan_packages WHERE scan_result_id = $1",
+            )
+            .bind(scan.id)
+            .fetch_one(&pool)
+            .await
+            .expect("aggregate");
+            // Exactly one row landed after dedup; the COALESCE merge
+            // surfaces all three fields from whichever payload supplied them.
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1.as_deref(), Some("pkg:npm/express@4.18.2"));
+            assert_eq!(row.2.as_deref(), Some("MIT"));
+            assert_eq!(row.3.as_deref(), Some("package-lock.json"));
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// Empty findings slice is a no-op. Same shape as the package
+        /// guard; protects against accidentally inserting a phantom row.
+        #[tokio::test]
+        async fn create_findings_empty_slice_is_noop() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "no-finds").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+
+            svc.create_findings(scan.id, aid, &[])
+                .await
+                .expect("empty insert");
+
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE scan_result_id = $1")
+                    .bind(scan.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count findings");
+            assert_eq!(count, 0);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// 100 findings in one UNNEST call lands 100 rows. Verifies the
+        /// batched path doesn't truncate or short-write.
+        #[tokio::test]
+        async fn create_findings_batch_inserts_all_rows() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "finds").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+
+            let findings: Vec<RawFinding> = (0..100)
+                .map(|i| RawFinding {
+                    severity: Severity::Medium,
+                    title: format!("CVE-{i}"),
+                    description: Some(format!("desc {i}")),
+                    cve_id: Some(format!("CVE-2024-{i:04}")),
+                    affected_component: Some(format!("lib-{i}")),
+                    affected_version: Some(format!("1.{i}")),
+                    fixed_version: Some(format!("2.{i}")),
+                    source: Some("trivy".into()),
+                    source_url: None,
+                })
+                .collect();
+
+            svc.create_findings(scan.id, aid, &findings)
+                .await
+                .expect("batch insert");
+
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE scan_result_id = $1")
+                    .bind(scan.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count findings");
+            assert_eq!(count, 100);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        // ===================================================================
+        // #1154: composite FK enforcement.
+        // ===================================================================
+
+        /// Attempting to insert a scan_packages row whose artifact_id does
+        /// not match the parent scan_results.artifact_id must fail with a
+        /// FK violation. This is exactly the drift the composite FK closes.
+        #[tokio::test]
+        async fn scan_packages_composite_fk_rejects_mismatched_artifact() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (real_aid, _) = insert_test_artifact(&pool, repo_id, "owner").await;
+            let (other_aid, _) = insert_test_artifact(&pool, repo_id, "drift").await;
+            let scan = svc
+                .create_scan_result(real_aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+
+            // Direct INSERT bypassing the service so we drive the constraint
+            // rather than the application-layer caller. Bound parameters
+            // are (scan_result_id, artifact_id) where artifact_id is the
+            // *wrong* artifact for this scan.
+            let result = sqlx::query(
+                "INSERT INTO scan_packages (scan_result_id, artifact_id, name) \
+                 VALUES ($1, $2, 'drifted-pkg')",
+            )
+            .bind(scan.id)
+            .bind(other_aid)
+            .execute(&pool)
+            .await;
+
+            assert!(
+                result.is_err(),
+                "INSERT with mismatched artifact_id must fail FK check"
+            );
+            let err = result.unwrap_err().to_string().to_lowercase();
+            assert!(
+                err.contains("scan_packages_scan_result_artifact_fk")
+                    || err.contains("foreign key")
+                    || err.contains("violates"),
+                "expected FK violation, got: {err}"
+            );
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        // ===================================================================
+        // #1157: inventory_status column + set_inventory_status helper.
+        // ===================================================================
+
+        /// New scan rows default to inventory_status = 'complete'; the
+        /// service helper flips it to 'partial' and the value persists.
+        #[tokio::test]
+        async fn set_inventory_status_partial_updates_row() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "inv").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+
+            // Default value from migration 087.
+            let initial: String =
+                sqlx::query_scalar("SELECT inventory_status FROM scan_results WHERE id = $1")
+                    .bind(scan.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read inventory_status default");
+            assert_eq!(initial, "complete");
+
+            svc.set_inventory_status(scan.id, "partial")
+                .await
+                .expect("set partial");
+
+            let after: String =
+                sqlx::query_scalar("SELECT inventory_status FROM scan_results WHERE id = $1")
+                    .bind(scan.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read inventory_status after");
+            assert_eq!(after, "partial");
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// The CHECK constraint on inventory_status rejects unknown values.
+        /// Guards against accidental typos in callers that bypass the
+        /// service helper.
+        #[tokio::test]
+        async fn set_inventory_status_rejects_unknown_value() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "bad-inv").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+
+            let result = svc.set_inventory_status(scan.id, "garbage").await;
+            assert!(result.is_err(), "CHECK must reject unknown value");
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        // ===================================================================
+        // #1155: list_artifacts_missing_inventory.
+        // ===================================================================
+
+        /// An artifact with a completed scan but no scan_packages rows is
+        /// returned by the backfill query; an artifact with packages is not.
+        #[tokio::test]
+        async fn list_artifacts_missing_inventory_finds_only_empty_inventory() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (legacy_aid, _) = insert_test_artifact(&pool, repo_id, "legacy").await;
+            let (modern_aid, _) = insert_test_artifact(&pool, repo_id, "modern").await;
+
+            // Legacy scan: completed, no packages.
+            let legacy_scan = svc
+                .create_scan_result(legacy_aid, repo_id, "dependency")
+                .await
+                .expect("create legacy scan");
+            svc.complete_scan(
+                legacy_scan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("v1"),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("complete legacy");
+
+            // Modern scan: completed AND has at least one package row.
+            let modern_scan = svc
+                .create_scan_result(modern_aid, repo_id, "dependency")
+                .await
+                .expect("create modern scan");
+            svc.create_packages(
+                modern_scan.id,
+                modern_aid,
+                &[RawPackage {
+                    name: "express".into(),
+                    version: Some("4.18.2".into()),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                }],
+            )
+            .await
+            .expect("inventory");
+            svc.complete_scan(
+                modern_scan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("v1"),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("complete modern");
+
+            let missing = svc
+                .list_artifacts_missing_inventory(100)
+                .await
+                .expect("list missing");
+
+            assert!(
+                missing.contains(&legacy_aid),
+                "legacy artifact should be in backfill candidates"
+            );
+            assert!(
+                !missing.contains(&modern_aid),
+                "modern artifact must not be flagged as missing inventory"
+            );
 
             cleanup_repo(&pool, repo_id).await;
         }

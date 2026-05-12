@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT sr.artifact_id\n            FROM scan_results sr\n            JOIN artifacts a ON a.id = sr.artifact_id\n            WHERE sr.status = 'completed'\n              AND NOT a.is_deleted\n              AND NOT EXISTS (\n                  SELECT 1 FROM scan_packages sp\n                  WHERE sp.artifact_id = sr.artifact_id\n              )\n            LIMIT $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "329760842e203da6544beeabf51204efabf40bb253625c4c9e772342fdbaadd2"
+}

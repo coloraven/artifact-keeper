@@ -31,6 +31,7 @@ pub fn router() -> Router<SharedState> {
         .route("/stats", get(get_system_stats))
         .route("/cleanup", post(run_cleanup))
         .route("/reindex", post(trigger_reindex))
+        .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
 }
 
@@ -783,6 +784,114 @@ pub async fn trigger_reindex(
     }))
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RescanForInventoryRequest {
+    /// Maximum number of artifacts to enqueue in this call. Operators
+    /// run the endpoint repeatedly to drain large backfills without
+    /// stalling a single HTTP worker; the handler returns the actual
+    /// number enqueued so the caller can detect when work is done.
+    /// Defaults to 100. Hard-capped at 1000 to avoid pathological inputs.
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RescanForInventoryResponse {
+    /// Number of artifacts whose latest scan had no inventory rows and
+    /// for which a rescan was enqueued in this call.
+    pub artifacts_enqueued: i64,
+    /// Echo of the requested (or defaulted) limit, useful for clients
+    /// driving the loop programmatically.
+    pub limit: i64,
+}
+
+/// Enqueue rescans for artifacts whose latest scan has no scan_packages
+/// inventory rows.
+///
+/// Targets pre-#903 (migration 085) scans, and any post-#903 scan whose
+/// inventory was lost or never produced. The SBOM read path falls back to
+/// `scan_findings` for these artifacts and produces a vulnerability-only
+/// component list, which is exactly the bug #903 set out to fix. This
+/// endpoint is the one-shot operator command for rebuilding the
+/// inventory across a whole instance after upgrading. (#1155)
+///
+/// Requires admin privileges and a configured scanner service. Returns
+/// 503 if the scanner is not configured (operationally normal on
+/// minimal stacks, not a server bug).
+///
+/// The handler is dispatch-and-return: scans run on background tokio
+/// tasks. Callers poll the response.artifacts_enqueued value across
+/// repeated calls to drive a full backfill, stopping when a call
+/// returns zero.
+#[utoipa::path(
+    post,
+    path = "/rescan-for-inventory",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = RescanForInventoryRequest,
+    responses(
+        (status = 200, description = "Rescans enqueued", body = RescanForInventoryResponse),
+        (status = 401, description = "Admin privileges required"),
+        (status = 503, description = "Scanner service not configured"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn rescan_for_inventory(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(body): Json<RescanForInventoryRequest>,
+) -> Result<Json<RescanForInventoryResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Admin privileges required".to_string(),
+        ));
+    }
+
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("Scanner service not configured".to_string()))?
+        .clone();
+
+    // Cap the limit at 1000 to bound work per call regardless of what the
+    // caller asks for. The default of 100 matches the typical operator
+    // pace: each rescan eats scanner capacity, so 100 is enough to keep
+    // a backfill moving without crowding out new uploads.
+    let limit = body.limit.unwrap_or(100).clamp(1, 1000);
+
+    let scan_result_service =
+        crate::services::scan_result_service::ScanResultService::new(state.db.clone());
+    let artifact_ids = scan_result_service
+        .list_artifacts_missing_inventory(limit)
+        .await?;
+    let enqueued = artifact_ids.len() as i64;
+
+    for artifact_id in artifact_ids {
+        let scanner_for_spawn = scanner.clone();
+        tokio::spawn(async move {
+            // Use `force = true` (via scan_artifact_with_options) so the
+            // repo's scan-enabled config doesn't block the backfill. The
+            // operator already chose to rescan; respecting per-repo config
+            // here would silently skip exactly the repos the inventory
+            // gap most likely affects.
+            if let Err(e) = scanner_for_spawn
+                .scan_artifact_with_options(artifact_id, true)
+                .await
+            {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    error = %e,
+                    "rescan-for-inventory: scan failed"
+                );
+            }
+        });
+    }
+
+    Ok(Json(RescanForInventoryResponse {
+        artifacts_enqueued: enqueued,
+        limit,
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -798,6 +907,7 @@ pub async fn trigger_reindex(
         get_system_stats,
         run_cleanup,
         trigger_reindex,
+        rescan_for_inventory,
         list_storage_backends,
     ),
     components(schemas(
@@ -812,6 +922,8 @@ pub async fn trigger_reindex(
         CleanupRequest,
         CleanupResponse,
         ReindexResponse,
+        RescanForInventoryRequest,
+        RescanForInventoryResponse,
     ))
 )]
 pub struct AdminApiDoc;

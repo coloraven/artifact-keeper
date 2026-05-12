@@ -2194,6 +2194,14 @@ impl ScannerService {
                     // marked as failed because a non-critical INSERT
                     // tripped over a constraint. SBOM generation falls back
                     // to scan_findings when the inventory is empty.
+                    //
+                    // #1157: when persistence fails, set
+                    // `inventory_status = 'partial'` on the scan_result row
+                    // and increment the `scan_inventory_failures_total`
+                    // counter so operator dashboards can alert on degraded
+                    // SBOMs. The scan itself still completes (status =
+                    // 'completed', counts are accurate) so customers don't
+                    // get false-positive scan-failed pages.
                     if !packages.is_empty() {
                         if let Err(e) = self
                             .scan_result_service
@@ -2203,9 +2211,26 @@ impl ScannerService {
                             warn!(
                                 "Failed to persist scan_packages for scan {}: {}. \
                                  Findings were persisted; SBOM generation will fall \
-                                 back to the findings-derived component list.",
+                                 back to the findings-derived component list. \
+                                 Marking inventory_status='partial'.",
                                 scan_result.id, e
                             );
+                            crate::services::metrics_service::record_scan_inventory_failure(
+                                scanner.scan_type(),
+                            );
+                            if let Err(set_err) = self
+                                .scan_result_service
+                                .set_inventory_status(scan_result.id, "partial")
+                                .await
+                            {
+                                // Status-update failure is itself non-fatal
+                                // (scan is already complete with findings);
+                                // log it so the gap is visible.
+                                warn!(
+                                    "Failed to set inventory_status='partial' on scan {}: {}",
+                                    scan_result.id, set_err
+                                );
+                            }
                         }
                     }
 
