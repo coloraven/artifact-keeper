@@ -319,29 +319,27 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
 
-    // Issue #976: surface the upstream private-IP allowlist at boot so the
-    // posture is obvious in startup logs. Metadata IPs remain blocked
-    // unconditionally; the validator handles that. The warning is loud
-    // because relaxing the SSRF guard is a security tradeoff the operator
-    // owns.
-    if let Ok(list) = std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST") {
-        let trimmed = list.trim();
-        if !trimmed.is_empty() {
-            tracing::warn!(
-                target: "security",
-                allowlist = %trimmed,
-                "UPSTREAM_PRIVATE_IP_ALLOWLIST is set; upstream URLs may now \
-                 target listed private CIDRs. Cloud metadata IPs and loopback \
-                 remain blocked. SSRF risk surface widened (issue #976)."
-            );
-        }
+    // Issues #976, #1224: surface the upstream private-IP allowlist at
+    // boot so the posture is obvious in startup logs. Metadata IPs
+    // remain blocked unconditionally; the validator handles that. The
+    // warning is loud because relaxing the SSRF guard is a security
+    // tradeoff the operator owns.
+    if let Some(list) = artifact_keeper_backend::api::validation::private_cidr_allowlist_value() {
+        tracing::warn!(
+            target: "security",
+            allowlist = %list,
+            "AK_SSRF_ALLOW_PRIVATE_CIDRS (or alias UPSTREAM_PRIVATE_IP_ALLOWLIST) \
+             is set; upstream URLs may now target listed private CIDRs. Cloud \
+             metadata IPs and loopback remain blocked. SSRF risk surface \
+             widened (issues #976, #1224)."
+        );
     } else if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
         tracing::warn!(
             target: "security",
             "UPSTREAM_ALLOW_PRIVATE_IPS=true; upstream URLs may now target ALL \
              RFC1918 / unique-local addresses. Cloud metadata IPs and loopback \
-             remain blocked. Prefer UPSTREAM_PRIVATE_IP_ALLOWLIST with explicit \
-             CIDRs for a narrower SSRF surface (issue #976)."
+             remain blocked. Prefer AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit \
+             CIDRs for a narrower SSRF surface (issues #976, #1224)."
         );
     }
 
