@@ -30,6 +30,7 @@ use crate::services::repository_service::{
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
+use crate::services::upload_service;
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -1809,6 +1810,16 @@ pub async fn upload_artifact(
 ) -> Result<Json<ArtifactResponse>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    // Validate the composed artifact path against traversal, null bytes,
+    // backslashes, percent-encoded traversal, absolute paths, etc. This
+    // protects all upload entry points (URL-path variant, multipart with
+    // path in URL, and multipart with `path` form field added in #1237).
+    // Filesystem storage's `key_to_path` would strip `..` segments, but S3
+    // and other object backends would happily accept `../etc/passwd`.
+    upload_service::validate_artifact_path(&path)
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
@@ -1947,7 +1958,15 @@ async fn upload_artifact_multipart_with_path(
 
 /// Upload artifact via multipart/form-data POST (no path in URL).
 ///
-/// The artifact path comes from the `file` field's filename.
+/// The artifact path is built from the optional `path` form field combined
+/// with the uploaded file's filename:
+///   - missing/empty `path` -> path is just the filename
+///   - `path` ending in `/` -> path becomes `<path><filename>` (directory prefix)
+///   - otherwise the `path` value is used verbatim as the full artifact path
+///
+/// This is what makes the web UI's "Custom path (optional)" field actually
+/// land artifacts at the requested path (#1237). Previously the form field
+/// was silently dropped and only the filename was used.
 async fn upload_artifact_multipart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1955,15 +1974,41 @@ async fn upload_artifact_multipart(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Json<ArtifactResponse>> {
-    let (body, filename) = extract_multipart_file(multipart).await?;
+    let (body, filename, custom_path) = extract_multipart_file_and_path(multipart).await?;
+    let artifact_path = compose_artifact_path(custom_path.as_deref(), &filename);
     upload_artifact(
         State(state),
         Extension(auth),
-        Path((key, filename)),
+        Path((key, artifact_path)),
         headers,
         body,
     )
     .await
+}
+
+/// Combine an optional client-provided `path` field with the uploaded file's
+/// filename into a single artifact path.
+///
+/// Rules (see #1237):
+///   - `None` or empty `custom_path` -> `filename`
+///   - `custom_path` ending in `/`   -> `<custom_path><filename>` (directory)
+///   - otherwise                     -> `custom_path` verbatim (full path)
+///
+/// Leading slashes on `custom_path` are stripped so callers can pass either
+/// `unifi/docs/` or `/unifi/docs/`. Empty segments produced by `//` are
+/// rejected by `validate_artifact_path` later in the upload pipeline.
+fn compose_artifact_path(custom_path: Option<&str>, filename: &str) -> String {
+    let raw = custom_path.unwrap_or("").trim();
+    let trimmed = raw.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return filename.to_string();
+    }
+    if trimmed.ends_with('/') {
+        // Treat as a directory prefix: append the uploaded filename.
+        format!("{trimmed}{filename}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Extract the first file field from a multipart form.
@@ -1986,6 +2031,53 @@ async fn extract_multipart_file(mut multipart: Multipart) -> Result<(Bytes, Stri
     Err(AppError::Validation(
         "No file field found in multipart form".to_string(),
     ))
+}
+
+/// Extract both a file field and an optional `path` text field from a
+/// multipart form.
+///
+/// Iterates the full form: a file field (one with a `filename`) yields the
+/// body and original filename; a `path` field (any non-file field named
+/// `path`) yields the requested artifact path. Either may appear in any
+/// order. Returns an error if no file is found.
+async fn extract_multipart_file_and_path(
+    mut multipart: Multipart,
+) -> Result<(Bytes, String, Option<String>)> {
+    let mut file: Option<(Bytes, String)> = None;
+    let mut custom_path: Option<String> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::Validation(format!("Invalid multipart data: {e}")))?
+    {
+        let filename = field.file_name().map(|s| s.to_string());
+        let name = field.name().map(|s| s.to_string());
+        if let Some(filename) = filename {
+            // File upload field
+            if file.is_none() {
+                let data: Bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::Validation(format!("Failed to read file: {e}")))?;
+                file = Some((data, filename));
+            }
+        } else if name.as_deref() == Some("path") {
+            // Custom path text field
+            let value = field
+                .text()
+                .await
+                .map_err(|e| AppError::Validation(format!("Failed to read path field: {e}")))?;
+            custom_path = Some(value);
+        }
+    }
+
+    match file {
+        Some((body, filename)) => Ok((body, filename, custom_path)),
+        None => Err(AppError::Validation(
+            "No file field found in multipart form".to_string(),
+        )),
+    }
 }
 
 /// Download artifact
@@ -6534,5 +6626,205 @@ mod tests {
              `proxy_fetch` helper would re-introduce the OOM regression \
              closed by #895/#1294."
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // compose_artifact_path (#1237)
+    //
+    // The web UI's "Custom path (optional)" field is sent as a `path` form
+    // field alongside the file in a multipart POST to
+    // `/api/v1/repositories/<repo>/artifacts`. Before #1237 this field was
+    // silently dropped and only the file's filename ever reached the
+    // storage layer. These tests pin the composition rules:
+    //   - empty / missing custom_path -> use the filename only
+    //   - trailing slash -> directory prefix (append filename)
+    //   - no trailing slash -> full path verbatim
+    //   - arbitrary depth allowed (1 or N segments)
+    // The downstream `validate_artifact_path` in the upload pipeline
+    // continues to reject `..`, `//`, null bytes, etc.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_artifact_path_no_custom_path_uses_filename() {
+        // Empty and absent both fall back to the filename
+        assert_eq!(compose_artifact_path(None, "foo.tar.gz"), "foo.tar.gz");
+        assert_eq!(compose_artifact_path(Some(""), "foo.tar.gz"), "foo.tar.gz");
+        assert_eq!(
+            compose_artifact_path(Some("   "), "foo.tar.gz"),
+            "foo.tar.gz",
+            "whitespace-only path should fall back to filename"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_one_segment_verbatim() {
+        // Bug repro case from #1237: custom_path `unifi/guide.pdf` should
+        // become the full artifact path, NOT `unifi-udmp-security-guide.pdf`.
+        assert_eq!(
+            compose_artifact_path(Some("unifi/guide.pdf"), "unifi-udmp-security-guide.pdf"),
+            "unifi/guide.pdf"
+        );
+        // Single-segment custom path
+        assert_eq!(
+            compose_artifact_path(Some("renamed.bin"), "original.bin"),
+            "renamed.bin"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_trailing_slash_appends_filename() {
+        // Issue #1237 explicit example: `unifi/docs/` + filename ->
+        // `unifi/docs/unifi-udmp-security-guide.pdf`
+        assert_eq!(
+            compose_artifact_path(Some("unifi/docs/"), "unifi-udmp-security-guide.pdf"),
+            "unifi/docs/unifi-udmp-security-guide.pdf"
+        );
+        // Single-segment directory
+        assert_eq!(
+            compose_artifact_path(Some("releases/"), "v1.tar.gz"),
+            "releases/v1.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_arbitrary_depth() {
+        // 3-segment path
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/file.bin"), "ignored.bin"),
+            "a/b/c/file.bin"
+        );
+        // 5-segment path (deep)
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/d/e/file.bin"), "ignored.bin"),
+            "a/b/c/d/e/file.bin"
+        );
+        // 4-segment directory prefix
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/d/"), "file.bin"),
+            "a/b/c/d/file.bin"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_strips_leading_slash() {
+        // Leading slash on the form field should not produce an absolute
+        // path (validate_artifact_path rejects those). Strip it so a UI
+        // that sends `/unifi/docs/` still works.
+        assert_eq!(
+            compose_artifact_path(Some("/unifi/docs/"), "x.pdf"),
+            "unifi/docs/x.pdf"
+        );
+        assert_eq!(
+            compose_artifact_path(Some("/unifi/guide.pdf"), "x.pdf"),
+            "unifi/guide.pdf"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_with_special_chars() {
+        // Spaces, dots, dashes, underscores, plus signs - all valid in paths
+        // (the downstream validator only rejects traversal patterns).
+        assert_eq!(
+            compose_artifact_path(Some("my dir/file.tar.gz"), "x.bin"),
+            "my dir/file.tar.gz"
+        );
+        assert_eq!(
+            compose_artifact_path(
+                Some("releases/v1.2.3-rc.1/"),
+                "artifact_v1.2.3+linux.x86_64.bin"
+            ),
+            "releases/v1.2.3-rc.1/artifact_v1.2.3+linux.x86_64.bin"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Security: composed paths must be rejected by validate_artifact_path
+    //
+    // Regression for the gap found in #1322's security review:
+    // `compose_artifact_path` happily produces `../etc/passwd` from a
+    // malicious `path` form field, and the original PR did NOT call
+    // `validate_artifact_path` on the composed value before handing it to
+    // the storage layer. Filesystem storage's `key_to_path` strips `..`
+    // segments, but S3/GCS backends do not, so a `path=../../etc/passwd`
+    // form field could escape the repository's storage key prefix.
+    //
+    // The fix is to call `validate_artifact_path` inside `upload_artifact`
+    // so every entry point (URL-path PUT, multipart-with-path POST, and
+    // the new multipart `path` form field added in #1237) is covered. The
+    // first test pins the composition+validation contract without needing
+    // a database; the second drives the actual handler end-to-end and
+    // asserts the HTTP response is 400.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_artifact_path_traversal_is_rejected_by_validator() {
+        // The composed path is exactly the attacker-controlled value
+        // (no trailing slash means the path is used verbatim).
+        let composed = compose_artifact_path(Some("../etc/passwd"), "ignored.bin");
+        assert_eq!(composed, "../etc/passwd");
+
+        // And validate_artifact_path must reject it. If this ever starts
+        // returning Ok(_) the security guarantee is gone.
+        let err = upload_service::validate_artifact_path(&composed)
+            .expect_err("../etc/passwd must be rejected as traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("traversal"),
+            "expected traversal rejection, got: {msg}"
+        );
+
+        // Belt-and-braces: a few other shapes the composer can produce
+        // from hostile form fields, all of which must fail validation.
+        for hostile in [
+            "../../etc/passwd",
+            "a/../b",
+            "file\0.txt",
+            "a/%2e%2e/b",
+            "a\\b",
+        ] {
+            assert!(
+                upload_service::validate_artifact_path(hostile).is_err(),
+                "validate_artifact_path must reject {hostile:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_artifact_rejects_traversal_path_with_400() {
+        // End-to-end pin: drive `upload_artifact` with a path produced by
+        // `compose_artifact_path("../etc/passwd", _)` and assert the
+        // handler returns 400 Bad Request without touching storage. Skips
+        // gracefully when no DATABASE_URL is configured.
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let composed = compose_artifact_path(Some("../etc/passwd"), "ignored.bin");
+        assert_eq!(composed, "../etc/passwd");
+
+        // `make_auth` builds a JWT-style AuthExtension (is_api_token =
+        // false), so `require_scope("write")` automatically passes - no
+        // need to populate `scopes`.
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+
+        let result = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path((fx.repo_key.clone(), composed)),
+            HeaderMap::new(),
+            Bytes::from_static(b"payload-should-never-be-stored"),
+        )
+        .await;
+
+        let err = result.expect_err("traversal path must be rejected");
+        // AppError::Validation maps to 400 Bad Request via IntoResponse
+        // (see error.rs status_and_code). Pinning the variant here is
+        // equivalent and avoids reaching into a private method.
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "traversal path must surface as Validation (400), got {err:?}",
+        );
+
+        fx.teardown().await;
     }
 }
