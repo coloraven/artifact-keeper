@@ -175,7 +175,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         tracing::info!("SKIP_MIGRATIONS=true, skipping automatic database migrations");
     } else {
         tracing::info!("Running database migrations...");
-        repair_legacy_073_checksum(&db_pool).await?;
+        artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
+        artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool)
+            .await?;
         // Some migrations (e.g. CREATE INDEX on a populated `artifacts` table
         // or backfill UPDATEs) take longer than the per-query
         // `statement_timeout` that operators commonly set on their Postgres
@@ -1141,86 +1143,6 @@ fn build_oidc_request_from_values(
         pkce_enabled: None,
         map_groups_to_groups: None,
     })
-}
-
-/// Repair a stale `_sqlx_migrations` row for version 73 that was left over by
-/// the duplicate-073 bug fixed in #1138.
-///
-/// Between PR #975 (forward-port of download-ticket cascade) and PR #1138
-/// (rename to 083), the migrations directory contained two files numbered 073:
-/// `073_account_lockout.sql` and `073_download_tickets_cascade.sql`. Postgres
-/// only kept whichever row `sqlx migrate run` inserted first, with that file's
-/// checksum. After #1138 renamed the colliding file to 083, the surviving 073
-/// file on disk (`073_account_lockout.sql`) may differ from what the DB stored,
-/// and `sqlx migrate run` then aborts with `Migration(VersionMismatch(73))`
-/// before applying any newer migration (issue #1129).
-///
-/// This pre-migration step looks at the DB and only acts when both halves of
-/// the broken state are present: the lockout schema (proof account_lockout was
-/// applied at some point) AND the `_sqlx_migrations` row for version 73 whose
-/// checksum no longer matches the current file. In that exact case we rewrite
-/// the stored checksum to the current file's checksum so the migrator can move
-/// on. The check is conservative; if either signal is missing we leave the row
-/// alone so unrelated checksum drift still surfaces as a startup error.
-async fn repair_legacy_073_checksum(db: &sqlx::PgPool) -> Result<()> {
-    // Skip when the table doesn't exist yet (fresh DB) or when no row for
-    // version 73 has been recorded.
-    let table_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '_sqlx_migrations')",
-    )
-    .fetch_one(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-    if !table_exists {
-        return Ok(());
-    }
-
-    let stored_checksum: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 73")
-            .fetch_optional(db)
-            .await
-            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-    let Some(stored) = stored_checksum else {
-        return Ok(());
-    };
-
-    // Confirm the lockout migration was previously applied by checking for one
-    // of its columns. If the column is absent, this row predates the duplicate
-    // and is unrelated to the bug we're repairing.
-    let lockout_applied: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-         WHERE table_name = 'users' AND column_name = 'failed_login_attempts')",
-    )
-    .fetch_one(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-    if !lockout_applied {
-        return Ok(());
-    }
-
-    let current_file = include_str!("../migrations/073_account_lockout.sql");
-    use sha2::{Digest, Sha384};
-    let mut hasher = Sha384::new();
-    hasher.update(current_file.as_bytes());
-    let current_checksum = hasher.finalize().to_vec();
-
-    if stored == current_checksum {
-        return Ok(());
-    }
-
-    tracing::warn!(
-        event = "migration_073_checksum_repair",
-        "Detected stale checksum for migration 073 (account_lockout). \
-         Rewriting _sqlx_migrations row so the migrator can proceed. \
-         This is a one-time recovery for installations affected by the \
-         duplicate-073 bug fixed in #1138."
-    );
-    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 73")
-        .bind(&current_checksum)
-        .execute(db)
-        .await
-        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-    Ok(())
 }
 
 /// Provision the initial admin user on first boot and determine setup mode.
