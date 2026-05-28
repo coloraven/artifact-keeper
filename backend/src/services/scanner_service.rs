@@ -543,7 +543,34 @@ impl ScanWorkspace {
     /// Clean up the scan workspace directory, logging warnings on failure.
     pub async fn cleanup(base: &str, prefix: Option<&str>, artifact: &Artifact) {
         let workspace = Self::workspace_dir(base, prefix, artifact);
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
+        Self::cleanup_path(&workspace).await;
+    }
+
+    /// Clean up a specific workspace directory by path, logging warnings on
+    /// failure. Used by scanners that allocate a per-scan-unique workspace
+    /// (so the path cannot be recomputed from `(base, prefix, artifact)`).
+    pub async fn cleanup_path(workspace: &Path) {
+        if !workspace.exists() {
+            return;
+        }
+        // Extracted trees can contain directories the runtime UID can't traverse
+        // or delete — e.g. tar can land kernel-module dirs at mode `d--x--S---`
+        // (setgid, no read). Force owner-rwX across the tree first so the
+        // recursive delete actually succeeds; otherwise it fails with EACCES and
+        // silently leaves the (often multi-GiB) tree on the PVC until it fills.
+        let workspace_str = workspace.to_string_lossy().to_string();
+        if let Err(e) = tokio::process::Command::new("chmod")
+            .args(["-R", "u+rwX", &workspace_str])
+            .output()
+            .await
+        {
+            warn!(
+                "Failed to pre-chmod scan workspace {} before cleanup: {}",
+                workspace.display(),
+                e
+            );
+        }
+        if let Err(e) = tokio::fs::remove_dir_all(workspace).await {
             warn!(
                 "Failed to clean up scan workspace {}: {}",
                 workspace.display(),
@@ -719,6 +746,21 @@ pub(crate) async fn fail_scan(
     let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
     warn!("{}", msg);
     ScanWorkspace::cleanup(workspace_base, workspace_prefix, artifact).await;
+    AppError::Internal(msg)
+}
+
+/// Variant of [`fail_scan`] that cleans up an explicit workspace path rather
+/// than recomputing it from `(base, prefix, artifact)`. Used by scanners that
+/// allocate a per-scan-unique workspace directory.
+pub(crate) async fn fail_scan_path(
+    scanner_label: &str,
+    artifact: &Artifact,
+    error: &AppError,
+    workspace: &Path,
+) -> AppError {
+    let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
+    warn!("{}", msg);
+    ScanWorkspace::cleanup_path(workspace).await;
     AppError::Internal(msg)
 }
 
