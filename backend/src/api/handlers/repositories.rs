@@ -921,31 +921,36 @@ pub async fn create_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
-    // Add virtual repository members. The up-front validation above
-    // guarantees `member_repos` is `Some(non-empty)` whenever
-    // `repo_type == Virtual`, so the empty / None arms are unreachable.
+    // Add virtual repository members. Post-#1444, the validator accepts
+    // `member_repos == None` (deferred-population pattern: caller will
+    // POST /members later) and only rejects `Some(empty_vec)`. Treat the
+    // None arm as a clean no-op here; the Some(non-empty) arm is the
+    // create-with-members path and runs the original loop.
     if repo_type == RepositoryType::Virtual {
-        let member_inputs = payload
-            .member_repos
-            .as_deref()
-            .expect("member_repos non-empty validated above");
-        tracing::info!(
-            repo_key = %repo.key,
-            member_count = member_inputs.len(),
-            "Adding virtual repository members during creation"
-        );
-        for (idx, input) in member_inputs.iter().enumerate() {
-            let member_repo = service.get_by_key(&input.repo_key).await?;
-            let priority = resolve_member_priority(input.priority, idx);
-            tracing::debug!(
-                virtual_repo = %repo.key,
-                member_key = %input.repo_key,
-                priority = priority,
-                "Adding virtual member"
+        if let Some(member_inputs) = payload.member_repos.as_deref() {
+            tracing::info!(
+                repo_key = %repo.key,
+                member_count = member_inputs.len(),
+                "Adding virtual repository members during creation"
             );
-            service
-                .add_virtual_member(repo.id, member_repo.id, Some(priority))
-                .await?;
+            for (idx, input) in member_inputs.iter().enumerate() {
+                let member_repo = service.get_by_key(&input.repo_key).await?;
+                let priority = resolve_member_priority(input.priority, idx);
+                tracing::debug!(
+                    virtual_repo = %repo.key,
+                    member_key = %input.repo_key,
+                    priority = priority,
+                    "Adding virtual member"
+                );
+                service
+                    .add_virtual_member(repo.id, member_repo.id, Some(priority))
+                    .await?;
+            }
+        } else {
+            tracing::info!(
+                repo_key = %repo.key,
+                "Virtual repo created with no members; deferring to POST /members (#1444)"
+            );
         }
     }
 
