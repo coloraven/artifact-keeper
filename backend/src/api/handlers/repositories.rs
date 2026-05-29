@@ -1530,11 +1530,27 @@ pub async fn list_artifacts(
             std::collections::HashMap::new()
         };
 
+    // For npm-family repos the artifact is stored under the
+    // version-segmented layout `<name>/<version>/<name>-<version>.tgz`
+    // (see `api::handlers::npm::store_npm_version`), but npm clients and
+    // every external consumer reference tarballs by the download-URL
+    // shape `<name>/-/<name>-<version>.tgz`. Surface the URL shape in the
+    // listing's `path` so callers that resolve an artifact by the path
+    // npm published (the management UI, SDKs, the release-gate real-flow
+    // smoke test) match against the same string they downloaded from.
+    // Lookup-by-path already accepts both shapes via
+    // `normalize_lookup_path` (#1443); this keeps the listing consistent.
+    let rewrite_npm_tarball_paths = is_npm_family_format(&repo.format);
+
     let mut items = Vec::new();
     for artifact in artifacts {
         let artifact_id = artifact.id;
         let download_count = *download_counts.get(&artifact_id).unwrap_or(&0);
-        items.push(build_artifact_response(&artifact, &key, download_count));
+        let mut item = build_artifact_response(&artifact, &key, download_count);
+        if rewrite_npm_tarball_paths {
+            apply_npm_tarball_url_path(&mut item);
+        }
+        items.push(item);
 
         if let Some(secondary) = maven_files_by_artifact.get(&artifact_id) {
             items.extend(expand_maven_secondary_files(&artifact, &key, secondary));
@@ -1633,6 +1649,21 @@ async fn lookup_artifact_by_paths(
         }
     }
     Ok(None)
+}
+
+/// Rewrite an npm-family artifact listing row's `path` from the
+/// version-segmented storage layout (`<name>/<version>/<file>.tgz`) to
+/// the canonical npm download-URL shape (`<name>/-/<file>.tgz`).
+///
+/// No-op for any row whose path is not a stored npm tarball (metadata
+/// rows, raw uploads, paths already in URL form), so the listing keeps
+/// reporting those verbatim. See the real-flow-smoke follow-up to #1443:
+/// callers resolve a tarball by the URL path they downloaded from, which
+/// must match what the listing reports.
+fn apply_npm_tarball_url_path(item: &mut ArtifactResponse) {
+    if let Some(url_path) = crate::formats::npm::tarball_url_path_from_stored(&item.path) {
+        item.path = url_path;
+    }
 }
 
 fn build_artifact_response(
@@ -2800,12 +2831,32 @@ pub async fn download_artifact(
             }
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Virtual => {
-            // Virtual repo: try each member in priority order
+            // Virtual repo: try each member in priority order.
+            //
+            // Shadowing guard (B9): the generic-format download keys on the
+            // exact stored path. If a non-Remote member of this virtual repo
+            // owns the path, suppress the proxy service so Remote members are
+            // Skip'd and cannot shadow the local artifact. Without this a
+            // Remote member earlier in priority order that returns a 200 for
+            // the same path (catch-all upstream, or a different object at
+            // that path) would win the first-`Ok` race and serve the wrong
+            // or empty bytes, while a guarded format handler would 404-refuse.
+            let owns_locally =
+                proxy_helpers::virtual_non_remote_owns_path(&state.db, repo.id, &path)
+                    .await
+                    .map_err(|_| {
+                        AppError::Internal("virtual shadowing-guard query failed".to_string())
+                    })?;
+            let proxy_for_virtual = if owns_locally {
+                None
+            } else {
+                state.proxy_service.as_deref()
+            };
             let db = state.db.clone();
             let path_clone = path.clone();
             let (content, content_type) = proxy_helpers::resolve_virtual_download(
                 &state.db,
-                state.proxy_service.as_deref(),
+                proxy_for_virtual,
                 repo.id,
                 &path,
                 |member_id, location| {
@@ -3127,14 +3178,16 @@ pub async fn remove_virtual_member(
     let member_repo = service.get_by_key(&member_key).await?;
     authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "remove")?;
 
-    sqlx::query(
-        "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2",
-    )
-    .bind(virtual_repo.id)
-    .bind(member_repo.id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // Delegate to the service, which scopes the DELETE to the single
+    // (virtual_repo_id, member_repo_id) row and returns `AppError::NotFound`
+    // (HTTP 404) when no row matched. Routing through the service keeps a
+    // single source of truth for the delete predicate so this handler cannot
+    // drift back to a virtual-repo-id-only DELETE that would empty every
+    // member (B1), and gives the repeat-delete-of-an-already-removed-member
+    // path its 404 instead of a misleading 200 (B3).
+    service
+        .remove_virtual_member(virtual_repo.id, member_repo.id)
+        .await?;
 
     Ok(())
 }
@@ -3257,36 +3310,24 @@ pub async fn update_virtual_members(
 
     // Single-statement bulk update via UNNEST(uuid[], int4[]). This is atomic
     // by construction in Postgres: the entire statement either succeeds and
-    // updates every matching row, or fails and updates none. Removes the
-    // need for an explicit transaction, the per-row lock-ordering sort, and
-    // the rows_affected loop guard. Concurrent PUTs serialise at the row-
-    // lock layer of this single statement and produce a deterministic final
-    // state (one wins, the other overwrites it; never a row-level mix).
+    // updates every matching row, or fails and updates none.
+    //
+    // The service runs the UPDATE inside a transaction that first takes the
+    // process-wide member-graph advisory lock (B2). Without that lock, two
+    // concurrent PUTs over an overlapping member set acquire row locks in
+    // planner-scan order and can deadlock on the shared row, which Postgres
+    // only breaks after `deadlock_timeout`; under a race loop that surfaces
+    // as multi-second stalls that exhaust the client timeout. The lock
+    // serialises every member-graph mutation so the UPDATEs never contend.
     //
     // RETURNING gives us the set of member_repo_ids that actually matched
     // the (virtual_repo_id, member_repo_id) predicate. If that set is
     // smaller than the input set, some member row was deleted between the
     // resolve pass and the UPDATE (TOCTOU), and we surface a 404 listing
     // the missing keys so the caller can retry with a fresh resolution.
-    let updated: Vec<Uuid> = sqlx::query_scalar(
-        r#"
-        UPDATE virtual_repo_members
-           SET priority = c.priority
-          FROM (
-            SELECT * FROM UNNEST($2::uuid[], $3::int4[])
-                     AS t(member_repo_id, priority)
-          ) AS c
-         WHERE virtual_repo_members.virtual_repo_id = $1
-           AND virtual_repo_members.member_repo_id = c.member_repo_id
-        RETURNING virtual_repo_members.member_repo_id
-        "#,
-    )
-    .bind(virtual_repo.id)
-    .bind(&resolved_member_ids)
-    .bind(&priorities)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let updated = service
+        .update_virtual_member_priorities(virtual_repo.id, &resolved_member_ids, &priorities)
+        .await?;
 
     detect_bulk_update_misses(
         &virtual_repo.key,
@@ -3806,6 +3847,57 @@ mod tests {
         assert_eq!(resp.size_bytes, 500);
         assert_eq!(resp.checksum_sha256, "primary-sha");
         assert_eq!(resp.download_count, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_npm_tarball_url_path: the listing rewrite that lets npm clients
+    // (and the release-gate real-flow smoke test) resolve a tarball by the
+    // `<name>/-/<file>.tgz` URL path they downloaded from, even though it is
+    // stored under `<name>/<version>/<file>.tgz`. Follow-up to #1443.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_rewrites_stored_tarball() {
+        let a = make_artifact_for_test("rfs-pkg/1.0.5/rfs-pkg-1.0.5.tgz");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_rewrites_scoped_stored_tarball() {
+        let a = make_artifact_for_test("@angular/core/17.0.0/core-17.0.0.tgz");
+        let mut resp = build_artifact_response(&a, "npm-hosted", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "@angular/core/-/core-17.0.0.tgz");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_noop_for_metadata_row() {
+        // Non-tarball rows (a bare package metadata path) are left verbatim.
+        let a = make_artifact_for_test("rfs-pkg/package.json");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/package.json");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_idempotent_on_url_shape() {
+        // A path already in the `/-/` URL shape must not be rewritten again.
+        let a = make_artifact_for_test("rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+    }
+
+    #[test]
+    fn test_is_npm_family_format_covers_npm_aliases() {
+        assert!(is_npm_family_format(&RepositoryFormat::Npm));
+        assert!(is_npm_family_format(&RepositoryFormat::Yarn));
+        assert!(is_npm_family_format(&RepositoryFormat::Bower));
+        assert!(is_npm_family_format(&RepositoryFormat::Pnpm));
+        assert!(!is_npm_family_format(&RepositoryFormat::Maven));
+        assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
     }
 
     #[test]
