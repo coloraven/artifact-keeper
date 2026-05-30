@@ -1359,9 +1359,19 @@ pub struct DockerTagResponse {
     pub is_index: bool,
     /// Last push (or update) timestamp from the underlying `oci_tags` row.
     pub last_pushed_at: chrono::DateTime<chrono::Utc>,
-    /// Latest scan status (`pending`, `running`, `completed`, `failed`) from
-    /// `scan_results`, if the manifest has ever been scanned.  `None` when
-    /// the artifact has never been scanned.
+    /// Rolled-up scan status across all scanners configured for this
+    /// artifact. `None` when the artifact has never been scanned.
+    ///
+    /// Values surface the aggregate state, not a single scanner's row
+    /// (see #1497). One of:
+    ///
+    /// * `pending` / `running` -- at least one scanner is still in flight
+    /// * `completed` -- every per-scan-type latest row is `completed`
+    /// * `failed` -- every per-scan-type latest row is `failed`
+    /// * `partial` -- mixed: at least one `completed` AND at least one
+    ///   `failed`. A green generic scanner (e.g. grype) no longer hides
+    ///   a failed format-native scanner (e.g. incus) behind a
+    ///   `completed` label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_status: Option<String>,
 }
@@ -2052,6 +2062,66 @@ async fn list_artifacts_grouped_by_docker_tag(
     }))
 }
 
+/// Collapse the set of per-scan-type latest statuses for an artifact into
+/// a single rollup label (#1497).
+///
+/// The scan pipeline writes one `scan_results` row per (artifact,
+/// scan_type) pair (grype, dependency-track, openscap, incus, ...).
+/// Surfacing only the most-recent row's status silently masks a failed
+/// format-native scanner whenever a generic scanner finishes after it,
+/// which is a security-scanning gap (the operator sees `completed` and
+/// concludes the artifact was fully scanned).
+///
+/// Precedence, applied in order:
+///
+/// 1. Empty input -> `None` (artifact has never been scanned).
+/// 2. Any `running` -> `running` (in-flight beats anything terminal).
+/// 3. Any `pending` -> `pending` (queued beats terminal).
+/// 4. All `completed` -> `completed` (every configured scanner is green).
+/// 5. All `failed` -> `failed` (every configured scanner errored out).
+/// 6. Mixed terminal (at least one `completed` AND at least one `failed`)
+///    -> `partial`. This is the case #1497 was filed for: a green grype
+///    plus a failed incus scan now surfaces as `partial`, not
+///    `completed`.
+///
+/// Unknown status strings are pessimistically treated as a failure for
+/// the all-completed check (they will not collapse to `completed`).
+pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
+    if statuses.is_empty() {
+        return None;
+    }
+
+    let mut has_running = false;
+    let mut has_pending = false;
+    let mut has_completed = false;
+    let mut has_failed = false;
+    let mut has_unknown = false;
+
+    for s in statuses {
+        match s.as_str() {
+            "running" => has_running = true,
+            "pending" => has_pending = true,
+            "completed" => has_completed = true,
+            "failed" => has_failed = true,
+            _ => has_unknown = true,
+        }
+    }
+
+    if has_running {
+        return Some("running".to_string());
+    }
+    if has_pending {
+        return Some("pending".to_string());
+    }
+    if has_completed && !has_failed && !has_unknown {
+        return Some("completed".to_string());
+    }
+    if has_failed && !has_completed && !has_unknown {
+        return Some("failed".to_string());
+    }
+    Some("partial".to_string())
+}
+
 /// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
 /// latest `scan_results` row. Returns at most `limit` rows.
 ///
@@ -2074,9 +2144,16 @@ async fn fetch_docker_tag_rows(
     // not carry a back-reference to the oci_tags row; the push handler
     // composes `v2/{image}/manifests/{tag}` deterministically.
     //
-    // LEFT JOIN scan_results on the latest row per artifact is filtered
-    // by NOT EXISTS so we don't carry historical scans; this matches the
-    // partial-index pattern from migration 101.
+    // Scan-status rollup (#1497): an artifact can have multiple scan_results
+    // rows, one per scan_type (grype, dependency-track, openscap, incus,
+    // ...). Previously this query returned only the most-recent row's
+    // status via `ORDER BY created_at DESC LIMIT 1`, which silently masked
+    // a failed format-native scanner whenever a generic scanner (e.g.
+    // grype) finished after it. We now project per-scan-type latest rows
+    // and aggregate their statuses with `array_agg(DISTINCT ...)`; the
+    // Rust-side `rollup_scan_status` helper collapses the set into a
+    // single label (`completed`, `partial`, `failed`, `running`,
+    // `pending`) honoring the precedence in its doc comment.
     let sql = if search_query.is_some() {
         r#"SELECT
                 a.id            AS artifact_id,
@@ -2086,18 +2163,21 @@ async fn fetch_docker_tag_rows(
                 t.manifest_content_type AS manifest_content_type,
                 a.size_bytes    AS manifest_size_bytes,
                 t.updated_at    AS last_pushed_at,
-                s.status        AS scan_status
+                s.statuses      AS scan_statuses
             FROM oci_tags t
             JOIN artifacts a
               ON a.repository_id = t.repository_id
              AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
              AND a.is_deleted = false
             LEFT JOIN LATERAL (
-                SELECT status
-                FROM scan_results
-                WHERE artifact_id = a.id
-                ORDER BY created_at DESC
-                LIMIT 1
+                SELECT array_agg(DISTINCT latest.status) AS statuses
+                FROM (
+                    SELECT DISTINCT ON (sr.scan_type)
+                        sr.status
+                    FROM scan_results sr
+                    WHERE sr.artifact_id = a.id
+                    ORDER BY sr.scan_type, sr.created_at DESC
+                ) latest
             ) s ON true
             WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0
@@ -2113,18 +2193,21 @@ async fn fetch_docker_tag_rows(
                 t.manifest_content_type AS manifest_content_type,
                 a.size_bytes    AS manifest_size_bytes,
                 t.updated_at    AS last_pushed_at,
-                s.status        AS scan_status
+                s.statuses      AS scan_statuses
             FROM oci_tags t
             JOIN artifacts a
               ON a.repository_id = t.repository_id
              AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
              AND a.is_deleted = false
             LEFT JOIN LATERAL (
-                SELECT status
-                FROM scan_results
-                WHERE artifact_id = a.id
-                ORDER BY created_at DESC
-                LIMIT 1
+                SELECT array_agg(DISTINCT latest.status) AS statuses
+                FROM (
+                    SELECT DISTINCT ON (sr.scan_type)
+                        sr.status
+                    FROM scan_results sr
+                    WHERE sr.artifact_id = a.id
+                    ORDER BY sr.scan_type, sr.created_at DESC
+                ) latest
             ) s ON true
             WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0
@@ -2174,7 +2257,13 @@ async fn fetch_docker_tag_rows(
             last_pushed_at: r
                 .try_get("last_pushed_at")
                 .map_err(|e| AppError::Database(e.to_string()))?,
-            scan_status: r.try_get("scan_status").ok().flatten(),
+            scan_status: rollup_scan_status(
+                r.try_get::<Option<Vec<String>>, _>("scan_statuses")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .unwrap_or(&[]),
+            ),
         });
     }
     Ok(out)
@@ -5095,6 +5184,88 @@ mod tests {
         let resp = build_docker_tag_response(row, "docker-hub", &children);
 
         assert_eq!(resp.scan_status.as_deref(), Some("completed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // rollup_scan_status (#1497)
+    // -----------------------------------------------------------------------
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn test_rollup_scan_status_empty_returns_none() {
+        // Never scanned -> no rollup.
+        assert_eq!(rollup_scan_status(&[]), None);
+    }
+
+    #[test]
+    fn test_rollup_scan_status_all_completed_returns_completed() {
+        // Every configured scanner finished cleanly -> green rollup.
+        let statuses = vec![s("completed"), s("completed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_all_failed_returns_failed() {
+        // Every configured scanner errored out -> hard failure.
+        let statuses = vec![s("failed"), s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_mixed_completed_and_failed_returns_partial() {
+        // The #1497 regression case: incus (format-native) failed, grype
+        // completed. Pre-fix this surfaced as `completed` and the operator
+        // had no visible signal that the rootfs scan was skipped. Post-fix
+        // it must surface as `partial` so the UI/CLI/release-gate can flag
+        // the silent gap.
+        let statuses = vec![s("completed"), s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_mixed_with_running_returns_running() {
+        // An in-flight scan beats anything terminal so the UI does not
+        // prematurely call a still-running set `partial`.
+        let statuses = vec![s("completed"), s("failed"), s("running")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_pending_beats_terminal_only() {
+        // pending beats completed/failed but loses to running (running ==
+        // already started, pending == not yet started).
+        let statuses = vec![s("completed"), s("pending")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("pending"));
+
+        let statuses = vec![s("pending"), s("running")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_single_completed_stays_completed() {
+        // Only one scanner configured and it passed -> still `completed`.
+        // Guards against an overly-strict rollup that demanded N>=2.
+        let statuses = vec![s("completed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_single_failed_stays_failed() {
+        let statuses = vec![s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_unknown_status_collapses_to_partial() {
+        // Pessimistic: an unrecognized status should NOT be allowed to
+        // collapse the set to `completed`. Belt-and-braces against a
+        // future scanner that writes a status value the rollup does not
+        // yet know about.
+        let statuses = vec![s("completed"), s("weird-state")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
     }
 
     #[test]
