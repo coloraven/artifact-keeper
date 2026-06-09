@@ -122,6 +122,7 @@ async fn create_key(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateKeyPayload>,
 ) -> Result<Json<SigningKeyPublic>> {
+    require_signing_admin(&auth)?;
     let svc = signing_service(&state);
     let key = svc
         .create_key(CreateKeyRequest {
@@ -181,9 +182,10 @@ async fn get_key(
 )]
 async fn delete_key(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    require_signing_admin(&auth)?;
     let svc = signing_service(&state);
     svc.delete_key(key_id).await?;
     Ok(Json(serde_json::json!({"deleted": true})))
@@ -290,16 +292,7 @@ async fn get_repo_signing_config(
     let config = svc.get_signing_config(repo_id).await?;
 
     let (signing_key_id, sign_metadata, sign_packages, require_signatures) =
-        if let Some(ref c) = config {
-            (
-                c.signing_key_id,
-                c.sign_metadata,
-                c.sign_packages,
-                c.require_signatures,
-            )
-        } else {
-            (None, false, false, false)
-        };
+        signing_config_fields(config.as_ref());
 
     let key = if let Some(kid) = signing_key_id {
         Some(svc.get_key(kid).await?)
@@ -336,24 +329,16 @@ async fn get_repo_signing_config(
 )]
 async fn update_repo_signing_config(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_id): Path<Uuid>,
     Json(payload): Json<UpdateSigningConfigPayload>,
 ) -> Result<Json<RepositorySigningConfig>> {
+    require_signing_admin(&auth)?;
     let svc = signing_service(&state);
 
     // Get existing config to merge with updates
     let existing = svc.get_signing_config(repo_id).await?;
-    let (cur_key, cur_meta, cur_pkg, cur_req) = if let Some(ref c) = existing {
-        (
-            c.signing_key_id,
-            c.sign_metadata,
-            c.sign_packages,
-            c.require_signatures,
-        )
-    } else {
-        (None, false, false, false)
-    };
+    let (cur_key, cur_meta, cur_pkg, cur_req) = signing_config_fields(existing.as_ref());
 
     let config = svc
         .update_signing_config(
@@ -397,6 +382,32 @@ fn signing_service(state: &SharedState) -> SigningService {
     SigningService::new(state.db.clone(), &state.config.jwt_secret)
 }
 
+/// Admin gate shared by the signing-key/repo-config mutation handlers.
+///
+/// Minting, deleting, revoking, rotating a repository signing key, or writing
+/// the repo signing config all subvert the artifact-signing trust model, so
+/// they are admin-only. Centralizing the check keeps the policy in one place.
+fn require_signing_admin(auth: &AuthExtension) -> Result<()> {
+    auth.require_admin()
+}
+
+/// Project a repository signing config into its scalar fields, defaulting to
+/// "unconfigured" (no key, nothing signed) when absent. Used by both the read
+/// and the update handler so the defaulting rule lives in one place.
+fn signing_config_fields(
+    config: Option<&RepositorySigningConfig>,
+) -> (Option<Uuid>, bool, bool, bool) {
+    match config {
+        Some(c) => (
+            c.signing_key_id,
+            c.sign_metadata,
+            c.sign_packages,
+            c.require_signatures,
+        ),
+        None => (None, false, false, false),
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -424,7 +435,76 @@ pub struct SigningApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::middleware::auth::AuthExtension;
     use serde_json;
+
+    // -----------------------------------------------------------------------
+    // Admin gate on signing-key and repo-config mutation
+    // -----------------------------------------------------------------------
+
+    fn non_admin_jwt() -> AuthExtension {
+        // A non-admin JWT session: `is_api_token = false`, so scope checks do
+        // not apply and the admin gate is the only thing standing between the
+        // caller and a key mint / config write.
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "victor".to_string(),
+            email: "victor@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    fn admin_jwt() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_non_admin_blocked_from_managing_signing_keys() {
+        // Regression: minting/deleting a repository signing key or writing the
+        // repo signing config subverts the artifact-signing trust model, so it
+        // must be admin-only. create_key, delete_key, and
+        // update_repo_signing_config all call `auth.require_admin()?` before
+        // touching the service; pin that decision at the predicate level
+        // (no DB needed). A non-admin JWT must be rejected with 403.
+        let ext = non_admin_jwt();
+        match require_signing_admin(&ext) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!("expected 403 Authorization for non-admin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_admin_allowed_to_manage_signing_keys() {
+        // Legitimate use: an admin passes the same gate the three mutation
+        // handlers enforce, so signing-key management still works.
+        let ext = admin_jwt();
+        assert!(require_signing_admin(&ext).is_ok());
+    }
+
+    #[test]
+    fn test_signing_config_fields_defaults_when_absent() {
+        // The shared projection helper must treat a missing config as fully
+        // unconfigured (no key, nothing signed) so both the read and update
+        // handlers agree on the default.
+        let (key, meta, pkg, req) = signing_config_fields(None);
+        assert!(key.is_none());
+        assert!(!meta);
+        assert!(!pkg);
+        assert!(!req);
+    }
 
     // -----------------------------------------------------------------------
     // ListKeysQuery deserialization
@@ -642,16 +722,7 @@ mod tests {
     fn test_config_extraction_from_none() {
         let config: Option<RepositorySigningConfig> = None;
         let (signing_key_id, sign_metadata, sign_packages, require_signatures) =
-            if let Some(ref c) = config {
-                (
-                    c.signing_key_id,
-                    c.sign_metadata,
-                    c.sign_packages,
-                    c.require_signatures,
-                )
-            } else {
-                (None, false, false, false)
-            };
+            signing_config_fields(config.as_ref());
         assert!(signing_key_id.is_none());
         assert!(!sign_metadata);
         assert!(!sign_packages);
@@ -674,16 +745,7 @@ mod tests {
             updated_at: now,
         });
         let (signing_key_id, sign_metadata, sign_packages, require_signatures) =
-            if let Some(ref c) = config {
-                (
-                    c.signing_key_id,
-                    c.sign_metadata,
-                    c.sign_packages,
-                    c.require_signatures,
-                )
-            } else {
-                (None, false, false, false)
-            };
+            signing_config_fields(config.as_ref());
         assert_eq!(signing_key_id, Some(key_id));
         assert!(sign_metadata);
         assert!(sign_packages);
@@ -703,16 +765,7 @@ mod tests {
             require_signatures: None,
         };
         let existing: Option<RepositorySigningConfig> = None;
-        let (cur_key, cur_meta, cur_pkg, cur_req) = if let Some(ref c) = existing {
-            (
-                c.signing_key_id,
-                c.sign_metadata,
-                c.sign_packages,
-                c.require_signatures,
-            )
-        } else {
-            (None, false, false, false)
-        };
+        let (cur_key, cur_meta, cur_pkg, cur_req) = signing_config_fields(existing.as_ref());
 
         let merged_key = payload.signing_key_id.or(cur_key);
         let merged_meta = payload.sign_metadata.unwrap_or(cur_meta);
@@ -745,16 +798,7 @@ mod tests {
             sign_packages: None,
             require_signatures: None,
         };
-        let (cur_key, cur_meta, cur_pkg, cur_req) = if let Some(ref c) = existing {
-            (
-                c.signing_key_id,
-                c.sign_metadata,
-                c.sign_packages,
-                c.require_signatures,
-            )
-        } else {
-            (None, false, false, false)
-        };
+        let (cur_key, cur_meta, cur_pkg, cur_req) = signing_config_fields(existing.as_ref());
 
         let merged_key = payload.signing_key_id.or(cur_key);
         let merged_meta = payload.sign_metadata.unwrap_or(cur_meta);
