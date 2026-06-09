@@ -29,6 +29,7 @@ use crate::error::{AppError, Result};
 use crate::formats::maven::MavenHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
+use crate::services::cache_classifier;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
 use crate::services::repository_service::{
@@ -3835,6 +3836,24 @@ pub async fn download_artifact(
     }
 }
 
+/// Decide whether a delete of `(format, path)` must be refused to preserve
+/// release immutability.
+///
+/// A delete is blocked when the coordinates classify as
+/// [`cache_classifier::Mutability::Immutable`] (the same structural rule the
+/// upload and proxy-cache paths use) and the caller is neither an admin nor an
+/// internal replication request. Admins keep an explicit retraction escape
+/// hatch; replication must be able to mirror upstream deletes; mutable paths
+/// (e.g. Maven SNAPSHOT directories, indexes) are always deletable.
+fn delete_blocked_by_immutability(
+    format: &RepositoryFormat,
+    path: &str,
+    is_admin: bool,
+    is_replication: bool,
+) -> bool {
+    !is_admin && !is_replication && cache_classifier::classify(format, path).is_immutable()
+}
+
 /// Delete artifact
 #[utoipa::path(
     delete,
@@ -3850,6 +3869,7 @@ pub async fn download_artifact(
         (status = 200, description = "Artifact deleted"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Artifact not found"),
+        (status = 409, description = "Artifact is immutable (released) and cannot be deleted"),
     )
 )]
 pub async fn delete_artifact(
@@ -3863,6 +3883,24 @@ pub async fn delete_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+
+    // Release immutability: a versioned (immutable) artifact must never be
+    // mutated after publication. Deleting one would re-open its coordinates for
+    // a different-bytes re-upload (the upload path already rejects an existing
+    // immutable version at `artifact_service`), so refuse the delete here using
+    // the SAME structural classification the proxy-cache and upload paths use.
+    // Admins retain an explicit escape hatch for genuine retractions; mutable
+    // paths (e.g. Maven SNAPSHOT directories) are unaffected.
+    if delete_blocked_by_immutability(
+        &repo.format,
+        &path,
+        auth.is_admin,
+        is_replication_request(&headers),
+    ) {
+        return Err(AppError::Conflict(
+            "Cannot delete an immutable/released artifact".to_string(),
+        ));
+    }
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = state.create_artifact_service(storage);
@@ -10281,6 +10319,65 @@ mod tests {
     // formats that don't normalise, and npm-family repos quietly fall
     // back to the stored path on the second probe.
     // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_blocked_by_immutability_matches_classification() {
+        // A released (versioned) Maven jar is immutable -> a non-admin,
+        // non-replication delete must be refused. This is the soft-delete +
+        // re-upload mutation bypass the gate closes.
+        let immutable_path = "com/acme/widget/3.0.0/widget-3.0.0.jar";
+        assert!(delete_blocked_by_immutability(
+            &RepositoryFormat::Maven,
+            immutable_path,
+            false, // not admin
+            false, // not replication
+        ));
+
+        // Same coordinates: an admin retraction is allowed.
+        assert!(!delete_blocked_by_immutability(
+            &RepositoryFormat::Maven,
+            immutable_path,
+            true,
+            false,
+        ));
+
+        // Same coordinates: an internal replication delete is allowed.
+        assert!(!delete_blocked_by_immutability(
+            &RepositoryFormat::Maven,
+            immutable_path,
+            false,
+            true,
+        ));
+
+        // Mutable coordinates (SNAPSHOT directory metadata, maven-metadata.xml)
+        // are deletable by anyone with the delete scope -> no regression.
+        assert!(!delete_blocked_by_immutability(
+            &RepositoryFormat::Maven,
+            "com/acme/widget/maven-metadata.xml",
+            false,
+            false,
+        ));
+        assert!(!delete_blocked_by_immutability(
+            &RepositoryFormat::Maven,
+            "com/acme/widget/1.0-SNAPSHOT/",
+            false,
+            false,
+        ));
+
+        // The decision tracks the central classifier for other formats too.
+        assert!(delete_blocked_by_immutability(
+            &RepositoryFormat::Npm,
+            "lodash/-/lodash-4.17.21.tgz",
+            false,
+            false,
+        ));
+        assert!(!delete_blocked_by_immutability(
+            &RepositoryFormat::Npm,
+            "lodash",
+            false,
+            false,
+        ));
+    }
 
     #[test]
     fn test_lookup_path_candidates_npm_url_shape_adds_stored_fallback() {
