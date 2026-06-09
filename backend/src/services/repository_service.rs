@@ -30,6 +30,11 @@ pub struct CreateRepositoryRequest {
     pub quota_bytes: Option<i64>,
     /// Custom format key for WASM plugin handlers (e.g. "rpm-custom").
     pub format_key: Option<String>,
+    /// User who is creating this repository. When set, the repository records
+    /// this user as `created_by` and the creator is auto-granted the
+    /// `developer` role scoped to the new repository (owner auto-grant), so the
+    /// creator retains access under per-repo authorization.
+    pub created_by: Option<Uuid>,
 }
 
 /// Request to update a repository
@@ -529,6 +534,28 @@ impl RepositoryService {
                         .await
                         .map_err(|e| AppError::Database(e.to_string()))?;
                 }
+                // Owner auto-grant: record the creator and grant them the
+                // `developer` role scoped to this repository, so the creator
+                // retains access under per-repo authorization. Runs inside the
+                // same tx as the INSERT so creator-grant is atomic with create.
+                if let Some(creator_id) = req.created_by {
+                    sqlx::query("UPDATE repositories SET created_by = $1 WHERE id = $2")
+                        .bind(creator_id)
+                        .bind(repo.id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    sqlx::query(
+                        "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+                         ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+                    )
+                    .bind(creator_id)
+                    .bind(repo.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                }
                 tx.commit()
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -567,6 +594,31 @@ impl RepositoryService {
         }
 
         Ok(repo)
+    }
+
+    /// Check whether a single user may access a private repository.
+    ///
+    /// Mirrors the `RepoVisibility::User` branch of [`build_visibility_clause`]
+    /// for one repository: the user has access if they hold any role assignment
+    /// scoped to that repository OR a global (NULL-scoped) role assignment.
+    ///
+    /// This is the per-repo authorization predicate. Callers are responsible for
+    /// short-circuiting the cases this method does NOT cover: admins bypass it
+    /// entirely and public repositories are accessible to everyone.
+    pub async fn user_can_access_repo(&self, repo_id: Uuid, user_id: Uuid) -> Result<bool> {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM role_assignments ra \
+                 WHERE ra.user_id = $1 \
+                   AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
+             )",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(granted)
     }
 
     /// Get a repository by ID
@@ -1356,6 +1408,7 @@ mod tests {
             is_public: true,
             quota_bytes: Some(1_000_000_000),
             format_key: None,
+            created_by: None,
         };
         assert_eq!(req.key, "my-repo");
         assert_eq!(req.format, RepositoryFormat::Maven);
@@ -1378,6 +1431,7 @@ mod tests {
             is_public: false,
             quota_bytes: None,
             format_key: None,
+            created_by: None,
         };
         assert_eq!(
             req.upstream_url,
@@ -2306,6 +2360,7 @@ mod tests {
                 is_public: false,
                 quota_bytes: None,
                 format_key: None,
+                created_by: None,
             }
         }
 
@@ -2389,6 +2444,76 @@ mod tests {
             );
 
             cleanup_repo(&pool, first.id).await;
+        }
+
+        /// Regression (authz-private-repo-membership): per-repo authorization
+        /// for a PRIVATE repository.
+        ///
+        /// Before the fix, any authenticated user could access any private
+        /// repository (the handlers never consulted the grant model). This
+        /// asserts the corrected predicate: the owner (auto-granted on create)
+        /// can access the repo, while a different user with no grant cannot —
+        /// and that an explicit grant restores access.
+        #[tokio::test]
+        async fn test_user_can_access_repo_private_grant_enforced() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (other_id, _) = tdh::create_user(&pool).await;
+
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            // Owner auto-grant: the creator is recorded and granted access.
+            req.created_by = Some(owner_id);
+            let repo = service.create(req).await.expect("create private repo");
+
+            // Owner (auto-granted developer role scoped to the repo) -> allowed.
+            assert!(
+                service
+                    .user_can_access_repo(repo.id, owner_id)
+                    .await
+                    .expect("owner access check"),
+                "owner should retain access via auto-grant"
+            );
+
+            // Different user with no grant -> denied (this is the bug being fixed).
+            assert!(
+                !service
+                    .user_can_access_repo(repo.id, other_id)
+                    .await
+                    .expect("other access check"),
+                "ungranted user must NOT access a private repo"
+            );
+
+            // Explicit grant scoped to the repo -> access restored.
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+                 ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+            )
+            .bind(other_id)
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("grant developer role");
+            assert!(
+                service
+                    .user_can_access_repo(repo.id, other_id)
+                    .await
+                    .expect("granted access check"),
+                "explicitly granted user should now have access"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+            for uid in [owner_id, other_id] {
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(uid)
+                    .execute(&pool)
+                    .await;
+            }
         }
     }
 }

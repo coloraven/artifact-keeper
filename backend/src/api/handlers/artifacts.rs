@@ -50,6 +50,20 @@ async fn check_artifact_visibility(
                     "Token does not have access to this repository".to_string(),
                 ));
             }
+            // Per-repo authorization for private repos: admins bypass; every
+            // other caller must hold a role assignment scoped to the repo
+            // (direct or global). NotFound (not Forbidden) avoids leaking the
+            // existence of repositories the caller may not see.
+            if !is_public && !ext.is_admin {
+                let repo_service =
+                    crate::services::repository_service::RepositoryService::new(db.clone());
+                if !repo_service
+                    .user_can_access_repo(repo_id, ext.user_id)
+                    .await?
+                {
+                    return Err(AppError::NotFound("Artifact not found".to_string()));
+                }
+            }
             Ok(())
         }
         None => {

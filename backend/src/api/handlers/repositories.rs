@@ -93,30 +93,70 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
     }
 }
 
+/// Authorize a write/delete operation against a repository.
+///
+/// Enforces both the token-scope check (`require_repo_access`) and, for private
+/// repositories, per-repo authorization: admins bypass; every other caller must
+/// hold a role assignment scoped to the repo (direct or global). Public repos
+/// keep their existing behavior (token-scope only).
+async fn require_repo_write_access(
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    require_repo_access(auth, repo.id)?;
+    if repo.is_public || auth.is_admin {
+        return Ok(());
+    }
+    if repo_service
+        .user_can_access_repo(repo.id, auth.user_id)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "You do not have access to this repository".to_string(),
+        ))
+    }
+}
+
 /// Ensure a repository is visible to the current user.
-/// Public repos are visible to everyone. Private repos require authentication.
-fn require_visible(
+///
+/// Public repos are visible to everyone. Private repos require authentication
+/// AND per-repo authorization: the caller must be an admin or hold a role
+/// assignment scoped to the repository (direct or global). The token-scope
+/// check (`can_access_repo`) is also enforced for repository-scoped API tokens.
+///
+/// Denials on private repos return `NotFound` (not `Forbidden`) to avoid
+/// leaking the existence of repositories the caller may not see.
+async fn require_visible(
     repo: &crate::models::repository::Repository,
     auth: &Option<AuthExtension>,
+    repo_service: &RepositoryService,
 ) -> Result<()> {
     if repo.is_public {
         return Ok(());
     }
+    let not_found = || AppError::NotFound(format!("Repository '{}' not found", repo.key));
     match auth {
         Some(a) => {
-            if a.can_access_repo(repo.id) {
+            // Repository-scoped API tokens must still allow this repo.
+            if !a.can_access_repo(repo.id) {
+                return Err(not_found());
+            }
+            // Per-repo authorization: admins bypass; everyone else needs a
+            // role assignment scoped to this repo (or a global assignment).
+            if a.is_admin
+                || repo_service
+                    .user_can_access_repo(repo.id, a.user_id)
+                    .await?
+            {
                 Ok(())
             } else {
-                Err(AppError::NotFound(format!(
-                    "Repository '{}' not found",
-                    repo.key
-                )))
+                Err(not_found())
             }
         }
-        None => Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            repo.key
-        ))),
+        None => Err(not_found()),
     }
 }
 
@@ -1234,6 +1274,9 @@ pub async fn create_repository(
             // in the payload: when a WASM plugin format was resolved above,
             // `plugin_format_key` carries the canonical handler name.
             format_key: plugin_format_key.or(payload.format_key),
+            // Owner auto-grant: record the creator and grant them per-repo
+            // access so they retain access under per-repo authorization.
+            created_by: Some(auth.user_id),
         })
         .await?;
 
@@ -1325,7 +1368,7 @@ pub async fn get_repository(
 ) -> Result<Json<RepositoryResponse>> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_visible(&repo, &auth)?;
+    require_visible(&repo, &auth, &service).await?;
     let storage_used = service.get_storage_usage(repo.id).await?;
     let auth_type =
         crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
@@ -1902,7 +1945,7 @@ pub async fn list_artifacts(
 
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_visible(&repo, &auth)?;
+    require_visible(&repo, &auth, &repo_service).await?;
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
@@ -3086,7 +3129,7 @@ pub async fn get_artifact_metadata(
 ) -> Result<Response> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_visible(&repo, &auth)?;
+    require_visible(&repo, &auth, &repo_service).await?;
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
@@ -3272,7 +3315,7 @@ pub async fn upload_artifact(
 
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
 
     // Verify declared checksums against actual content before storing anything.
     let declared_sha256 = headers
@@ -3559,7 +3602,7 @@ pub async fn download_artifact(
 ) -> Result<impl IntoResponse> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_visible(&repo, &auth)?;
+    require_visible(&repo, &auth, &repo_service).await?;
 
     // Check quarantine status before serving the artifact.
     // If the artifact is quarantined or rejected, return 409 Conflict.
@@ -3819,7 +3862,7 @@ pub async fn delete_artifact(
     auth.require_scope("delete")?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = state.create_artifact_service(storage);
@@ -7276,23 +7319,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_require_visible_public_no_auth() {
+    // NOTE: `require_visible` is now async and consults the per-repo grant
+    // model (role_assignments) for private repositories, so the cases that
+    // exercise the DB grant lookup (private + authenticated non-admin) are
+    // covered by integration/live verification rather than these pure tests.
+    // The cases below short-circuit BEFORE any DB access (public repos, the
+    // anonymous-on-private denial, and the token-scope mismatch denial) and so
+    // remain DB-free; we drive them with an unused pool handle.
+
+    #[tokio::test]
+    async fn test_require_visible_public_no_auth() {
         let repo = make_repo(true);
-        assert!(require_visible(&repo, &None).is_ok());
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        assert!(require_visible(&repo, &None, &svc).await.is_ok());
     }
 
-    #[test]
-    fn test_require_visible_public_with_auth() {
+    #[tokio::test]
+    async fn test_require_visible_public_with_auth() {
         let repo = make_repo(true);
         let auth = Some(make_auth_ext(None));
-        assert!(require_visible(&repo, &auth).is_ok());
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        assert!(require_visible(&repo, &auth, &svc).await.is_ok());
     }
 
-    #[test]
-    fn test_require_visible_private_no_auth() {
+    #[tokio::test]
+    async fn test_require_visible_private_no_auth() {
         let repo = make_repo(false);
-        let result = require_visible(&repo, &None);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let result = require_visible(&repo, &None, &svc).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
@@ -7300,30 +7354,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_require_visible_private_with_unrestricted_auth() {
-        let repo = make_repo(false);
-        let auth = Some(make_auth_ext(None));
-        assert!(require_visible(&repo, &auth).is_ok());
-    }
-
-    #[test]
-    fn test_require_visible_private_with_allowed_repo() {
-        let repo = make_repo(false);
-        let auth = Some(make_auth_ext(Some(vec![repo.id])));
-        assert!(require_visible(&repo, &auth).is_ok());
-    }
-
-    #[test]
-    fn test_require_visible_private_with_different_repo_restriction() {
+    #[tokio::test]
+    async fn test_require_visible_private_with_different_repo_restriction() {
+        // Token-scope mismatch is rejected before the grant lookup, so this
+        // remains DB-free.
         let repo = make_repo(false);
         let other_repo_id = Uuid::new_v4();
         let auth = Some(make_auth_ext(Some(vec![other_repo_id])));
-        let result = require_visible(&repo, &auth);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let result = require_visible(&repo, &auth, &svc).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
             other => panic!("Expected NotFound error, got: {:?}", other),
+        }
+    }
+
+    /// Admin variant of [`make_auth_ext`]: an authenticated admin with no
+    /// repository-scope restriction. Admins bypass per-repo authorization.
+    fn make_admin_auth_ext() -> AuthExtension {
+        let mut ext = make_auth_ext(None);
+        ext.is_admin = true;
+        ext
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_private_admin_bypasses_grant() {
+        // Admins bypass the per-repo grant lookup, so this short-circuits
+        // before any DB access and remains DB-free.
+        let repo = make_repo(false);
+        let auth = Some(make_admin_auth_ext());
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        assert!(
+            require_visible(&repo, &auth, &svc).await.is_ok(),
+            "admin must see a private repo without an explicit grant"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // require_repo_write_access (authz-private-repo-membership)
+    //
+    // Write/delete authorization on a repository. The public-repo and admin
+    // arms short-circuit before the grant lookup, so they are DB-free. The
+    // private + non-admin grant lookup is covered by
+    // `repository_service::tests::test_user_can_access_repo_private_grant_enforced`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_public_ok() {
+        let repo = make_repo(true);
+        let auth = make_auth_ext(None);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        assert!(
+            require_repo_write_access(&auth, &repo, &svc).await.is_ok(),
+            "any authenticated caller may write to a public repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_admin_ok() {
+        let repo = make_repo(false);
+        let auth = make_admin_auth_ext();
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        assert!(
+            require_repo_write_access(&auth, &repo, &svc).await.is_ok(),
+            "admin may write to a private repo without an explicit grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_token_scope_denied() {
+        // The token-scope check runs first and rejects a repository-scoped
+        // token that does not list this repo, before the grant lookup, so this
+        // remains DB-free.
+        let repo = make_repo(false);
+        let other_repo_id = Uuid::new_v4();
+        let auth = make_auth_ext(Some(vec![other_repo_id]));
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let result = require_repo_write_access(&auth, &repo, &svc).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authorization(msg) => assert!(msg.contains("does not have access")),
+            other => panic!("Expected Authorization error, got: {:?}", other),
         }
     }
 

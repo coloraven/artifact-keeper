@@ -40,6 +40,17 @@ pub async fn try_pool() -> Option<PgPool> {
         .ok()
 }
 
+/// Build a lazily-connecting pool that never actually opens a connection
+/// unless a query is issued. Useful for DB-free unit tests of code paths that
+/// short-circuit before touching the database.
+pub fn lazy_pool() -> PgPool {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://invalid:invalid@127.0.0.1:1/none".to_string());
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy(&url)
+        .expect("lazy pool")
+}
+
 fn cfg(storage_path: &str) -> Config {
     Config {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
@@ -226,7 +237,29 @@ pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
     (status, body)
 }
 
+/// Grant `user_id` the `developer` role scoped to `repo_id`, mirroring the
+/// owner auto-grant that `RepositoryService::create` performs for real
+/// callers. Handler smoke tests authenticate as the fixture user, so without
+/// this grant the per-repo authorization check in `require_visible` /
+/// `require_repo_write_access` would reject them on private repositories.
+pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+         ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .expect("grant developer role");
+}
+
 pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await;
     let _ = sqlx::query(
         "DELETE FROM artifact_metadata WHERE artifact_id IN \
          (SELECT id FROM artifacts WHERE repository_id = $1)",
@@ -368,6 +401,11 @@ impl Fixture {
         let pool = try_pool().await?;
         let (user_id, username) = create_user(&pool).await;
         let (repo_id, repo_key, storage_dir) = create_repo(&pool, repo_type, format).await;
+        // Owner auto-grant: the fixture user is the de-facto owner of the
+        // fixture repo, so grant them per-repo access. This keeps the
+        // authenticated-router smoke tests valid under per-repo authorization
+        // (private repos now require a role assignment, not just a token).
+        grant_repo_access(&pool, repo_id, user_id).await;
         let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
         Some(Self {
             pool,
