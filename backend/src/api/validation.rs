@@ -217,6 +217,33 @@ fn is_blocked_url_in(url: &reqwest::Url, ctx: OutboundUrlContext) -> Option<Bloc
         if is_blocked_ip_in(ip, ctx) {
             return Some(BlockReason::Ip(ip));
         }
+        // An IP literal carries no DNS resolution step, so once the IP
+        // itself is cleared there is nothing more to check.
+        return None;
+    }
+
+    // The host is a DNS name, not an IP literal. The string-based checks
+    // above (BLOCKED_HOSTS) only catch known service names, so an
+    // arbitrary internal container/service name would otherwise sail
+    // through and the server would issue the request. Resolve the
+    // hostname and re-run the private/internal/loopback/link-local checks
+    // against EVERY resolved address; reject if any one of them is
+    // internal. `(host, 0)` performs a getaddrinfo lookup; the port is
+    // irrelevant to the IP classification.
+    //
+    // Residual gap (see module docs): this resolves at validation time,
+    // so a DNS-rebinding attacker who returns a public IP here and a
+    // private IP at fetch time is not caught by this check alone. Pinning
+    // the resolved address into the request (reqwest `resolve_to_addrs`)
+    // is the follow-up that closes the TOCTOU window.
+    use std::net::ToSocketAddrs;
+    if let Ok(addrs) = (host_normalized, 0u16).to_socket_addrs() {
+        for addr in addrs {
+            let ip = addr.ip();
+            if is_blocked_ip_in(ip, ctx) {
+                return Some(BlockReason::Ip(ip));
+            }
+        }
     }
 
     None
@@ -808,6 +835,35 @@ mod tests {
     #[test]
     fn test_rejects_localhost() {
         assert_blocked_host("http://localhost:8080/api");
+    }
+
+    #[test]
+    fn test_rejects_hostname_resolving_to_internal() {
+        // Regression: a hostname that is NOT in BLOCKED_HOSTS but
+        // resolves (getaddrinfo) to an internal/loopback address must be
+        // rejected. Before the resolution step was added, an arbitrary
+        // internal container/service name sailed past the string checks
+        // and the server issued the outbound request (SSRF).
+        //
+        // `localhost.localdomain` is the test vehicle: it is not a
+        // BLOCKED_HOSTS entry (and does not match the `.localhost`
+        // suffix), yet glibc resolves it to loopback. The assertion is
+        // guarded so the test does not flake on resolver setups that
+        // cannot resolve it — but where it does resolve to an internal
+        // IP, blocking is mandatory.
+        use std::net::ToSocketAddrs;
+        let host = "localhost.localdomain";
+        let resolves_internal = (host, 0u16)
+            .to_socket_addrs()
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .any(|a| is_blocked_ip_in(a.ip(), OutboundUrlContext::Upstream))
+            })
+            .unwrap_or(false);
+        if resolves_internal {
+            assert_blocked_ip(&format!("http://{host}/api"));
+        }
     }
 
     #[test]
