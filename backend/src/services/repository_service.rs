@@ -188,19 +188,43 @@ pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
 /// - `User(id)`   -> public repos OR repos the user has a role_assignment for.
 /// - `Ids(ids)`   -> only repos whose id is in `ids` (repo-scoped token).
 pub(crate) fn build_visibility_clause(visibility: &RepoVisibility) -> (String, VisibilityBind) {
+    // Canonical instantiation for repository listing: the `repositories` table
+    // is referenced unaliased and the visibility parameter is bound at `$3`.
+    build_visibility_clause_for(visibility, "repositories", 3)
+}
+
+/// Alias- and parameter-index-aware variant of [`build_visibility_clause`].
+///
+/// Produces the same per-user grant predicate but lets the caller control:
+/// - `table_alias`: the alias under which the `repositories` table is referenced
+///   (e.g. `r` when the table is joined into a packages query); only the `.id`
+///   references in the `User`/`Ids` arms are qualified, since `is_public` is
+///   unique to `repositories` and resolves unambiguously even in a join.
+/// - `user_param`: the positional bind index (`$N`) for the `user_id`/`ids`
+///   value, so the generated `$N` lines up with the caller's `.bind()` order
+///   (this differs per query).
+///
+/// [`build_visibility_clause`] is the canonical `("repositories", $3)`
+/// instantiation used by repository listing.
+pub(crate) fn build_visibility_clause_for(
+    visibility: &RepoVisibility,
+    table_alias: &str,
+    user_param: usize,
+) -> (String, VisibilityBind) {
     match visibility {
         RepoVisibility::PublicOnly => ("is_public = true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::All => ("true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::User(user_id) => {
-            let clause = r#"(
+            let clause = format!(
+                r#"(
                 is_public = true
                 OR EXISTS (
                     SELECT 1 FROM role_assignments ra
-                    WHERE ra.user_id = $3
-                      AND (ra.repository_id = repositories.id OR ra.repository_id IS NULL)
+                    WHERE ra.user_id = ${user_param}
+                      AND (ra.repository_id = {table_alias}.id OR ra.repository_id IS NULL)
                 )
             )"#
-            .to_string();
+            );
             (clause, VisibilityBind::User(Some(*user_id)))
         }
         RepoVisibility::Ids(ids) => {
@@ -208,7 +232,7 @@ pub(crate) fn build_visibility_clause(visibility: &RepoVisibility) -> (String, V
             // match no rows (not "all rows") — `id = ANY('{}')` is correctly
             // false for every row in Postgres.
             (
-                "repositories.id = ANY($3)".to_string(),
+                format!("{table_alias}.id = ANY(${user_param})"),
                 VisibilityBind::Ids(ids.clone()),
             )
         }
@@ -1985,6 +2009,64 @@ mod tests {
         assert!(clause.contains("ra.repository_id = repositories.id"));
         // Global assignment (repository_id IS NULL)
         assert!(clause.contains("ra.repository_id IS NULL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_visibility_clause_for tests (alias + param-index aware variant)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_visibility_for_delegates_match_canonical_wrapper() {
+        // The wrapper must be an exact ("repositories", 3) instantiation of the
+        // variant, so the two agree for every arm.
+        let uid = Uuid::new_v4();
+        for v in [
+            RepoVisibility::PublicOnly,
+            RepoVisibility::All,
+            RepoVisibility::User(uid),
+            RepoVisibility::Ids(vec![Uuid::new_v4()]),
+        ] {
+            assert_eq!(
+                build_visibility_clause(&v),
+                build_visibility_clause_for(&v, "repositories", 3)
+            );
+        }
+    }
+
+    #[test]
+    fn test_visibility_for_applies_alias_and_param_index() {
+        let uid = Uuid::new_v4();
+        let (clause, bind) = build_visibility_clause_for(&RepoVisibility::User(uid), "r", 6);
+        // Alias is applied to the `.id` reference in the EXISTS subquery.
+        assert!(clause.contains("ra.repository_id = r.id"));
+        assert!(!clause.contains("repositories.id"));
+        // Global assignments still honoured.
+        assert!(clause.contains("ra.repository_id IS NULL"));
+        // user_id bound at the requested positional index.
+        assert!(clause.contains("ra.user_id = $6"));
+        assert!(!clause.contains("$3"));
+        // is_public stays unqualified (unique to repositories, unambiguous in a join).
+        assert!(clause.contains("is_public = true"));
+        assert_eq!(bind, VisibilityBind::User(Some(uid)));
+    }
+
+    #[test]
+    fn test_visibility_for_public_only_and_all_ignore_alias_and_param() {
+        let (clause, bind) = build_visibility_clause_for(&RepoVisibility::PublicOnly, "r", 6);
+        assert_eq!(clause, "is_public = true");
+        assert_eq!(bind, VisibilityBind::User(None));
+
+        let (clause, bind) = build_visibility_clause_for(&RepoVisibility::All, "r", 6);
+        assert_eq!(clause, "true");
+        assert_eq!(bind, VisibilityBind::User(None));
+    }
+
+    #[test]
+    fn test_visibility_for_ids_uses_alias_and_param_index() {
+        let a = Uuid::new_v4();
+        let (clause, bind) = build_visibility_clause_for(&RepoVisibility::Ids(vec![a]), "r", 2);
+        assert_eq!(clause, "r.id = ANY($2)");
+        assert_eq!(bind, VisibilityBind::Ids(vec![a]));
     }
 
     #[test]

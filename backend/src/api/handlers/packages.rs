@@ -15,6 +15,36 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::curation_service::version_compare;
+use crate::services::repository_service::{
+    build_visibility_clause_for, RepoVisibility, VisibilityBind,
+};
+
+/// Map an optional authenticated principal to the repository visibility scope
+/// used to filter package listings. Mirrors `list_repositories` so that the
+/// packages endpoints enforce the same per-user authorization model
+/// (public repos plus any repo the user holds a role assignment for) instead
+/// of treating every authenticated caller as entitled to all packages.
+fn repo_visibility_for(auth: Option<&AuthExtension>) -> RepoVisibility {
+    match auth {
+        None => RepoVisibility::PublicOnly,
+        Some(a) if a.is_admin => RepoVisibility::All,
+        // Repo-scoped token: restrict strictly to the token's allowed set.
+        Some(a) if a.allowed_repo_ids.is_some() => {
+            RepoVisibility::Ids(a.allowed_repo_ids.clone().unwrap_or_default())
+        }
+        Some(a) => RepoVisibility::User(a.user_id),
+    }
+}
+
+/// Split a [`VisibilityBind`] into the two concrete shapes its parameter can
+/// take (single `user_id` uuid vs `uuid[]`). Exactly one is `Some` per call;
+/// the unused one binds as a typed NULL the clause never references.
+fn split_visibility_bind(bind: VisibilityBind) -> (Option<Uuid>, Option<Vec<Uuid>>) {
+    match bind {
+        VisibilityBind::User(uid) => (uid, None),
+        VisibilityBind::Ids(ids) => (None, Some(ids)),
+    }
+}
 
 /// Check if the packages table exists in the database.
 async fn packages_table_exists(db: &sqlx::PgPool) -> bool {
@@ -118,7 +148,7 @@ pub async fn list_packages(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListPackagesQuery>,
 ) -> Result<Json<PackageListResponse>> {
-    let public_only = auth.is_none();
+    let visibility = repo_visibility_for(auth.as_ref());
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(24).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -139,7 +169,16 @@ pub async fn list_packages(
         }));
     }
 
-    let packages: Vec<PackageRow> = sqlx::query_as(
+    // Per-user repository visibility. The page query binds the visibility
+    // parameter at $6 (after repository_key/format/search/offset/limit); the
+    // count query binds it at $4 (after repository_key/format/search). The
+    // generated `$N` MUST line up with the `.bind()` order below.
+    let (page_clause, page_bind) = build_visibility_clause_for(&visibility, "r", 6);
+    let (count_clause, count_bind) = build_visibility_clause_for(&visibility, "r", 4);
+    let (page_user_id, page_ids) = split_visibility_bind(page_bind);
+    let (count_user_id, count_ids) = split_visibility_bind(count_bind);
+
+    let page_sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
                p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
@@ -149,23 +188,29 @@ pub async fn list_packages(
         WHERE ($1::text IS NULL OR r.key = $1)
           AND ($2::text IS NULL OR r.format::text = $2)
           AND ($3::text IS NULL OR p.name ILIKE $3)
-          AND ($6::bool = false OR r.is_public = true)
+          AND ({page_clause})
         ORDER BY p.updated_at DESC
         OFFSET $4
         LIMIT $5
-        "#,
-    )
-    .bind(&query.repository_key)
-    .bind(&query.format)
-    .bind(&search_pattern)
-    .bind(offset)
-    .bind(per_page as i64)
-    .bind(public_only)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+        "#
+    );
+    let page_query = sqlx::query_as::<_, PackageRow>(&page_sql)
+        .bind(&query.repository_key)
+        .bind(&query.format)
+        .bind(&search_pattern)
+        .bind(offset)
+        .bind(per_page as i64);
+    // $6 shape depends on the visibility variant (single uuid vs uuid[]).
+    let page_query = match &page_ids {
+        Some(ids) => page_query.bind(ids.clone()),
+        None => page_query.bind(page_user_id),
+    };
+    let packages: Vec<PackageRow> = page_query
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total: i64 = sqlx::query_scalar(
+    let count_sql = format!(
         r#"
         SELECT COUNT(*)
         FROM packages p
@@ -173,16 +218,19 @@ pub async fn list_packages(
         WHERE ($1::text IS NULL OR r.key = $1)
           AND ($2::text IS NULL OR r.format::text = $2)
           AND ($3::text IS NULL OR p.name ILIKE $3)
-          AND ($4::bool = false OR r.is_public = true)
-        "#,
-    )
-    .bind(&query.repository_key)
-    .bind(&query.format)
-    .bind(&search_pattern)
-    .bind(public_only)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+          AND ({count_clause})
+        "#
+    );
+    let count_query = sqlx::query_scalar::<_, i64>(&count_sql)
+        .bind(&query.repository_key)
+        .bind(&query.format)
+        .bind(&search_pattern);
+    // $4 shape depends on the visibility variant (single uuid vs uuid[]).
+    let count_query = match &count_ids {
+        Some(ids) => count_query.bind(ids.clone()),
+        None => count_query.bind(count_user_id),
+    };
+    let total: i64 = count_query.fetch_one(&state.db).await.unwrap_or(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -218,7 +266,7 @@ pub async fn get_package(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PackageResponse>> {
-    let public_only = auth.is_none();
+    let visibility = repo_visibility_for(auth.as_ref());
 
     let table_exists = packages_table_exists(&state.db).await;
 
@@ -226,7 +274,11 @@ pub async fn get_package(
         return Err(AppError::NotFound("Package not found".to_string()));
     }
 
-    let package: PackageRow = sqlx::query_as(
+    // The visibility parameter is bound at $2 (after the package id at $1).
+    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 2);
+    let (user_id, ids) = split_visibility_bind(bind);
+
+    let sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
                p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
@@ -234,15 +286,20 @@ pub async fn get_package(
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
         WHERE p.id = $1
-          AND ($2::bool = false OR r.is_public = true)
-        "#,
-    )
-    .bind(id)
-    .bind(public_only)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
+          AND ({clause})
+        "#
+    );
+    let query = sqlx::query_as::<_, PackageRow>(&sql).bind(id);
+    // $2 shape depends on the visibility variant (single uuid vs uuid[]).
+    let query = match &ids {
+        Some(ids) => query.bind(ids.clone()),
+        None => query.bind(user_id),
+    };
+    let package: PackageRow = query
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
 
     Ok(Json(PackageResponse::from(package)))
 }
@@ -303,7 +360,7 @@ pub async fn get_package_versions(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PackageVersionsResponse>> {
-    let public_only = auth.is_none();
+    let visibility = repo_visibility_for(auth.as_ref());
 
     let table_exists = packages_table_exists(&state.db).await;
 
@@ -311,22 +368,28 @@ pub async fn get_package_versions(
         return Err(AppError::NotFound("Package not found".to_string()));
     }
 
-    // Verify the package exists and belongs to a visible repository
-    let package_exists: bool = sqlx::query_scalar(
+    // Verify the package exists and belongs to a repository visible to the
+    // caller. The visibility parameter is bound at $2 (after the id at $1).
+    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 2);
+    let (user_id, ids) = split_visibility_bind(bind);
+
+    let exists_sql = format!(
         r#"
         SELECT EXISTS(
             SELECT 1 FROM packages p
             JOIN repositories r ON r.id = p.repository_id
             WHERE p.id = $1
-              AND ($2::bool = false OR r.is_public = true)
+              AND ({clause})
         )
-        "#,
-    )
-    .bind(id)
-    .bind(public_only)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(false);
+        "#
+    );
+    let exists_query = sqlx::query_scalar::<_, bool>(&exists_sql).bind(id);
+    // $2 shape depends on the visibility variant (single uuid vs uuid[]).
+    let exists_query = match &ids {
+        Some(ids) => exists_query.bind(ids.clone()),
+        None => exists_query.bind(user_id),
+    };
+    let package_exists: bool = exists_query.fetch_one(&state.db).await.unwrap_or(false);
 
     if !package_exists {
         return Err(AppError::NotFound("Package not found".to_string()));
@@ -405,6 +468,76 @@ mod tests {
             updated_at: now,
             metadata: Some(serde_json::json!({"license": "MIT"})),
         }
+    }
+
+    fn make_auth(user_id: Uuid, is_admin: bool, allowed: Option<Vec<Uuid>>) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: "tester".to_string(),
+            email: "tester@example.com".to_string(),
+            is_admin,
+            is_api_token: allowed.is_some(),
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: allowed,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // repo_visibility_for: per-user authorization mapping (mirrors list_repositories)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_visibility_anonymous_is_public_only() {
+        assert_eq!(repo_visibility_for(None), RepoVisibility::PublicOnly);
+    }
+
+    #[test]
+    fn test_visibility_admin_is_all() {
+        let auth = make_auth(Uuid::new_v4(), true, None);
+        assert_eq!(repo_visibility_for(Some(&auth)), RepoVisibility::All);
+    }
+
+    #[test]
+    fn test_visibility_authenticated_non_admin_is_user_scope() {
+        let uid = Uuid::new_v4();
+        let auth = make_auth(uid, false, None);
+        assert_eq!(repo_visibility_for(Some(&auth)), RepoVisibility::User(uid));
+    }
+
+    #[test]
+    fn test_visibility_scoped_token_is_ids() {
+        let repo = Uuid::new_v4();
+        let auth = make_auth(Uuid::new_v4(), false, Some(vec![repo]));
+        assert_eq!(
+            repo_visibility_for(Some(&auth)),
+            RepoVisibility::Ids(vec![repo])
+        );
+    }
+
+    #[test]
+    fn test_visibility_admin_scoped_token_still_all() {
+        // Admin bypasses scope restrictions, matching list_repositories.
+        let auth = make_auth(Uuid::new_v4(), true, Some(vec![Uuid::new_v4()]));
+        assert_eq!(repo_visibility_for(Some(&auth)), RepoVisibility::All);
+    }
+
+    #[test]
+    fn test_split_visibility_bind_user_and_ids() {
+        let uid = Uuid::new_v4();
+        assert_eq!(
+            split_visibility_bind(VisibilityBind::User(Some(uid))),
+            (Some(uid), None)
+        );
+        assert_eq!(
+            split_visibility_bind(VisibilityBind::User(None)),
+            (None, None)
+        );
+        let a = Uuid::new_v4();
+        assert_eq!(
+            split_visibility_bind(VisibilityBind::Ids(vec![a])),
+            (None, Some(vec![a]))
+        );
     }
 
     fn make_version_row() -> PackageVersionRow {
@@ -693,5 +826,159 @@ mod tests {
         assert_eq!(json["pagination"]["page"], 1);
         assert_eq!(json["pagination"]["per_page"], 24);
         assert_eq!(json["pagination"]["total"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed visibility tests: the listing/detail/versions endpoints must
+    // enforce per-user repository visibility (skip cleanly without
+    // DATABASE_URL, same as the other handler suites).
+    // -----------------------------------------------------------------------
+    mod visibility_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        /// Insert a minimal `packages` row in `repo_id` and return its id.
+        async fn seed_package(pool: &sqlx::PgPool, repo_id: Uuid) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO packages (repository_id, name, version, size_bytes) \
+                 VALUES ($1, 'vis-test-pkg', '1.0.0', 1) RETURNING id",
+            )
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("seed package")
+        }
+
+        async fn set_repo_public(pool: &sqlx::PgPool, repo_id: Uuid) {
+            sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await
+                .expect("set is_public");
+        }
+
+        /// Build the packages router with `auth` injected (None = anonymous).
+        fn app_for(f: &tdh::Fixture, auth: Option<AuthExtension>) -> axum::Router {
+            match auth {
+                Some(a) => tdh::router_with_auth(router(), f.state.clone(), a),
+                None => f.router_anon(router()),
+            }
+        }
+
+        /// How many packages of the fixture repo the caller can see in the
+        /// listing (filtered by repository_key so parallel tests don't leak in).
+        async fn visible_total(f: &tdh::Fixture, auth: Option<AuthExtension>) -> i64 {
+            let (status, body) = tdh::send(
+                app_for(f, auth),
+                tdh::get(format!("/?repository_key={}", f.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+            json["pagination"]["total"].as_i64().expect("total")
+        }
+
+        /// Status the caller gets for a packages-router GET (detail/versions).
+        async fn status_of(
+            f: &tdh::Fixture,
+            auth: Option<AuthExtension>,
+            path: String,
+        ) -> StatusCode {
+            let (status, _) = tdh::send(app_for(f, auth), tdh::get(path)).await;
+            status
+        }
+
+        #[tokio::test]
+        async fn test_private_repo_packages_hidden_without_access() {
+            // create_repo leaves is_public at its default (false): private.
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            let pkg = seed_package(&f.pool, f.repo_id).await;
+            // A user with no role assignment on the repo.
+            let outsider = || Some(make_auth(Uuid::new_v4(), false, None));
+
+            assert_eq!(visible_total(&f, None).await, 0);
+            assert_eq!(visible_total(&f, outsider()).await, 0);
+            assert_eq!(
+                status_of(&f, None, format!("/{pkg}")).await,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                status_of(&f, outsider(), format!("/{pkg}")).await,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                status_of(&f, outsider(), format!("/{pkg}/versions")).await,
+                StatusCode::NOT_FOUND
+            );
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn test_private_repo_packages_visible_with_grant_or_admin() {
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            let pkg = seed_package(&f.pool, f.repo_id).await;
+            // Fixture::setup grants the fixture user a repo-scoped role.
+            let granted = || Some(make_auth(f.user_id, false, None));
+            let admin = || Some(make_auth(Uuid::new_v4(), true, None));
+
+            assert_eq!(visible_total(&f, granted()).await, 1);
+            assert_eq!(visible_total(&f, admin()).await, 1);
+            assert_eq!(
+                status_of(&f, granted(), format!("/{pkg}")).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                status_of(&f, admin(), format!("/{pkg}")).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                status_of(&f, granted(), format!("/{pkg}/versions")).await,
+                StatusCode::OK
+            );
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn test_public_repo_packages_visible_to_anonymous() {
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            let pkg = seed_package(&f.pool, f.repo_id).await;
+            set_repo_public(&f.pool, f.repo_id).await;
+
+            assert_eq!(visible_total(&f, None).await, 1);
+            assert_eq!(status_of(&f, None, format!("/{pkg}")).await, StatusCode::OK);
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn test_repo_scoped_token_limited_to_allowed_repos() {
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            let pkg = seed_package(&f.pool, f.repo_id).await;
+            let scoped_to = |ids: Vec<Uuid>| Some(make_auth(f.user_id, false, Some(ids)));
+
+            // Token scoped to a different repository: nothing visible, even
+            // though the underlying user holds a grant on the fixture repo.
+            assert_eq!(visible_total(&f, scoped_to(vec![Uuid::new_v4()])).await, 0);
+            assert_eq!(
+                status_of(&f, scoped_to(vec![Uuid::new_v4()]), format!("/{pkg}")).await,
+                StatusCode::NOT_FOUND
+            );
+
+            // Token scoped to the fixture repository: visible.
+            assert_eq!(visible_total(&f, scoped_to(vec![f.repo_id])).await, 1);
+            assert_eq!(
+                status_of(&f, scoped_to(vec![f.repo_id]), format!("/{pkg}")).await,
+                StatusCode::OK
+            );
+            f.teardown().await;
+        }
     }
 }
