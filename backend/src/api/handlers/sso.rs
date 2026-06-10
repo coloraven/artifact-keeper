@@ -16,6 +16,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::auth::set_auth_cookies;
+use crate::api::validation::validate_outbound_url;
 
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -37,6 +38,16 @@ pub fn router() -> Router<SharedState> {
         .route("/saml/:id/login", get(saml_login))
         .route("/saml/:id/acs", post(saml_acs))
         .route("/exchange", post(exchange_code))
+}
+
+/// Re-validate an OIDC endpoint URL against the shared outbound-URL SSRF
+/// guard immediately before the server fetches it as a first hop. The
+/// shared HTTP client's redirect policy only guards redirect hops, never
+/// the initial request, so each server-side fetch target (discovery,
+/// token, JWKS) is checked here. Uses the `Upstream` context, so internal
+/// IdPs are reachable when `UPSTREAM_ALLOW_PRIVATE_IPS` is set.
+fn validate_oidc_fetch_url(url: &str, label: &str) -> Result<()> {
+    validate_outbound_url(url, label)
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +120,7 @@ pub async fn oidc_login(
         "{}/.well-known/openid-configuration",
         row.issuer_url.trim_end_matches('/')
     );
+    validate_oidc_fetch_url(&discovery_url, "OIDC discovery URL")?;
 
     let http_client = crate::services::http_client::default_client();
     let discovery: serde_json::Value = http_client
@@ -347,6 +359,7 @@ async fn oidc_callback_inner(
         "{}/.well-known/openid-configuration",
         row.issuer_url.trim_end_matches('/')
     );
+    validate_oidc_fetch_url(&discovery_url, "OIDC discovery URL")?;
 
     let http_client = crate::services::http_client::default_client();
     let discovery: serde_json::Value = http_client
@@ -361,6 +374,7 @@ async fn oidc_callback_inner(
     let token_endpoint = discovery["token_endpoint"]
         .as_str()
         .ok_or_else(|| AppError::Internal("OIDC discovery missing token_endpoint".into()))?;
+    validate_oidc_fetch_url(token_endpoint, "OIDC token endpoint")?;
 
     // 3. Build redirect_uri (must match the one used in the login request)
     let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id, &headers);
@@ -1062,6 +1076,7 @@ async fn validate_id_token(
     let jwks_uri = discovery["jwks_uri"]
         .as_str()
         .ok_or_else(|| AppError::Internal("OIDC discovery missing jwks_uri".into()))?;
+    validate_oidc_fetch_url(jwks_uri, "OIDC JWKS URI")?;
 
     let jwks: serde_json::Value = http_client
         .get(jwks_uri)
@@ -1156,6 +1171,35 @@ mod tests {
         let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
         let signature = URL_SAFE_NO_PAD.encode(b"fake_signature");
         format!("{}.{}.{}", header, payload_b64, signature)
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_oidc_fetch_url (SSRF guard before each server-side first hop)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_oidc_fetch_url_rejects_internal() {
+        // Loopback and cloud-metadata targets must be rejected before the
+        // server issues the discovery/token/jwks fetch.
+        assert!(validate_oidc_fetch_url(
+            "http://127.0.0.1/.well-known/openid-configuration",
+            "OIDC discovery URL"
+        )
+        .is_err());
+        assert!(validate_oidc_fetch_url(
+            "http://169.254.169.254/latest/meta-data",
+            "OIDC token endpoint"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_validate_oidc_fetch_url_accepts_public() {
+        assert!(validate_oidc_fetch_url(
+            "https://idp.example.com/.well-known/openid-configuration",
+            "OIDC discovery URL"
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------

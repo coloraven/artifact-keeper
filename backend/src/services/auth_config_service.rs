@@ -10,8 +10,17 @@ use sqlx::{FromRow, PgPool};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::api::validation::validate_outbound_url;
 use crate::error::{AppError, Result};
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
+
+/// Validate an OIDC `issuer_url` against the shared outbound-URL SSRF guard
+/// before it is persisted. Mirrors the upstream-URL validation in
+/// `repository_service` so the SSO surface enforces the same policy
+/// (honors `UPSTREAM_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS`).
+fn validate_oidc_issuer(url: &str) -> Result<()> {
+    validate_outbound_url(url, "OIDC issuer URL")
+}
 
 // ---------------------------------------------------------------------------
 // Row structs (mapped directly from database columns)
@@ -501,6 +510,7 @@ impl AuthConfigService {
         pool: &PgPool,
         req: CreateOidcConfigRequest,
     ) -> Result<OidcConfigResponse> {
+        validate_oidc_issuer(&req.issuer_url)?;
         let id = Uuid::new_v4();
         let encrypted = encrypt_credentials(&req.client_secret, &encryption_key());
         let encrypted_hex = hex::encode(&encrypted);
@@ -570,6 +580,7 @@ impl AuthConfigService {
 
         let name = req.name.unwrap_or(existing.name);
         let issuer_url = req.issuer_url.unwrap_or(existing.issuer_url);
+        validate_oidc_issuer(&issuer_url)?;
         let client_id = req.client_id.unwrap_or(existing.client_id);
         let scopes = req.scopes.unwrap_or(existing.scopes);
         // Issue #1191: deep-merge attribute_mapping by default. Callers that
@@ -1654,6 +1665,28 @@ mod tests {
     use serde_json::json;
     #[allow(unused_imports)]
     use uuid::Uuid;
+
+    // -----------------------------------------------------------------------
+    // validate_oidc_issuer() tests (SSRF guard at the config trust boundary)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_oidc_issuer_rejects_metadata_and_internal() {
+        // Cloud metadata, loopback, and a private-IP host must all be
+        // rejected by the shared outbound-URL SSRF guard (IP literals are
+        // classified without DNS, so these are deterministic).
+        assert!(validate_oidc_issuer("http://169.254.169.254/latest/meta-data").is_err());
+        assert!(validate_oidc_issuer("http://127.0.0.1:8080/api/v1/admin/metrics").is_err());
+        assert!(validate_oidc_issuer("http://172.19.0.1:9999/oidc").is_err());
+        // `localhost` is an internal service name in BLOCKED_HOSTS, so it is
+        // rejected regardless of DNS resolution on the test host.
+        assert!(validate_oidc_issuer("http://localhost:5432/").is_err());
+    }
+
+    #[test]
+    fn test_validate_oidc_issuer_accepts_public_idp() {
+        assert!(validate_oidc_issuer("https://idp.example.com").is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // encryption_key() tests
