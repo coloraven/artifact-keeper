@@ -1398,7 +1398,6 @@ pub async fn fetch_virtual_members(
             r.storage_backend, r.storage_path, r.upstream_url,
             r.is_public, r.quota_bytes, r.promotion_only,
             r.replication_priority as "replication_priority: ReplicationPriority",
-            r.promotion_target_id, r.promotion_policy_id,
             r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
             r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
             r.created_at, r.updated_at
@@ -2855,8 +2854,6 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
         quota_bytes: None,
         promotion_only: false,
         replication_priority: ReplicationPriority::OnDemand,
-        promotion_target_id: None,
-        promotion_policy_id: None,
         curation_enabled: false,
         curation_source_repo_id: None,
         curation_target_repo_id: None,
@@ -3383,8 +3380,6 @@ mod tests {
         assert!(!repo.is_public);
         assert!(repo.quota_bytes.is_none());
         assert_eq!(repo.replication_priority, ReplicationPriority::OnDemand);
-        assert!(repo.promotion_target_id.is_none());
-        assert!(repo.promotion_policy_id.is_none());
     }
 
     #[test]
@@ -5827,8 +5822,6 @@ mod tests {
             quota_bytes: None,
             promotion_only: false,
             replication_priority: ReplicationPriority::OnDemand,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,

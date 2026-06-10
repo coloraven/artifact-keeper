@@ -7445,8 +7445,6 @@ mod tests {
             quota_bytes: Some(1073741824),
             promotion_only: false,
             replication_priority: ReplicationPriority::Immediate,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,
@@ -7524,8 +7522,6 @@ mod tests {
             quota_bytes: None,
             promotion_only: false,
             replication_priority: ReplicationPriority::OnDemand,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,
@@ -7568,8 +7564,6 @@ mod tests {
             quota_bytes: None,
             promotion_only: false,
             replication_priority: ReplicationPriority::LocalOnly,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,
@@ -7587,12 +7581,10 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_to_response_staging_with_promotion() {
+    fn test_repo_to_response_staging() {
         use crate::models::repository::{ReplicationPriority, Repository};
 
         let now = chrono::Utc::now();
-        let target_id = Uuid::new_v4();
-        let policy_id = Uuid::new_v4();
         let repo = Repository {
             id: Uuid::new_v4(),
             key: "cargo-staging".to_string(),
@@ -7607,8 +7599,6 @@ mod tests {
             quota_bytes: Some(5_000_000_000),
             promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
-            promotion_target_id: Some(target_id),
-            promotion_policy_id: Some(policy_id),
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,
@@ -7721,8 +7711,6 @@ mod tests {
             quota_bytes: None,
             promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,
@@ -8054,8 +8042,6 @@ mod tests {
             quota_bytes: None,
             promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,

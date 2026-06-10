@@ -560,7 +560,6 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
-                promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 created_at, updated_at
@@ -700,7 +699,6 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
-                promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 created_at, updated_at
@@ -729,7 +727,6 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
-                promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 created_at, updated_at
@@ -781,7 +778,6 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes, promotion_only,
                 replication_priority,
-                promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 created_at, updated_at
@@ -868,7 +864,6 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
-                promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 created_at, updated_at
@@ -1231,7 +1226,6 @@ impl RepositoryService {
                 r.storage_backend, r.storage_path, r.upstream_url,
                 r.is_public, r.quota_bytes, r.promotion_only,
                 r.replication_priority as "replication_priority: ReplicationPriority",
-                r.promotion_target_id, r.promotion_policy_id,
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
                 r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
                 r.created_at, r.updated_at
@@ -1361,8 +1355,6 @@ mod tests {
             quota_bytes: Some(1024 * 1024 * 1024),
             promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,
@@ -1430,8 +1422,6 @@ mod tests {
             quota_bytes: None,
             promotion_only: false,
             replication_priority: ReplicationPriority::LocalOnly,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,

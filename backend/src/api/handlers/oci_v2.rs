@@ -10536,8 +10536,6 @@ mod tests {
             quota_bytes: None,
             promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
-            promotion_target_id: None,
-            promotion_policy_id: None,
             curation_enabled: false,
             curation_source_repo_id: None,
             curation_target_repo_id: None,

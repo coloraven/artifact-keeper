@@ -157,10 +157,6 @@ pub struct Repository {
     /// approval). Defaults to false (no behavior change for existing repos).
     pub promotion_only: bool,
     pub replication_priority: ReplicationPriority,
-    /// For staging repos: default release repo to promote artifacts to
-    pub promotion_target_id: Option<Uuid>,
-    /// For staging repos: security policy to evaluate before promotion
-    pub promotion_policy_id: Option<Uuid>,
     /// Curation: enable upstream package vetting for this staging repo
     pub curation_enabled: bool,
     /// Curation: the remote repo to sync upstream metadata from
