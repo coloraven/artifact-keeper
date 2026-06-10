@@ -480,14 +480,19 @@ pub async fn auth_middleware(
                 }
                 Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
                     Ok(ext) => Ok((ext, None)),
-                    Err(_) => Err("Invalid or expired token"),
+                    // Same transient bcrypt-capacity shed as the Basic branch
+                    // below: a saturated cap is "retry shortly", not "wrong
+                    // token". See `TokenAuthError::Overloaded`.
+                    Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
+                    Err(TokenAuthError::Invalid) => Err("Invalid or expired token"),
                 },
             }
         }
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
                 Ok(ext) => Ok((ext, None)),
-                Err(_) => Err("Invalid or expired API token"),
+                Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
+                Err(TokenAuthError::Invalid) => Err("Invalid or expired API token"),
             }
         }
         ExtractedToken::Basic(encoded) => match decode_basic_credentials(encoded) {
@@ -596,15 +601,48 @@ pub async fn auth_middleware(
     (StatusCode::UNAUTHORIZED, message).into_response()
 }
 
+/// Why an API-token validation attempt did not produce an [`AuthExtension`].
+///
+/// Two outcomes matter to the middleware: the token is genuinely bad
+/// (unknown, expired, revoked, deactivated owner — answer with 401), or
+/// validation could not be completed because the process-wide bcrypt
+/// concurrency cap is saturated (`AppError::ServiceUnavailable` from
+/// `auth_service::acquire_auth_permit_for_bcrypt` — answer with a retryable
+/// 503, exactly like the username/password branch). Flattening both into a
+/// unit error is what made cargo/twine API-token clients receive a spurious
+/// 401 under a concurrent burst; they retry on 503 but abort on 401.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenAuthError {
+    /// The credential failed validation; the caller owes the client a 401.
+    Invalid,
+    /// The bcrypt-bound auth-concurrency cap is saturated; the caller must
+    /// surface a retryable 503 (see [`service_unavailable_response`]), never
+    /// a 401.
+    Overloaded,
+}
+
+/// Classify a `validate_api_token` error into the two outcomes the
+/// middleware distinguishes. Only the transient bcrypt-capacity shed
+/// (`AppError::ServiceUnavailable`) maps to [`TokenAuthError::Overloaded`];
+/// everything else (authentication, unauthorized, database, internal) is a
+/// genuine validation failure and stays [`TokenAuthError::Invalid`] so the
+/// existing 401 behaviour is preserved.
+fn classify_token_validation_err(err: AppError) -> TokenAuthError {
+    match err {
+        AppError::ServiceUnavailable(_) => TokenAuthError::Overloaded,
+        _ => TokenAuthError::Invalid,
+    }
+}
+
 /// Validate an API token and create an AuthExtension with scopes and repo restrictions.
 async fn validate_api_token_with_scopes(
     auth_service: &AuthService,
     token: &str,
-) -> Result<AuthExtension, ()> {
+) -> Result<AuthExtension, TokenAuthError> {
     let validation = auth_service
         .validate_api_token(token)
         .await
-        .map_err(|_| ())?;
+        .map_err(classify_token_validation_err)?;
 
     Ok(AuthExtension {
         user_id: validation.user.id,
@@ -706,8 +744,12 @@ pub(crate) async fn try_resolve_auth_outcome(
             if let Ok(claims) = auth_service.validate_access_token_async(token).await {
                 return AuthOutcome::Resolved(AuthExtension::from(claims));
             }
-            if let Ok(ext) = validate_api_token_with_scopes(auth_service, token).await {
-                return AuthOutcome::Resolved(ext);
+            match validate_api_token_with_scopes(auth_service, token).await {
+                Ok(ext) => return AuthOutcome::Resolved(ext),
+                // A transient bcrypt-capacity shed must surface as 503, not
+                // 401. See `AuthOutcome::Overloaded`.
+                Err(TokenAuthError::Overloaded) => return AuthOutcome::Overloaded,
+                Err(TokenAuthError::Invalid) => {}
             }
             // Some package managers (npm, cargo, goproxy) send Bearer tokens
             // that are base64-encoded `username:password` rather than JWTs or
@@ -726,7 +768,10 @@ pub(crate) async fn try_resolve_auth_outcome(
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(auth_service, token).await {
                 Ok(ext) => AuthOutcome::Resolved(ext),
-                Err(()) => AuthOutcome::InvalidCredential,
+                // See `AuthOutcome::Overloaded`: saturated bcrypt cap is a
+                // retryable 503, never a 401.
+                Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
+                Err(TokenAuthError::Invalid) => AuthOutcome::InvalidCredential,
             }
         }
         ExtractedToken::Basic(encoded) => {
@@ -748,7 +793,12 @@ pub(crate) async fn try_resolve_auth_outcome(
             // pip netrc / Artifactory-style `token:<api_token>` credential format
             match validate_api_token_with_scopes(auth_service, &password).await {
                 Ok(ext) => AuthOutcome::Resolved(ext),
-                Err(()) => AuthOutcome::InvalidCredential,
+                // The token fallback also burns a bcrypt verify under the
+                // same process-wide cap; preserve the shed as Overloaded so
+                // pip-netrc-style `token:<api_token>` clients get the
+                // retryable 503, not a spurious 401.
+                Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
+                Err(TokenAuthError::Invalid) => AuthOutcome::InvalidCredential,
             }
         }
         ExtractedToken::None => AuthOutcome::NoCredential,
@@ -1057,7 +1107,10 @@ pub async fn admin_middleware(
                 Ok(claims) => AuthExtension::from(claims),
                 Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
                     Ok(ext) => ext,
-                    Err(_) => {
+                    // A saturated bcrypt cap is a retryable 503, never a 401.
+                    // See `TokenAuthError::Overloaded`.
+                    Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
+                    Err(TokenAuthError::Invalid) => {
                         return (StatusCode::UNAUTHORIZED, "Invalid or expired token")
                             .into_response()
                     }
@@ -1067,7 +1120,8 @@ pub async fn admin_middleware(
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
                 Ok(ext) => ext,
-                Err(_) => {
+                Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
+                Err(TokenAuthError::Invalid) => {
                     return (StatusCode::UNAUTHORIZED, "Invalid or expired API token")
                         .into_response()
                 }
@@ -3573,6 +3627,41 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("1")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_token_validation_err: the API-token branch must preserve the
+    // bcrypt-capacity shed (`AppError::ServiceUnavailable`) as Overloaded so
+    // every token call site surfaces a retryable 503, while every other
+    // validation failure stays Invalid (401). This mapping is what stops a
+    // saturated auth cap from being misreported to cargo/twine/pip API-token
+    // clients as "invalid credentials".
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_token_validation_err_service_unavailable_is_overloaded() {
+        assert_eq!(
+            classify_token_validation_err(AppError::ServiceUnavailable(
+                "Authentication service is at capacity, retry shortly".to_string()
+            )),
+            TokenAuthError::Overloaded
+        );
+    }
+
+    #[test]
+    fn test_classify_token_validation_err_genuine_failures_stay_invalid() {
+        // Genuinely bad tokens (unknown, expired, revoked, deactivated owner)
+        // and infrastructure errors must keep producing 401 from the token
+        // call sites — only the transient capacity shed maps to Overloaded.
+        for err in [
+            AppError::Authentication("Invalid API token".to_string()),
+            AppError::Authentication("API token expired".to_string()),
+            AppError::Unauthorized("Token has been revoked".to_string()),
+            AppError::Database("connection refused".to_string()),
+            AppError::Internal("bcrypt failure".to_string()),
+        ] {
+            assert_eq!(classify_token_validation_err(err), TokenAuthError::Invalid);
+        }
     }
 
     #[tokio::test]
