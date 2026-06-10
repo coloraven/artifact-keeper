@@ -154,23 +154,43 @@ async fn require_visible(
     }
 }
 
+/// Pure decision for the fine-grained privilege gate on virtual-member
+/// mutations: admins always pass; every other caller must hold the
+/// `repository:admin` action on the virtual parent. Mirrors the gate used by
+/// `update_repository` / `delete_repository`. Factored out so both branches are
+/// unit-testable without a database.
+fn member_mutation_admin_allowed(is_admin: bool, has_repo_admin: bool) -> bool {
+    is_admin || has_repo_admin
+}
+
 /// Issue #913: authorize a virtual-member mutation.
 ///
 /// All three mutating handlers (`add_virtual_member`, `remove_virtual_member`,
-/// per-iteration step of `update_virtual_members`) must check access on BOTH
-/// the virtual parent and the member repo. A caller with write scope on the
-/// virtual parent must not be able to add/remove/reorder members they have no
-/// rights to. Tokens with `allowed_repo_ids = None` (admins, JWT sessions,
-/// unrestricted API tokens) bypass these checks naturally.
+/// per-iteration step of `update_virtual_members`) must enforce two things
+/// before mutating membership:
 ///
-/// On denial of the member-repo check, emit a structured `tracing::warn!` so
-/// the event is recoverable from logs (the parent-repo denial is left to the
-/// existing `require_repo_access` callers that warn elsewhere in this module).
-fn authorize_virtual_member_mutation(
+///   1. Token-scope (`require_repo_access`) on BOTH the virtual parent and the
+///      member repo. A repository-scoped API token must not reach repos it was
+///      not granted. Tokens with `allowed_repo_ids = None` (admins, JWT
+///      sessions, unrestricted API tokens) pass this naturally.
+///   2. Fine-grained privilege on the virtual parent: managing a virtual
+///      repository's member resolution graph is an administrative change to
+///      that repository, so non-admins must hold `repository:admin` on the
+///      virtual parent — the same check `update_repository` /
+///      `delete_repository` enforce. Without this, any authenticated user could
+///      reorder/add/remove members (the token-scope check no-ops for JWT
+///      sessions, whose `allowed_repo_ids` is always `None`).
+///
+/// Admins short-circuit the privilege check with no database lookup.
+///
+/// On denial, emit a structured `tracing::warn!` so the event is recoverable
+/// from logs.
+async fn authorize_virtual_member_mutation(
     auth: &AuthExtension,
     virtual_repo: &crate::models::repository::Repository,
     member_repo: &crate::models::repository::Repository,
     action: &str,
+    permission_service: &crate::services::permission_service::PermissionService,
 ) -> Result<()> {
     if let Err(e) = require_repo_access(auth, virtual_repo.id) {
         tracing::warn!(
@@ -197,6 +217,31 @@ fn authorize_virtual_member_mutation(
             "denied virtual-member mutation: caller lacks access to member repo"
         );
         return Err(e);
+    }
+
+    // Fine-grained privilege gate on the virtual parent. Admins short-circuit
+    // with no DB lookup; non-admins need `repository:admin` on the virtual repo.
+    let has_repo_admin = if auth.is_admin {
+        true
+    } else {
+        permission_service
+            .check_permission(auth.user_id, "repository", virtual_repo.id, "admin", false)
+            .await?
+    };
+    if !member_mutation_admin_allowed(auth.is_admin, has_repo_admin) {
+        tracing::warn!(
+            actor_user_id = %auth.user_id,
+            actor_username = %auth.username,
+            virtual_repo_id = %virtual_repo.id,
+            virtual_repo_key = %virtual_repo.key,
+            member_repo_id = %member_repo.id,
+            member_repo_key = %member_repo.key,
+            action = action,
+            "denied virtual-member mutation: caller lacks repository:admin on virtual parent"
+        );
+        return Err(AppError::Authorization(
+            "Insufficient permissions to manage members of this repository".to_string(),
+        ));
     }
     Ok(())
 }
@@ -4345,7 +4390,14 @@ pub async fn add_virtual_member(
 
     let virtual_repo = service.get_by_key(&key).await?;
     let member_repo = service.get_by_key(&payload.member_key).await?;
-    authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "add")?;
+    authorize_virtual_member_mutation(
+        &auth,
+        &virtual_repo,
+        &member_repo,
+        "add",
+        &state.permission_service,
+    )
+    .await?;
 
     // Resolve priority inside the service's advisory-locked transaction
     // (ak-jhdq). Computing MAX(priority)+1 here, outside the tx, would let
@@ -4425,7 +4477,14 @@ pub async fn remove_virtual_member(
         ));
     }
     let member_repo = service.get_by_key(&member_key).await?;
-    authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "remove")?;
+    authorize_virtual_member_mutation(
+        &auth,
+        &virtual_repo,
+        &member_repo,
+        "remove",
+        &state.permission_service,
+    )
+    .await?;
 
     // Delegate to the service, which scopes the DELETE to the single
     // (virtual_repo_id, member_repo_id) row and returns `AppError::NotFound`
@@ -4534,7 +4593,14 @@ pub async fn update_virtual_members(
     let mut priorities: Vec<i32> = Vec::with_capacity(payload.members.len());
     for member in &payload.members {
         let member_repo = service.get_by_key(&member.member_key).await?;
-        authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "update")?;
+        authorize_virtual_member_mutation(
+            &auth,
+            &virtual_repo,
+            &member_repo,
+            "update",
+            &state.permission_service,
+        )
+        .await?;
 
         if member_repo.id == virtual_repo.id {
             return Err(AppError::Validation(
@@ -7595,15 +7661,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_virtual_member_authz_access_to_parent_only_is_denied() {
-        // Caller has access to V but not M -> 403.
+    /// A `PermissionService` backed by a lazily-connecting pool. The token-scope
+    /// denial tests below reject before the privilege lookup runs, and the admin
+    /// path short-circuits before any query, so this service is never asked to
+    /// touch the database.
+    fn lazy_perm_service() -> crate::services::permission_service::PermissionService {
+        crate::services::permission_service::PermissionService::new(
+            crate::api::handlers::test_db_helpers::lazy_pool(),
+        )
+    }
+
+    /// Admin `AuthExtension` (unrestricted token-scope, is_admin = true).
+    fn make_admin_ext() -> AuthExtension {
+        AuthExtension {
+            is_admin: true,
+            ..make_auth_ext(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_virtual_member_authz_access_to_parent_only_is_denied() {
+        // Caller has token-scope to V but not M -> denied at the member-repo
+        // token-scope check, before any privilege lookup.
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
         let v = make_repo_with_id(virtual_id, "v");
         let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![virtual_id]));
-        let result = authorize_virtual_member_mutation(&ext, &v, &m, "add");
+        let result =
+            authorize_virtual_member_mutation(&ext, &v, &m, "add", &lazy_perm_service()).await;
         assert!(
             result.is_err(),
             "caller with access to parent only must be denied"
@@ -7616,54 +7702,143 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_virtual_member_authz_access_to_member_only_is_denied() {
-        // Caller has access to M but not V -> 403.
+    #[tokio::test]
+    async fn test_virtual_member_authz_access_to_member_only_is_denied() {
+        // Caller has token-scope to M but not V -> denied at the parent-repo
+        // token-scope check, before any privilege lookup.
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
         let v = make_repo_with_id(virtual_id, "v");
         let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![member_id]));
-        let result = authorize_virtual_member_mutation(&ext, &v, &m, "remove");
+        let result =
+            authorize_virtual_member_mutation(&ext, &v, &m, "remove", &lazy_perm_service()).await;
         assert!(
             result.is_err(),
             "caller with access to member only must be denied"
         );
     }
 
-    #[test]
-    fn test_virtual_member_authz_access_to_both_is_allowed() {
-        // Caller has access to both V and M -> ok.
+    #[tokio::test]
+    async fn test_virtual_member_authz_admin_short_circuits_with_no_db() {
+        // Admins pass both token-scope (unrestricted) and the privilege gate
+        // (is_admin short-circuit) without any database lookup.
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
         let v = make_repo_with_id(virtual_id, "v");
         let m = make_repo_with_id(member_id, "m");
-        let ext = make_auth_ext(Some(vec![virtual_id, member_id]));
-        assert!(authorize_virtual_member_mutation(&ext, &v, &m, "update").is_ok());
+        let ext = make_admin_ext();
+        let result =
+            authorize_virtual_member_mutation(&ext, &v, &m, "update", &lazy_perm_service()).await;
+        assert!(
+            result.is_ok(),
+            "admin must be allowed via is_admin short-circuit with no DB: {:?}",
+            result
+        );
     }
 
-    #[test]
-    fn test_virtual_member_authz_unrestricted_token_bypass() {
-        // Tokens with allowed_repo_ids = None (admins, JWT sessions,
-        // unrestricted API tokens) bypass the per-member check.
-        let virtual_id = Uuid::new_v4();
-        let member_id = Uuid::new_v4();
-        let v = make_repo_with_id(virtual_id, "v");
-        let m = make_repo_with_id(member_id, "m");
-        let ext = make_auth_ext(None);
-        assert!(authorize_virtual_member_mutation(&ext, &v, &m, "add").is_ok());
-    }
-
-    #[test]
-    fn test_virtual_member_authz_no_access_to_either_is_denied() {
-        // Caller has access to neither V nor M -> 403 (failing on parent first).
+    #[tokio::test]
+    async fn test_virtual_member_authz_no_access_to_either_is_denied() {
+        // Caller has token-scope to neither V nor M -> denied on parent first,
+        // before any privilege lookup.
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
         let other = Uuid::new_v4();
         let v = make_repo_with_id(virtual_id, "v");
         let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![other]));
-        assert!(authorize_virtual_member_mutation(&ext, &v, &m, "add").is_err());
+        let result =
+            authorize_virtual_member_mutation(&ext, &v, &m, "add", &lazy_perm_service()).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_member_mutation_admin_allowed_admin_passes() {
+        // Admins are allowed regardless of an explicit repository:admin grant.
+        assert!(member_mutation_admin_allowed(true, false));
+        assert!(member_mutation_admin_allowed(true, true));
+    }
+
+    #[test]
+    fn test_member_mutation_admin_allowed_nonadmin_needs_repo_admin() {
+        // Non-admins are allowed only when they hold repository:admin.
+        assert!(member_mutation_admin_allowed(false, true));
+        assert!(!member_mutation_admin_allowed(false, false));
+    }
+
+    /// DB-backed: a non-admin without `repository:admin` on the virtual parent
+    /// is rejected (Insufficient permissions), and granting the rule lets them
+    /// through — mirroring the gate `update_repository` enforces. Skips when no
+    /// `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn test_virtual_member_authz_nonadmin_requires_repo_admin_grant_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let virtual_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let v = make_repo_with_id(virtual_id, "v");
+        let m = make_repo_with_id(member_id, "m");
+        // Non-admin, unrestricted token-scope (allowed_repo_ids = None) — exactly
+        // the password/JWT session shape that the old code let through.
+        let ext = tdh::make_auth(user_id, &username);
+
+        // Deny: no repository:admin grant on the virtual parent.
+        let denied = authorize_virtual_member_mutation(
+            &ext,
+            &v,
+            &m,
+            "update",
+            &crate::services::permission_service::PermissionService::new(pool.clone()),
+        )
+        .await;
+        match denied {
+            Err(AppError::Authorization(msg)) => {
+                assert!(
+                    msg.contains("Insufficient permissions"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Authorization denial, got: {:?}", other),
+        }
+
+        // Allow: grant the user repository:admin on the virtual parent. A fresh
+        // service avoids the per-process cache from the deny lookup above.
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'repository', $2, ARRAY['admin'])",
+        )
+        .bind(user_id)
+        .bind(virtual_id)
+        .execute(&pool)
+        .await
+        .expect("grant repository:admin");
+
+        let allowed = authorize_virtual_member_mutation(
+            &ext,
+            &v,
+            &m,
+            "update",
+            &crate::services::permission_service::PermissionService::new(pool.clone()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "non-admin WITH repository:admin must be allowed: {:?}",
+            allowed
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
     }
 
     /// Issue #913 binding test:
