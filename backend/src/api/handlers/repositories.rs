@@ -93,7 +93,14 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
 /// repositories, per-repo authorization: admins bypass; every other caller must
 /// hold a role assignment scoped to the repo (direct or global). Public repos
 /// keep their existing behavior (token-scope only).
-async fn require_repo_write_access(
+///
+/// Exposed as `pub(crate)` so the repository sub-resource handlers that live in
+/// sibling modules (labels, security, email subscriptions) and the chunked
+/// upload-session create path can route through the SAME tenant write gate
+/// rather than re-deriving (or forgetting) it. The `/api/v1/repositories` nest
+/// runs under `optional_auth_middleware` only, NOT `repo_visibility_middleware`,
+/// so each sub-handler must enforce this itself.
+pub(crate) async fn require_repo_write_access(
     auth: &AuthExtension,
     repo: &crate::models::repository::Repository,
     repo_service: &RepositoryService,
@@ -123,7 +130,10 @@ async fn require_repo_write_access(
 ///
 /// Denials on private repos return `NotFound` (not `Forbidden`) to avoid
 /// leaking the existence of repositories the caller may not see.
-async fn require_visible(
+///
+/// Exposed as `pub(crate)` so leaky-read sub-resource handlers in sibling
+/// modules (labels list, security read) can reuse the canonical visibility gate.
+pub(crate) async fn require_visible(
     repo: &crate::models::repository::Repository,
     auth: &Option<AuthExtension>,
     repo_service: &RepositoryService,
@@ -718,7 +728,7 @@ pub async fn set_cache_ttl(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (see #917).
@@ -852,7 +862,7 @@ pub async fn invalidate_cache(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     // Cache invalidation is meaningless on Local / Virtual / Staging repos --
     // only Remote (proxy) repos own a cache. Reject up front before touching
@@ -994,7 +1004,7 @@ pub async fn put_pypi_track(
     auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
     require_pypi_tracks_repo(&repo)?;
 
     let tracks_url = payload.tracks_url.trim().to_string();
@@ -1056,7 +1066,7 @@ pub async fn delete_pypi_track(
     auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
     sqlx::query(
@@ -4775,6 +4785,8 @@ pub async fn set_upstream_auth(
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
 
     if payload.auth_type == "none" {
         crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
@@ -4828,6 +4840,8 @@ pub async fn test_upstream(
     let auth = require_auth(auth)?;
     auth.require_scope("read")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
 
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         AppError::Validation("Repository has no upstream URL configured".to_string())
@@ -4970,7 +4984,7 @@ pub async fn set_routing_rules(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     let value = serde_json::to_string(&payload.rules)
         .map_err(|e| AppError::Internal(format!("Failed to serialize routing rules: {}", e)))?;
@@ -5021,7 +5035,7 @@ pub async fn delete_routing_rules(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     sqlx::query(
         r#"
@@ -7850,6 +7864,152 @@ mod tests {
         assert!(!member_mutation_admin_allowed(false, false));
     }
 
+    // -----------------------------------------------------------------------
+    // xtenant-write-authz-systemic: behavioral coverage for the two shared
+    // tenant gates (`require_repo_write_access` / `require_visible`) that every
+    // repository sub-resource handler now routes through. The no-DB
+    // short-circuits (token scope, public, admin, anonymous) run everywhere;
+    // the per-repo role-assignment branch is exercised by the `*_db` tests,
+    // which seed a real Postgres and skip cleanly when DATABASE_URL is unset
+    // (the same `try_pool()` convention the virtual-member tests use).
+    // -----------------------------------------------------------------------
+    fn no_db_repo_service() -> RepositoryService {
+        RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool())
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_admin_short_circuits_no_db() {
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let res = require_repo_write_access(&make_admin_ext(), &repo, &no_db_repo_service()).await;
+        assert!(
+            res.is_ok(),
+            "admin must pass the write gate via is_admin, no DB: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_public_allowed_no_db() {
+        let repo = make_repo(true); // is_public = true
+        let res =
+            require_repo_write_access(&make_auth_ext(None), &repo, &no_db_repo_service()).await;
+        assert!(
+            res.is_ok(),
+            "a public repo is writable past the gate, no DB: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_out_of_token_scope_denied_no_db() {
+        // A repo-scoped token whose scope excludes this repo is denied before any
+        // DB lookup (the `require_repo_access` token-scope gate).
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let auth = make_auth_ext(Some(vec![Uuid::new_v4()]));
+        let res = require_repo_write_access(&auth, &repo, &no_db_repo_service()).await;
+        assert!(
+            matches!(res, Err(AppError::Authorization(_))),
+            "a repo-scoped token must be denied write outside its scope: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_public_is_visible_to_anonymous_no_db() {
+        let repo = make_repo(true);
+        let res = require_visible(&repo, &None, &no_db_repo_service()).await;
+        assert!(
+            res.is_ok(),
+            "public repos are visible to anonymous callers: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_private_hidden_from_anonymous_no_db() {
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let res = require_visible(&repo, &None, &no_db_repo_service()).await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "private repos must be hidden (NotFound) from anonymous callers: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_out_of_token_scope_not_found_no_db() {
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let auth = make_auth_ext(Some(vec![Uuid::new_v4()]));
+        let res = require_visible(&repo, &Some(auth), &no_db_repo_service()).await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "a repo-scoped token must not see a repo outside its scope: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_admin_sees_private_no_db() {
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let res = require_visible(&repo, &Some(make_admin_ext()), &no_db_repo_service()).await;
+        assert!(
+            res.is_ok(),
+            "admins see any repo via the is_admin short-circuit: {res:?}"
+        );
+    }
+
+    /// DB-backed: a non-admin, unrestricted-scope session (the password/JWT shape
+    /// the systemic fix targets) is DENIED write to a private repo it holds no
+    /// role on, and granting a role lets it through. Skips with no DATABASE_URL.
+    #[tokio::test]
+    async fn test_require_repo_write_access_nonmember_denied_then_granted_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let repo = make_repo_with_id(repo_id, &key); // is_public = false
+        let ext = tdh::make_auth(user_id, &username);
+        let svc = RepositoryService::new(pool.clone());
+
+        let denied = require_repo_write_access(&ext, &repo, &svc).await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "non-member must be denied write on a private repo: {denied:?}"
+        );
+
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let allowed = require_repo_write_access(&ext, &repo, &svc).await;
+        assert!(
+            allowed.is_ok(),
+            "a granted member must pass the write gate: {allowed:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// DB-backed sibling for the read/visibility gate: a non-member gets NotFound
+    /// on a private repo; a granted member sees it. Skips with no DATABASE_URL.
+    #[tokio::test]
+    async fn test_require_visible_nonmember_not_found_then_granted_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let repo = make_repo_with_id(repo_id, &key);
+        let ext = tdh::make_auth(user_id, &username);
+        let svc = RepositoryService::new(pool.clone());
+
+        let hidden = require_visible(&repo, &Some(ext.clone()), &svc).await;
+        assert!(
+            matches!(hidden, Err(AppError::NotFound(_))),
+            "non-member must get NotFound on a private repo: {hidden:?}"
+        );
+
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let seen = require_visible(&repo, &Some(ext), &svc).await;
+        assert!(seen.is_ok(), "a granted member must see the repo: {seen:?}");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
     /// DB-backed: a non-admin without `repository:admin` on the virtual parent
     /// is rejected (Insufficient permissions), and granting the rule lets them
     /// through — mirroring the gate `update_repository` enforces. Skips when no
@@ -8041,6 +8201,53 @@ mod tests {
             "list_virtual_members must filter the response by \
              can_access_repo(member_repo_id) (issue #913)"
         );
+    }
+
+    /// Cross-tenant write authz (xtenant-write-authz-systemic):
+    ///
+    /// The `/api/v1/repositories` REST nest runs under `optional_auth_middleware`
+    /// only, NOT `repo_visibility_middleware`, so each sub-resource mutation
+    /// handler must enforce the tenant write gate itself. Assert every such
+    /// handler references `require_repo_write_access` (the canonical
+    /// `is_public + role_assignments` gate) so a future handler cannot silently
+    /// fall open to a non-member, non-admin caller on a private repo. String-grep
+    /// because the handlers need a full `SharedState` to run.
+    #[test]
+    fn test_repo_mutation_handlers_call_write_gate() {
+        let source = include_str!("repositories.rs");
+
+        for handler in [
+            "set_cache_ttl",
+            "invalidate_cache",
+            "put_pypi_track",
+            "delete_pypi_track",
+            "set_routing_rules",
+            "delete_routing_rules",
+            "set_upstream_auth",
+            "upload_artifact",
+            "delete_artifact",
+        ] {
+            let marker = format!("pub async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found in repositories.rs", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest
+                .find("\npub async fn ")
+                .or_else(|| rest.find("\npub fn "))
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+
+            assert!(
+                body.contains("require_repo_write_access("),
+                "handler `{}` does not call `require_repo_write_access` \
+                 (xtenant-write-authz-systemic). The /repositories nest is not \
+                 covered by repo_visibility_middleware, so each mutation handler \
+                 must enforce the tenant write gate itself. If you intentionally \
+                 restructured the authz model, update this test to match.",
+                handler
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
