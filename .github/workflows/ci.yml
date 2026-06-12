@@ -307,11 +307,9 @@ jobs:
           shared-key: coverage
           workspaces: ". -> target/llvm-cov-target"
 
-      - name: Install cargo-nextest
-        if: steps.detect.outputs.rust_changed == 'true'
-        uses: taiki-e/install-action@4bc351f7f2614e48088386e2a0ad917ca3a7e4ba # v2.81.5
-        with:
-          tool: nextest
+      # cargo-nextest is baked into the runner image at a pinned version
+      # (ghcr.io/artifact-keeper/ak-runner-rust, see artifact-keeper-iac
+      # runner-images/rust/Dockerfile) -- no per-run install needed.
 
       - name: Run database migrations
         if: steps.detect.outputs.rust_changed == 'true'
