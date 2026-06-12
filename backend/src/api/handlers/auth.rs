@@ -145,6 +145,80 @@ pub struct UserResponse {
     pub totp_enabled: bool,
 }
 
+/// Outcome of the local-login policy decision in [`local_login_gate`].
+#[derive(Debug, PartialEq, Eq)]
+enum LocalLoginGate {
+    /// Local login may proceed.
+    Allow,
+    /// Local login is rejected because SSO is enforced for this user.
+    RejectSso,
+}
+
+/// Decide whether a *verified* local credential may complete login.
+///
+/// Evaluated AFTER `AuthService::authenticate` succeeds, so `user_is_admin`
+/// is a proven property of the caller, not a claim from the request. When any
+/// SSO provider is enabled (issue #213) non-admin local login stays disabled,
+/// but a verified admin always retains a break-glass recovery path so a
+/// misconfigured SSO provider can be repaired in-band (issue #443). The
+/// legacy `ALLOW_LOCAL_ADMIN_LOGIN` flag (`allow_local_admin_login`) is kept
+/// as a back-compat input; it only ever applied to the admin account and must
+/// never broaden access for non-admin users.
+fn local_login_gate(
+    sso_enabled: bool,
+    user_is_admin: bool,
+    allow_local_admin_login: bool,
+) -> LocalLoginGate {
+    match (sso_enabled, user_is_admin, allow_local_admin_login) {
+        // No SSO providers enabled: local login is unchanged for everyone.
+        (false, _, _) => LocalLoginGate::Allow,
+        // Verified-admin break-glass (supersedes the legacy flag, which only
+        // ever allowed the admin account).
+        (true, true, _) => LocalLoginGate::Allow,
+        // Non-admins must use SSO; the legacy flag never broadens them.
+        (true, false, _) => LocalLoginGate::RejectSso,
+    }
+}
+
+/// DB-backed enforcement of the local-login SSO policy for an already-verified
+/// user. Returns whether any SSO provider is enabled (so the caller can emit the
+/// admin break-glass warning), or an `Authentication` error when the user must
+/// use SSO. Split out of the `login` handler so the policy decision — the SSO
+/// lookup plus [`local_login_gate`] plus the reject-side audit — is unit-testable
+/// against a seeded database without standing up the full login path.
+async fn enforce_local_login_sso_policy(
+    state: &SharedState,
+    user_id: Uuid,
+    username: &str,
+    user_is_admin: bool,
+) -> Result<bool> {
+    let sso_enabled = !AuthConfigService::list_enabled_providers(&state.db)
+        .await?
+        .is_empty();
+    match local_login_gate(
+        sso_enabled,
+        user_is_admin,
+        state.config.allow_local_admin_login,
+    ) {
+        LocalLoginGate::Allow => Ok(sso_enabled),
+        LocalLoginGate::RejectSso => {
+            audit_auth(
+                state,
+                AuditAction::LoginFailed,
+                Some(user_id),
+                serde_json::json!({
+                    "username": username,
+                    "reason": "local_login_disabled_sso",
+                }),
+            )
+            .await;
+            Err(AppError::Authentication(
+                "Local login is disabled when SSO is configured. Use your organization's SSO provider to sign in.".to_string(),
+            ))
+        }
+    }
+}
+
 /// Login with credentials
 #[utoipa::path(
     post,
@@ -161,20 +235,6 @@ pub async fn login(
     State(state): State<SharedState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response> {
-    // Block local login when SSO providers are configured (issue #213),
-    // unless ALLOW_LOCAL_ADMIN_LOGIN is set and the user is the admin account
-    // (break-glass recovery for misconfigured SSO, issue #443).
-    let sso_providers = AuthConfigService::list_enabled_providers(&state.db).await?;
-    if !sso_providers.is_empty() {
-        let is_admin_bypass = state.config.allow_local_admin_login && payload.username == "admin";
-        if !is_admin_bypass {
-            return Err(AppError::Authentication(
-                "Local login is disabled when SSO is configured. Use your organization's SSO provider to sign in.".to_string(),
-            ));
-        }
-        tracing::warn!("Local admin login allowed via ALLOW_LOCAL_ADMIN_LOGIN while SSO is active");
-    }
-
     // The bcrypt-bound auth-concurrency cap (#991, #1088) is enforced
     // inside `AuthService::verify_password` itself, so every entry point
     // that runs bcrypt (local login, API-token verify, basic-auth
@@ -200,6 +260,21 @@ pub async fn login(
         }
     };
 
+    // Local-login policy when SSO providers are configured (issue #213).
+    // Evaluated AFTER authentication so the decision is based on the
+    // *verified* `is_admin` flag: admins keep a break-glass recovery path
+    // for a misconfigured SSO provider (issue #443), while non-admin local
+    // login stays disabled. The DB-backed decision lives in
+    // `enforce_local_login_sso_policy` so it can be unit-tested directly.
+    let sso_enabled =
+        enforce_local_login_sso_policy(&state, user.id, &user.username, user.is_admin).await?;
+    if sso_enabled {
+        tracing::warn!(
+            username = %user.username,
+            "Local admin break-glass login while SSO is enabled"
+        );
+    }
+
     // If TOTP is enabled, return a pending token instead of real tokens
     if user.totp_enabled {
         let totp_token = auth_service.generate_totp_pending_token(&user)?;
@@ -215,13 +290,13 @@ pub async fn login(
         return Ok(Json(body).into_response());
     }
 
-    audit_auth(
-        &state,
-        AuditAction::Login,
-        Some(user.id),
-        serde_json::json!({ "username": user.username }),
-    )
-    .await;
+    let mut login_details = serde_json::json!({ "username": user.username });
+    if sso_enabled {
+        // Only verified admins reach this point with SSO enabled; mark the
+        // break-glass login so it is visible in the audit trail.
+        login_details["sso_break_glass"] = serde_json::json!(true);
+    }
+    audit_auth(&state, AuditAction::Login, Some(user.id), login_details).await;
 
     Ok(login_response(&tokens, user.must_change_password))
 }
@@ -725,6 +800,98 @@ mod tests {
     use super::*;
     use axum::http::header::{COOKIE, SET_COOKIE};
     use axum::http::HeaderMap;
+
+    // -----------------------------------------------------------------------
+    // local_login_gate — SSO local-login policy (issues #213 / #443)
+    //
+    // Full decision matrix: with no SSO providers everyone may log in
+    // locally; with SSO enabled only a *verified* admin passes (break-glass
+    // recovery for a misconfigured provider), and the legacy
+    // ALLOW_LOCAL_ADMIN_LOGIN flag never broadens access for non-admins.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_local_login_gate_no_sso_allows_everyone() {
+        assert_eq!(local_login_gate(false, true, false), LocalLoginGate::Allow);
+        assert_eq!(local_login_gate(false, false, false), LocalLoginGate::Allow);
+        assert_eq!(local_login_gate(false, true, true), LocalLoginGate::Allow);
+        assert_eq!(local_login_gate(false, false, true), LocalLoginGate::Allow);
+    }
+
+    #[test]
+    fn test_local_login_gate_sso_admin_break_glass_allowed() {
+        // Verified admin always retains a recovery path, with or without
+        // the legacy flag.
+        assert_eq!(local_login_gate(true, true, false), LocalLoginGate::Allow);
+        assert_eq!(local_login_gate(true, true, true), LocalLoginGate::Allow);
+    }
+
+    #[test]
+    fn test_local_login_gate_sso_non_admin_rejected() {
+        assert_eq!(
+            local_login_gate(true, false, false),
+            LocalLoginGate::RejectSso
+        );
+    }
+
+    #[test]
+    fn test_local_login_gate_legacy_flag_never_broadens_non_admins() {
+        assert_eq!(
+            local_login_gate(true, false, true),
+            LocalLoginGate::RejectSso
+        );
+    }
+
+    /// DB-backed: exercises the full SSO policy enforcement that the `login`
+    /// handler delegates to — the enabled-provider lookup, the gate decision,
+    /// and the reject-side audit — without standing up the bcrypt/authenticate
+    /// path. Skips cleanly when no DATABASE_URL is configured (try_pool).
+    #[tokio::test]
+    async fn test_enforce_local_login_sso_policy_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-sso-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let uid = Uuid::new_v4();
+        let provider = format!("ph-test-ldap-{uid}");
+
+        // No SSO providers enabled: local login is allowed for everyone and the
+        // returned sso_enabled flag is false (no break-glass warning).
+        let none = enforce_local_login_sso_policy(&state, uid, "alice", false).await;
+        assert!(!none.expect("no-SSO non-admin must be allowed"));
+
+        // Enable one LDAP provider. list_enabled_providers only reads id+name,
+        // so the remaining columns can take their schema defaults.
+        sqlx::query(
+            "INSERT INTO ldap_configs (name, server_url, user_base_dn, is_enabled) \
+             VALUES ($1, 'ldap://test.invalid', 'dc=test', true)",
+        )
+        .bind(&provider)
+        .execute(&pool)
+        .await
+        .expect("seed enabled LDAP provider");
+
+        // SSO enabled + non-admin -> rejected with the SSO message (and audited).
+        let denied = enforce_local_login_sso_policy(&state, uid, "alice", false).await;
+        assert!(
+            matches!(denied, Err(AppError::Authentication(_))),
+            "non-admin local login must be rejected when SSO is enabled: {denied:?}"
+        );
+
+        // SSO enabled + verified admin -> break-glass allowed; sso_enabled=true.
+        let allowed = enforce_local_login_sso_policy(&state, uid, "admin", true).await;
+        assert!(
+            allowed.expect("admin break-glass must be allowed"),
+            "admin must keep local login and observe sso_enabled=true"
+        );
+
+        let _ = sqlx::query("DELETE FROM ldap_configs WHERE name = $1")
+            .bind(&provider)
+            .execute(&pool)
+            .await;
+    }
 
     // -----------------------------------------------------------------------
     // LoginRequest deserialization
