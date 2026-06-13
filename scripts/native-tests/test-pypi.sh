@@ -87,7 +87,7 @@ JSON_RESP=$(curl -sf -H "Accept: application/vnd.pypi.simple.v1+json" "$PYPI_URL
 echo "$JSON_RESP" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
-assert data['meta']['api-version'] == '1.1', 'Wrong API version'
+assert data['meta']['api-version'] == '1.2', 'Wrong API version'
 assert data['name'] == 'test-package-native', 'Wrong name'
 assert len(data['files']) == 2, f'Expected 2 files, got {len(data[\"files\"])}'
 assert '$TEST_VERSION' in data['versions'], 'Version not listed'
