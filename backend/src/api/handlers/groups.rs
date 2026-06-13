@@ -21,6 +21,44 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
+/// Whether a caller reads groups without per-caller scoping.
+///
+/// Admins see every group (mirroring the admin short-circuit in the repository
+/// visibility gate and the group mutation handlers); every other caller is
+/// filtered to the groups they can actually reach.
+fn group_read_unscoped(is_admin: bool) -> bool {
+    is_admin
+}
+
+/// SQL predicate restricting a `groups` row to those a non-admin caller can
+/// reach: groups they are a member of (`user_group_members`) UNION groups they
+/// hold any permission grant on (`permissions` where `target_type = 'group'`,
+/// held directly as a `user` principal or via one of the caller's groups).
+///
+/// This is the same membership+grant predicate the group mutation handlers
+/// already trust via `permission_service::check_permission(user, "group", id, ..)`,
+/// applied as a read filter. `group_id_expr` is the SQL expression for the
+/// group id (e.g. `g.id`); `user_param` is the bind placeholder holding the
+/// caller's user id (e.g. `$2`). Kept as a single helper so the list SELECT,
+/// list COUNT, and get_group queries share one definition.
+fn visible_groups_predicate(group_id_expr: &str, user_param: &str) -> String {
+    format!(
+        "({group_id_expr} IN (
+            SELECT group_id FROM user_group_members WHERE user_id = {user_param}
+         )
+         OR EXISTS (
+            SELECT 1 FROM permissions p
+            WHERE p.target_type = 'group' AND p.target_id = {group_id_expr}
+              AND (
+                (p.principal_type = 'user' AND p.principal_id = {user_param})
+                OR (p.principal_type = 'group' AND p.principal_id IN (
+                    SELECT group_id FROM user_group_members WHERE user_id = {user_param}
+                ))
+              )
+         ))"
+    )
+}
+
 /// Create group routes
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -156,7 +194,7 @@ pub async fn list_groups(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListGroupsQuery>,
 ) -> Result<Json<GroupListResponse>> {
-    require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
@@ -184,37 +222,58 @@ pub async fn list_groups(
         }));
     }
 
-    let groups: Vec<GroupRow> = sqlx::query_as(
+    // Non-admins only see groups they can reach (membership UNION a group
+    // permission grant); admins are unscoped. The $4 placeholder carries the
+    // caller's user id when scoping is applied.
+    let scoped = !group_read_unscoped(auth.is_admin);
+    let select_scope = if scoped {
+        format!(" AND {}", visible_groups_predicate("g.id", "$4"))
+    } else {
+        String::new()
+    };
+    let select_sql = format!(
         r#"
         SELECT g.id, g.name, g.description, g.created_at, g.updated_at,
                COALESCE(COUNT(ugm.user_id), 0) as member_count
         FROM groups g
         LEFT JOIN user_group_members ugm ON ugm.group_id = g.id
-        WHERE ($1::text IS NULL OR g.name ILIKE $1 OR g.description ILIKE $1)
+        WHERE ($1::text IS NULL OR g.name ILIKE $1 OR g.description ILIKE $1){select_scope}
         GROUP BY g.id
         ORDER BY g.name
         OFFSET $2
         LIMIT $3
-        "#,
-    )
-    .bind(&search_pattern)
-    .bind(offset)
-    .bind(per_page as i64)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+        "#
+    );
+    let mut select_query = sqlx::query_as::<_, GroupRow>(&select_sql)
+        .bind(&search_pattern)
+        .bind(offset)
+        .bind(per_page as i64);
+    if scoped {
+        select_query = select_query.bind(auth.user_id);
+    }
+    let groups: Vec<GroupRow> = select_query
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total: i64 = sqlx::query_scalar(
+    // The COUNT must match the same scope so pagination totals are correct.
+    let count_scope = if scoped {
+        format!(" AND {}", visible_groups_predicate("g.id", "$2"))
+    } else {
+        String::new()
+    };
+    let count_sql = format!(
         r#"
         SELECT COUNT(*)
-        FROM groups
-        WHERE ($1::text IS NULL OR name ILIKE $1 OR description ILIKE $1)
-        "#,
-    )
-    .bind(&search_pattern)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+        FROM groups g
+        WHERE ($1::text IS NULL OR g.name ILIKE $1 OR g.description ILIKE $1){count_scope}
+        "#
+    );
+    let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql).bind(&search_pattern);
+    if scoped {
+        count_query = count_query.bind(auth.user_id);
+    }
+    let total: i64 = count_query.fetch_one(&state.db).await.unwrap_or(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -346,7 +405,7 @@ pub async fn get_group(
     Path(id): Path<Uuid>,
     Query(query): Query<GetGroupQuery>,
 ) -> Result<Json<GroupDetailResponse>> {
-    require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
     // Check if groups table exists first
     let table_exists: bool = sqlx::query_scalar(
@@ -360,21 +419,36 @@ pub async fn get_group(
         return Err(AppError::NotFound("Group not found".to_string()));
     }
 
-    let group: GroupRow = sqlx::query_as(
+    // Non-admins may only read a group they can reach (membership UNION a group
+    // permission grant); an out-of-scope group yields no row and therefore a
+    // 404 that is byte-identical to a genuinely-missing id (no existence
+    // oracle). Admins are unscoped. The $2 placeholder carries the caller's
+    // user id when scoping is applied.
+    let scoped = !group_read_unscoped(auth.is_admin);
+    let get_scope = if scoped {
+        format!(" AND {}", visible_groups_predicate("g.id", "$2"))
+    } else {
+        String::new()
+    };
+    let group_sql = format!(
         r#"
         SELECT g.id, g.name, g.description, g.created_at, g.updated_at,
                COALESCE(COUNT(ugm.user_id), 0) as member_count
         FROM groups g
         LEFT JOIN user_group_members ugm ON ugm.group_id = g.id
-        WHERE g.id = $1
+        WHERE g.id = $1{get_scope}
         GROUP BY g.id
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
+        "#
+    );
+    let mut group_query = sqlx::query_as::<_, GroupRow>(&group_sql).bind(id);
+    if scoped {
+        group_query = group_query.bind(auth.user_id);
+    }
+    let group: GroupRow = group_query
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
 
     let member_limit = query.limit();
     let member_offset = query.offset();
@@ -1462,5 +1536,200 @@ mod tests {
     fn test_get_group_authenticated_allowed() {
         let auth = make_auth(true);
         assert!(require_auth(Some(auth)).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Group read scoping (BOLA fix): non-admins are filtered to groups they
+    // can reach (membership UNION a group permission grant); admins are
+    // unscoped. The list SELECT/COUNT and the get_group query all share the
+    // same `visible_groups_predicate`. These tests cover the decision and the
+    // predicate shape without a database.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_read_unscoped_admin_bypasses_filter() {
+        // Admins read every group: no per-caller predicate is applied.
+        let auth = make_auth(true);
+        assert!(group_read_unscoped(auth.is_admin));
+    }
+
+    #[test]
+    fn test_group_read_scoped_for_non_admin() {
+        // Non-admins are scoped: the predicate is applied.
+        let auth = make_auth(false);
+        assert!(!group_read_unscoped(auth.is_admin));
+    }
+
+    #[test]
+    fn test_visible_groups_predicate_has_membership_arm() {
+        // Membership arm: caller is a member of the group.
+        let sql = visible_groups_predicate("g.id", "$2");
+        assert!(sql.contains("user_group_members"));
+        assert!(sql.contains("g.id IN ("));
+    }
+
+    #[test]
+    fn test_visible_groups_predicate_has_permission_grant_arm() {
+        // Permission-grant arm: caller holds a grant directly as a user
+        // principal OR via one of their groups. Dropping this arm would hide a
+        // group from a non-member grant-holder who can already mutate it.
+        let sql = visible_groups_predicate("g.id", "$2");
+        assert!(sql.contains("FROM permissions p"));
+        assert!(sql.contains("p.target_type = 'group'"));
+        assert!(sql.contains("p.principal_type = 'user'"));
+        assert!(sql.contains("p.principal_type = 'group'"));
+    }
+
+    #[test]
+    fn test_visible_groups_predicate_uses_supplied_placeholders() {
+        // The group-id expression and user bind placeholder are interpolated,
+        // so the list SELECT ($4) and get_group ($2) can reuse one helper with
+        // their own parameter numbering.
+        let sql = visible_groups_predicate("g.id", "$4");
+        assert!(sql.contains("user_id = $4"));
+        assert!(sql.contains("p.principal_id = $4"));
+        assert!(!sql.contains("$1"));
+    }
+
+    #[test]
+    fn test_visible_groups_predicate_targets_only_group_grants() {
+        // The grant arm must be scoped to the specific group id, not any grant.
+        let sql = visible_groups_predicate("g.id", "$2");
+        assert!(sql.contains("p.target_id = g.id"));
+    }
+
+    /// DB-backed: exercises the scoped query branches of `list_groups` and
+    /// `get_group`. A non-admin sees only the group it is a member of (not a
+    /// non-member group), and a non-member `get_group` returns NotFound (no
+    /// existence oracle); an admin is unscoped and sees both. Skips cleanly when
+    /// no DATABASE_URL is configured (the `try_pool` convention).
+    #[tokio::test]
+    async fn test_group_read_scoping_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, Query, State};
+        use axum::Extension;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // Two groups; the user is a member of `mine`, not of `other`.
+        let mine = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mine_name = format!("ph-grp-mine-{mine}");
+        let other_name = format!("ph-grp-other-{other}");
+        sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2), ($3, $4)")
+            .bind(mine)
+            .bind(&mine_name)
+            .bind(other)
+            .bind(&other_name)
+            .execute(&pool)
+            .await
+            .expect("seed groups");
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(mine)
+            .execute(&pool)
+            .await
+            .expect("seed membership");
+
+        let nonadmin = tdh::make_auth(user_id, &username); // is_admin = false
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        let list_q = || ListGroupsQuery {
+            search: None,
+            page: None,
+            per_page: None,
+        };
+        let get_q = || GetGroupQuery {
+            member_limit: None,
+            member_offset: None,
+        };
+
+        // list_groups: non-admin sees `mine`, not `other`.
+        let listed = list_groups(
+            State(state.clone()),
+            Extension(Some(nonadmin.clone())),
+            Query(list_q()),
+        )
+        .await
+        .expect("non-admin list ok")
+        .0;
+        let names: Vec<&str> = listed.items.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&mine_name.as_str()),
+            "non-admin must see its own group"
+        );
+        assert!(
+            !names.contains(&other_name.as_str()),
+            "non-admin must NOT see a non-member group (BOLA): {names:?}"
+        );
+
+        // list_groups: admin is unscoped and sees both.
+        let listed_admin = list_groups(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Query(list_q()),
+        )
+        .await
+        .expect("admin list ok")
+        .0;
+        let admin_names: Vec<&str> = listed_admin.items.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            admin_names.contains(&mine_name.as_str()) && admin_names.contains(&other_name.as_str()),
+            "admin must see all groups unscoped: {admin_names:?}"
+        );
+
+        // get_group: non-admin -> own 200, non-member -> 404 (no existence oracle).
+        assert!(
+            get_group(
+                State(state.clone()),
+                Extension(Some(nonadmin.clone())),
+                Path(mine),
+                Query(get_q()),
+            )
+            .await
+            .is_ok(),
+            "non-admin must read its own group"
+        );
+        let denied = get_group(
+            State(state.clone()),
+            Extension(Some(nonadmin)),
+            Path(other),
+            Query(get_q()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member get_group must be NotFound, not a leak: {denied:?}"
+        );
+        // get_group: admin reads any group.
+        assert!(
+            get_group(
+                State(state.clone()),
+                Extension(Some(admin)),
+                Path(other),
+                Query(get_q()),
+            )
+            .await
+            .is_ok(),
+            "admin must read any group"
+        );
+
+        // cleanup (user_group_members cascades on group/user delete).
+        let _ = sqlx::query("DELETE FROM groups WHERE id IN ($1, $2)")
+            .bind(mine)
+            .bind(other)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
     }
 }
