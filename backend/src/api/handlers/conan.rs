@@ -2624,6 +2624,8 @@ mod tests {
                 scan_workspace_path: "/tmp/scan".into(),
                 demo_mode: false,
                 guest_access_enabled: true,
+                plugins_require_signed: true,
+                plugins_trusted_pubkey: None,
                 peer_instance_name: "test".into(),
                 peer_public_endpoint: "http://localhost:8080".into(),
                 peer_api_key: "test-key".into(),

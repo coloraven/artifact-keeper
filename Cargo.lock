@@ -189,6 +189,7 @@ dependencies = [
  "clap",
  "cron",
  "dotenvy",
+ "ed25519-dalek",
  "flate2",
  "futures",
  "git2",

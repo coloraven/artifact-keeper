@@ -200,6 +200,21 @@ pub struct Config {
     /// permitted so users can authenticate and clients can negotiate.
     pub guest_access_enabled: bool,
 
+    /// When true (the default), a WASM plugin may only be installed (via ZIP,
+    /// Git, or reload) if it ships a detached Ed25519 signature
+    /// (`plugin.wasm.sig`) over its raw WASM bytes that verifies against the
+    /// operator-provisioned trusted public key (`plugins_trusted_pubkey`).
+    /// This is a fail-closed supply-chain control: with signing required but no
+    /// trusted key configured, every install is rejected. Set
+    /// `PLUGINS_REQUIRE_SIGNED=false`/`0` to opt out for trusted/first-party
+    /// or dev environments. Already-installed plugins loaded at startup are
+    /// unaffected — only the install/reload ingress paths are gated.
+    pub plugins_require_signed: bool,
+
+    /// Base64-encoded Ed25519 public key (32 raw bytes) used to verify plugin
+    /// signatures. `None` when unset. Never exposed in API responses or logs.
+    pub plugins_trusted_pubkey: Option<String>,
+
     /// Peer instance name for mesh identification
     pub peer_instance_name: String,
 
@@ -487,6 +502,8 @@ redacted_debug!(Config {
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
+    show plugins_require_signed,
+    redact_option plugins_trusted_pubkey,
     show peer_instance_name,
     show peer_public_endpoint,
     redact peer_api_key,
@@ -574,6 +591,8 @@ impl Default for Config {
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            plugins_require_signed: true,
+            plugins_trusted_pubkey: None,
             peer_instance_name: "test-instance".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
@@ -697,6 +716,17 @@ impl Config {
                 env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
                 Ok("false" | "0")
             ),
+            // Fail-closed supply-chain control: defaults to true so an
+            // unsigned WASM plugin cannot be installed out of the box. Only an
+            // explicit, recognized negative ("false"/"0", case/whitespace-
+            // insensitive) opts out; unset/empty/garbage keeps it required.
+            plugins_require_signed: parse_opt_out_flag(
+                env::var("PLUGINS_REQUIRE_SIGNED").ok().as_deref(),
+            ),
+            plugins_trusted_pubkey: env::var("PLUGINS_TRUSTED_PUBKEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
@@ -1061,6 +1091,15 @@ mod tests {
     // Environment variable tests must be serialized because env is global state.
     // We use a mutex to prevent parallel test interference.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Restore an env var to a previously captured value (or remove it if it
+    /// was unset), so env-mutating tests do not leak state to other tests.
+    fn restore_env(key: &str, saved: Option<String>) {
+        match saved {
+            Some(v) => env::set_var(key, v),
+            None => env::remove_var(key),
+        }
+    }
 
     // -----------------------------------------------------------------------
     // parse_opt_in_flag (pure; blob GC opt-in, #1408)
@@ -1697,6 +1736,92 @@ mod tests {
         // which is what test_config() relies on.
         let config = Config::default();
         assert!(config.guest_access_enabled);
+    }
+
+    #[test]
+    fn test_config_plugins_require_signed_default_true() {
+        // Fail-closed: when PLUGINS_REQUIRE_SIGNED is unset, plugin signature
+        // verification is required so an unsigned WASM cannot be installed.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("PLUGINS_REQUIRE_SIGNED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("PLUGINS_REQUIRE_SIGNED");
+
+        assert!(Config::from_env().unwrap().plugins_require_signed);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("PLUGINS_REQUIRE_SIGNED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_plugins_require_signed_explicit_values() {
+        // Only an explicit, recognized negative disables the requirement;
+        // garbage/empty/affirmative all keep it required (fail-closed).
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("PLUGINS_REQUIRE_SIGNED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("PLUGINS_REQUIRE_SIGNED", "false");
+        assert!(!Config::from_env().unwrap().plugins_require_signed);
+
+        env::set_var("PLUGINS_REQUIRE_SIGNED", "0");
+        assert!(!Config::from_env().unwrap().plugins_require_signed);
+
+        env::set_var("PLUGINS_REQUIRE_SIGNED", "true");
+        assert!(Config::from_env().unwrap().plugins_require_signed);
+
+        env::set_var("PLUGINS_REQUIRE_SIGNED", "1");
+        assert!(Config::from_env().unwrap().plugins_require_signed);
+
+        env::set_var("PLUGINS_REQUIRE_SIGNED", "garbage");
+        assert!(Config::from_env().unwrap().plugins_require_signed);
+
+        env::set_var("PLUGINS_REQUIRE_SIGNED", "");
+        assert!(Config::from_env().unwrap().plugins_require_signed);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("PLUGINS_REQUIRE_SIGNED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_plugins_trusted_pubkey() {
+        // Unset -> None; set non-empty -> Some(trimmed); empty/whitespace -> None.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_key = env::var("PLUGINS_TRUSTED_PUBKEY").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::remove_var("PLUGINS_TRUSTED_PUBKEY");
+        assert_eq!(Config::from_env().unwrap().plugins_trusted_pubkey, None);
+
+        env::set_var("PLUGINS_TRUSTED_PUBKEY", "  abc123==  ");
+        assert_eq!(
+            Config::from_env()
+                .unwrap()
+                .plugins_trusted_pubkey
+                .as_deref(),
+            Some("abc123==")
+        );
+
+        env::set_var("PLUGINS_TRUSTED_PUBKEY", "   ");
+        assert_eq!(Config::from_env().unwrap().plugins_trusted_pubkey, None);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("PLUGINS_TRUSTED_PUBKEY", saved_key);
     }
 
     #[test]

@@ -34,6 +34,21 @@ pub struct ScannersConfig {
     pub dependency_track_enabled: bool,
 }
 
+/// Plugin signature-verification (supply-chain) policy status.
+///
+/// Exposes only booleans — never the trusted key material itself — so frontends
+/// and operators can see whether unsigned plugin installs are rejected and
+/// whether a trusted publisher key has been provisioned.
+#[derive(Serialize, ToSchema)]
+pub struct PluginSigningConfig {
+    /// Whether a valid signature is required to install a WASM plugin.
+    pub required: bool,
+    /// Whether an operator trusted public key has been configured. When
+    /// `required` is true but this is false, every install is rejected
+    /// (fail-closed).
+    pub trusted_key_configured: bool,
+}
+
 /// Authentication provider availability.
 #[derive(Serialize, ToSchema)]
 pub struct AuthConfig {
@@ -77,6 +92,8 @@ pub struct SystemConfigResponse {
     /// Fine-grained permissions enforcement status. Permission rules can be
     /// managed via /api/v1/permissions and are actively enforced.
     pub permissions: PermissionsConfig,
+    /// Plugin signature-verification (supply-chain) policy status.
+    pub plugin_signing: PluginSigningConfig,
 }
 
 /// Return public runtime configuration.
@@ -139,6 +156,14 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
         enforcement_enabled: true,
     };
 
+    // Expose only booleans about the plugin signing policy — never the key
+    // material — so the supply-chain posture is observable without leaking the
+    // trusted public key.
+    let plugin_signing = PluginSigningConfig {
+        required: config.plugins_require_signed,
+        trusted_key_configured: config.plugins_trusted_pubkey.is_some(),
+    };
+
     Json(SystemConfigResponse {
         max_upload_size_bytes: config.max_upload_size_bytes,
         demo_mode: config.demo_mode,
@@ -149,13 +174,20 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
         auth,
         oidc_issuer: config.oidc_issuer.clone(),
         permissions,
+        plugin_signing,
     })
 }
 
 #[derive(OpenApi)]
 #[openapi(
     paths(get_system_config),
-    components(schemas(SystemConfigResponse, ScannersConfig, AuthConfig, PermissionsConfig))
+    components(schemas(
+        SystemConfigResponse,
+        ScannersConfig,
+        AuthConfig,
+        PermissionsConfig,
+        PluginSigningConfig
+    ))
 )]
 pub struct SystemConfigApiDoc;
 
@@ -185,6 +217,10 @@ mod tests {
             permissions: PermissionsConfig {
                 rules_exist: false,
                 enforcement_enabled: false,
+            },
+            plugin_signing: PluginSigningConfig {
+                required: true,
+                trusted_key_configured: false,
             },
         }
     }
@@ -234,6 +270,10 @@ mod tests {
             permissions: PermissionsConfig {
                 rules_exist: true,
                 enforcement_enabled: true,
+            },
+            plugin_signing: PluginSigningConfig {
+                required: true,
+                trusted_key_configured: true,
             },
         };
 
@@ -375,6 +415,39 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["guest_access_enabled"], false);
         assert!(json.contains("\"guest_access_enabled\":false"));
+    }
+
+    #[test]
+    fn test_system_config_plugin_signing_serialization() {
+        // plugin_signing must expose exactly {required, trusted_key_configured}
+        // and never leak any key material.
+        let response = SystemConfigResponse {
+            plugin_signing: PluginSigningConfig {
+                required: true,
+                trusted_key_configured: true,
+            },
+            ..minimal_response()
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["plugin_signing"]["required"], true);
+        assert_eq!(parsed["plugin_signing"]["trusted_key_configured"], true);
+
+        // Only the two boolean fields are present — no key bytes anywhere.
+        let obj = parsed["plugin_signing"].as_object().unwrap();
+        assert_eq!(obj.len(), 2);
+        assert!(!json.contains("plugins_trusted_pubkey"));
+        assert!(!json.to_lowercase().contains("pubkey"));
+    }
+
+    #[test]
+    fn test_system_config_plugin_signing_default_required() {
+        // minimal_response models the fail-closed default: required, no key yet.
+        let response = minimal_response();
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["plugin_signing"]["required"], true);
+        assert_eq!(parsed["plugin_signing"]["trusted_key_configured"], false);
     }
 
     #[test]

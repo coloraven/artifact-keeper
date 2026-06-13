@@ -254,8 +254,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Initialize WASM plugin system (T068)
     let plugins_dir =
         PathBuf::from(std::env::var("PLUGINS_DIR").unwrap_or_else(|_| "./plugins".to_string()));
-    let (plugin_registry, wasm_plugin_service) =
-        initialize_wasm_plugins(db_pool.clone(), plugins_dir).await?;
+    let (plugin_registry, wasm_plugin_service) = initialize_wasm_plugins(
+        db_pool.clone(),
+        plugins_dir,
+        config.plugins_require_signed,
+        config.plugins_trusted_pubkey.clone(),
+    )
+    .await?;
 
     // Initialize OpenSearch (optional, graceful fallback)
     let search_service = match &config.opensearch_url {
@@ -999,6 +1004,8 @@ fn main() -> Result<()> {
 async fn initialize_wasm_plugins(
     db_pool: sqlx::PgPool,
     plugins_dir: PathBuf,
+    require_signed: bool,
+    trusted_pubkey: Option<String>,
 ) -> Result<(Arc<PluginRegistry>, Arc<WasmPluginService>)> {
     tracing::info!("Initializing WASM plugin system");
 
@@ -1010,11 +1017,15 @@ async fn initialize_wasm_plugins(
         ))
     })?);
 
-    // Create WASM plugin service
+    // Create WASM plugin service. The signature policy gates the install/reload
+    // ingress paths; startup loading below intentionally reuses already-trusted
+    // DB records and is not re-gated.
     let wasm_service = Arc::new(WasmPluginService::new(
         db_pool.clone(),
         registry.clone(),
         plugins_dir.clone(),
+        require_signed,
+        trusted_pubkey,
     ));
 
     // Ensure plugins directory exists

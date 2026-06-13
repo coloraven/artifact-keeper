@@ -38,26 +38,151 @@ pub struct TestMetadata {
     pub size_bytes: u64,
 }
 
+/// Detached-signature file name suffix expected alongside a plugin's WASM file.
+const PLUGIN_SIG_SUFFIX: &str = ".sig";
+
+/// Compute the detached-signature path for a WASM file: `<wasm>.sig`.
+///
+/// e.g. `/plugins/foo.wasm` -> `/plugins/foo.wasm.sig`.
+fn sig_path_for(wasm_path: &Path) -> PathBuf {
+    let mut s = wasm_path.as_os_str().to_owned();
+    s.push(PLUGIN_SIG_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Verify a detached Ed25519 signature over `msg`.
+///
+/// `pubkey_b64` is the base64-encoded 32-byte verifying key; `sig_b64` is the
+/// base64-encoded 64-byte signature. Returns `false` on any decode/length/parse
+/// failure or signature mismatch — never panics, never trusts malformed input.
+fn verify_ed25519(pubkey_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
+    use base64::Engine;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    let key_bytes = match engine.decode(pubkey_b64.trim()) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let key_arr: [u8; 32] = match key_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&key_arr) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+
+    let sig_bytes = match engine.decode(sig_b64.trim()) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let signature = Signature::from_bytes(&sig_arr);
+
+    verifying_key.verify(msg, &signature).is_ok()
+}
+
+/// Pure gate decision for the plugin signature policy (fail-closed).
+///
+/// When `require` is false, installation is always permitted (back-compat /
+/// first-party trust). When `require` is true, ALL of the following must hold,
+/// otherwise an error is returned:
+///   * a trusted public key is configured (no key => reject, fail closed),
+///   * a signature file accompanies the WASM,
+///   * the signature verifies against the trusted key (`sig_valid`).
+fn signature_gate(
+    require: bool,
+    trusted_key: Option<&str>,
+    sig_present: bool,
+    sig_valid: bool,
+) -> Result<()> {
+    if !require {
+        return Ok(());
+    }
+    if trusted_key.is_none() {
+        return Err(AppError::Validation(
+            "Plugin signing is required but no trusted public key is configured \
+             (set PLUGINS_TRUSTED_PUBKEY, or set PLUGINS_REQUIRE_SIGNED=false to opt out)"
+                .to_string(),
+        ));
+    }
+    if !sig_present {
+        return Err(AppError::Validation(
+            "Plugin signing is required but the plugin is missing a detached \
+             signature (plugin.wasm.sig)"
+                .to_string(),
+        ));
+    }
+    if !sig_valid {
+        return Err(AppError::Validation(
+            "Plugin signature verification failed: the signature does not match \
+             the trusted publisher key"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// WASM plugin service for managing format handler plugins.
 pub struct WasmPluginService {
     db: PgPool,
     registry: Arc<PluginRegistry>,
     plugins_dir: PathBuf,
+    /// When true, every install/reload ingress path requires a valid detached
+    /// Ed25519 signature over the WASM bytes (fail-closed supply-chain control).
+    require_signed: bool,
+    /// Operator-provisioned base64 Ed25519 public key trusted to sign plugins.
+    trusted_pubkey: Option<String>,
 }
 
 impl WasmPluginService {
     /// Create a new WASM plugin service.
-    pub fn new(db: PgPool, registry: Arc<PluginRegistry>, plugins_dir: PathBuf) -> Self {
+    pub fn new(
+        db: PgPool,
+        registry: Arc<PluginRegistry>,
+        plugins_dir: PathBuf,
+        require_signed: bool,
+        trusted_pubkey: Option<String>,
+    ) -> Self {
         Self {
             db,
             registry,
             plugins_dir,
+            require_signed,
+            trusted_pubkey,
         }
     }
 
     /// Get the plugin registry.
     pub fn registry(&self) -> &Arc<PluginRegistry> {
         &self.registry
+    }
+
+    /// Enforce the plugin signature policy against the exact WASM bytes that
+    /// will be executed, BEFORE any DB record / format handler / registry
+    /// activation. Locates a detached `<wasm>.sig` next to `wasm_path`, verifies
+    /// it against the operator-provisioned trusted Ed25519 key, and applies the
+    /// fail-closed [`signature_gate`]. Shared by the ZIP, Git, and reload
+    /// ingress paths so the policy lives in exactly one place.
+    async fn enforce_signature_policy(&self, wasm_path: &Path, wasm_bytes: &[u8]) -> Result<()> {
+        let sig_path = sig_path_for(wasm_path);
+        let sig_contents = tokio::fs::read_to_string(&sig_path).await.ok();
+        let sig_present = sig_contents.is_some();
+        let sig_valid = match (self.trusted_pubkey.as_deref(), sig_contents.as_deref()) {
+            (Some(key), Some(sig)) => verify_ed25519(key, wasm_bytes, sig),
+            _ => false,
+        };
+        signature_gate(
+            self.require_signed,
+            self.trusted_pubkey.as_deref(),
+            sig_present,
+            sig_valid,
+        )
     }
 
     // =========================================================================
@@ -742,6 +867,11 @@ impl WasmPluginService {
             .validate(&wasm_bytes)
             .map_err(|e| AppError::Validation(format!("Invalid WASM component: {}", e)))?;
 
+        // Supply-chain gate: reject before any DB record / format handler /
+        // registry activation unless the WASM is signed by the trusted key.
+        self.enforce_signature_policy(&wasm_path, &wasm_bytes)
+            .await?;
+
         // Copy WASM to plugins directory
         let dest_path = self.wasm_path(&manifest.plugin.name);
         tokio::fs::copy(&wasm_path, &dest_path)
@@ -1242,6 +1372,11 @@ impl WasmPluginService {
             .validate(&wasm_bytes)
             .map_err(|e| AppError::Validation(format!("Invalid WASM component: {}", e)))?;
 
+        // Supply-chain gate: reject before any DB record / format handler /
+        // registry activation unless the WASM is signed by the trusted key.
+        self.enforce_signature_policy(&wasm_path, &wasm_bytes)
+            .await?;
+
         // Copy WASM to plugins directory
         let dest_path = self.wasm_path(&manifest.plugin.name);
         tokio::fs::copy(&wasm_path, &dest_path)
@@ -1513,6 +1648,13 @@ impl WasmPluginService {
         let wasm_bytes = tokio::fs::read(&wasm_path)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to read WASM: {}", e)))?;
+
+        // Reload ingress is gated by the same supply-chain policy as install:
+        // a re-clone must still carry a valid signature over the new WASM
+        // before it can replace the running plugin. The sig file lives next to
+        // the freshly cloned WASM, so verify while the temp dir is still alive.
+        self.enforce_signature_policy(&wasm_path, &wasm_bytes)
+            .await?;
 
         Ok((manifest, wasm_bytes))
     }
@@ -2663,5 +2805,100 @@ timeout_secs = 30
         assert_eq!(GitCloneErrorKind::NotFound, GitCloneErrorKind::NotFound);
         assert_ne!(GitCloneErrorKind::NotFound, GitCloneErrorKind::Timeout);
         assert_ne!(GitCloneErrorKind::Unauthorized, GitCloneErrorKind::Other);
+    }
+
+    // -----------------------------------------------------------------------
+    // Plugin signature policy (supply-chain trust) — pure, DB-free
+    // -----------------------------------------------------------------------
+
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Build a deterministic test keypair from a fixed 32-byte seed and produce
+    /// (base64 pubkey, base64 signature) over `msg`. No RNG / network needed.
+    fn test_keypair_sign(seed: u8, msg: &[u8]) -> (String, String) {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let signature = signing_key.sign(msg);
+        let engine = base64::engine::general_purpose::STANDARD;
+        (
+            engine.encode(verifying_key.to_bytes()),
+            engine.encode(signature.to_bytes()),
+        )
+    }
+
+    #[test]
+    fn test_sig_path_for_appends_suffix() {
+        assert_eq!(
+            sig_path_for(Path::new("/plugins/foo.wasm")),
+            PathBuf::from("/plugins/foo.wasm.sig")
+        );
+    }
+
+    #[test]
+    fn test_verify_ed25519_valid_signature() {
+        let msg = b"the exact wasm bytes we will execute";
+        let (pubkey, sig) = test_keypair_sign(7, msg);
+        assert!(verify_ed25519(&pubkey, msg, &sig));
+    }
+
+    #[test]
+    fn test_verify_ed25519_tampered_message() {
+        let msg = b"original wasm bytes";
+        let (pubkey, sig) = test_keypair_sign(7, msg);
+        assert!(!verify_ed25519(&pubkey, b"tampered wasm bytes", &sig));
+    }
+
+    #[test]
+    fn test_verify_ed25519_wrong_key() {
+        let msg = b"some wasm bytes";
+        let (_pubkey, sig) = test_keypair_sign(7, msg);
+        let (other_pubkey, _other_sig) = test_keypair_sign(9, msg);
+        assert!(!verify_ed25519(&other_pubkey, msg, &sig));
+    }
+
+    #[test]
+    fn test_verify_ed25519_malformed_inputs() {
+        let msg = b"bytes";
+        let (pubkey, sig) = test_keypair_sign(7, msg);
+        // Malformed base64 / wrong-length material must be rejected, not panic.
+        assert!(!verify_ed25519("not base64 !!!", msg, &sig));
+        assert!(!verify_ed25519(&pubkey, msg, "not base64 !!!"));
+        assert!(!verify_ed25519("", msg, &sig));
+        assert!(!verify_ed25519(&pubkey, msg, ""));
+        // Valid base64 but wrong byte length.
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 8]);
+        assert!(!verify_ed25519(&short, msg, &sig));
+        assert!(!verify_ed25519(&pubkey, msg, &short));
+    }
+
+    #[test]
+    fn test_signature_gate_not_required_allows_missing_sig() {
+        // Back-compat: opt-out mode permits unsigned plugins.
+        assert!(signature_gate(false, None, false, false).is_ok());
+        assert!(signature_gate(false, Some("key"), false, false).is_ok());
+    }
+
+    #[test]
+    fn test_signature_gate_required_no_trusted_key_fails_closed() {
+        let err = signature_gate(true, None, true, true).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_signature_gate_required_missing_sig_rejected() {
+        let err = signature_gate(true, Some("key"), false, false).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_signature_gate_required_invalid_sig_rejected() {
+        let err = signature_gate(true, Some("key"), true, false).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_signature_gate_required_valid_sig_ok() {
+        assert!(signature_gate(true, Some("key"), true, true).is_ok());
     }
 }
