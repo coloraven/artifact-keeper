@@ -40,12 +40,10 @@ use crate::storage::StorageLocation;
 /// are handled separately by parsing the Maven coordinate below.
 ///
 /// Primary file extensions (`.jar`, `.aar`, `.war`, `.ear`, `.zip`) are
-/// **deliberately excluded** from this list. Primary files always have
-/// their own row in `artifacts` (and therefore go through the
-/// SQL-backed `proxy_helpers::local_fetch_by_path`); allowing the
-/// storage fallback to serve a primary would silently bypass the
-/// quarantine and soft-delete gating on the primary's own row. The
-/// allowlist scopes the fallback to its documented purpose.
+/// **deliberately excluded** from this list; they are handled by a
+/// separate primary-path check in [`maven_local_fetch_storage_fallback`]
+/// Gate 1, which admits a primary only when a live sibling anchors the
+/// GAV *and* the primary has no soft-deleted own row.
 const MAVEN_SECONDARY_FILE_EXTENSIONS: &[&str] = &[
     ".pom",
     ".module",
@@ -83,6 +81,29 @@ fn maven_gav_directory(artifact_path: &str) -> Option<&str> {
     artifact_path.rsplit_once('/').map(|(dir, _)| dir)
 }
 
+/// Primary Maven artifact extensions eligible for the storage fallback when
+/// a live sibling row anchors the GAV and the primary has no soft-deleted own row.
+///
+/// Must stay in sync with `is_primary_maven_artifact` in `handlers/maven.rs`
+/// (the upload side that decides which file gets the canonical row) and with
+/// the Gate 2 anchor-preference `CASE` below. A type listed here but not there
+/// (or vice versa) means a primary that is parked rowless on upload but 404s on
+/// virtual-repo fetch.
+const MAVEN_PRIMARY_FILE_EXTENSIONS: &[&str] =
+    &[".jar", ".aar", ".war", ".ear", ".zip", ".bundle", ".tar.gz"];
+
+/// Returns `true` when `path` ends with a primary extension.
+///
+/// The caller must pre-compute `is_secondary` and only call this when
+/// `!is_secondary`; that avoids running `parse_coordinates` twice for
+/// the same path.
+#[inline]
+fn is_maven_primary_path_given_not_secondary(path: &str) -> bool {
+    MAVEN_PRIMARY_FILE_EXTENSIONS
+        .iter()
+        .any(|ext| path.ends_with(ext))
+}
+
 /// Maven-specific storage-direct fallback for virtual-repo downloads.
 ///
 /// The Maven download handler (`handlers/maven.rs`) groups artifacts by
@@ -106,15 +127,15 @@ fn maven_gav_directory(artifact_path: &str) -> Option<&str> {
 /// files (which have no row of their own), this helper:
 ///
 /// 1. Refuses any path that is neither a known companion-file suffix
-///    ([`MAVEN_SECONDARY_FILE_EXTENSIONS`]) nor a valid Maven coordinate
-///    with a classifier.
-///    Primary `.jar`/`.aar`/`.war`/`.ear` paths fall back to
-///    `NotFound` here so the caller can't accidentally route them
-///    around their own SQL row.
-/// 2. Looks up a "primary" sibling row in the same GAV directory and
-///    verifies it is not soft-deleted and not quarantined before
-///    serving the secondary bytes. A quarantined or deleted primary
-///    means the whole GAV is gated; the secondary travels with it.
+///    ([`MAVEN_SECONDARY_FILE_EXTENSIONS`]) / classifier artifact nor a
+///    bare primary extension ([`MAVEN_PRIMARY_FILE_EXTENSIONS`]).
+///    For primaries: also checks the primary's own row for soft-delete
+///    and quarantine (Gate 1.5) so a CLEAN sibling cannot anchor past
+///    a retracted or quarantined primary.
+/// 2. Looks up a live anchor row in the same GAV directory, preferring
+///    a primary-extension row so quarantine is checked against the
+///    authoritative row rather than an arbitrary younger sibling.
+///    A miss means the GAV is gone; stray storage bytes must not be served.
 /// 3. Only then reads `maven/<path>` from storage.
 ///
 /// ## Composition
@@ -134,36 +155,102 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<StreamingFetchResult, Response> {
-    // Gate 1: Only companion files and classifier artifacts are eligible.
-    // A primary `.jar`/`.aar`/etc. always has its own row and must travel
-    // the SQL path so its quarantine/soft-delete state is honored.
-    if !is_maven_secondary_path(artifact_path) {
+    // Gate 1: Only secondaries and bare primaries are eligible; anything else is 404.
+    // Compute is_secondary once — is_maven_primary_path_given_not_secondary takes the
+    // pre-computed flag so parse_coordinates is only called once per request.
+    let is_secondary = is_maven_secondary_path(artifact_path);
+    let is_primary = !is_secondary && is_maven_primary_path_given_not_secondary(artifact_path);
+    if !is_secondary && !is_primary {
         return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
     }
 
-    // Gate 2: Verify a live primary exists in the same GAV directory.
-    // We look for ANY non-deleted artifact whose path is a sibling of
-    // `artifact_path`; a hit means the GAV is live and the secondary
-    // inherits its policy state. A miss means there is no primary to
-    // anchor the secondary, so a stray storage byte at `maven/<path>`
-    // (e.g. orphaned by a botched delete) must not be served.
+    // Gate 1.5: For primary artifacts, check the primary's own DB row for both
+    // soft-delete and quarantine before reaching Gate 2. Without this, a CLEAN
+    // sibling in the same GAV (e.g. the .pom) could anchor past a quarantined
+    // or retracted primary's own row.
+    //
+    // Fetch is_deleted alongside the quarantine columns in a single query: one
+    // round-trip on the live-own-row path, and an atomic read so a soft-delete
+    // committed between two separate queries can't be observed inconsistently
+    // (which would let the quarantine check be skipped).
+    if is_primary {
+        let own =
+            sqlx::query_as::<_, (bool, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
+                "SELECT is_deleted, quarantine_status, quarantine_until \
+             FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 \
+             LIMIT 1",
+            )
+            .bind(repo_id)
+            .bind(artifact_path)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| internal_error("Database", e))?;
+
+        match own {
+            // Retracted: refuse even if a live sibling would satisfy Gate 2.
+            Some((true, _, _)) => {
+                return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response())
+            }
+            // Live own row: also check quarantine on the primary's own row so a
+            // CLEAN sibling cannot anchor past a quarantined primary.
+            Some((false, quarantine_status, quarantine_until)) => {
+                crate::services::quarantine_service::check_download_allowed(
+                    quarantine_status.as_deref(),
+                    quarantine_until,
+                    chrono::Utc::now(),
+                )
+                .map_err(|e| e.into_response())?;
+            }
+            // No own row (rowless primary — GAV-grouped). Proceed to Gate 2
+            // to anchor on the live sibling.
+            None => {}
+        }
+    }
+
+    // Gate 2: Verify a live sibling exists in the same GAV directory.
+    // Prefer a *true primary* row (primary extension, no classifier) as the
+    // anchor so quarantine is checked against the authoritative artifact, not
+    // an arbitrary younger sibling. Classifier jars (`-sources.jar`,
+    // `-tests.jar`, …) also end in `.jar`, so they must be excluded from the
+    // primary bucket — otherwise a CLEAN classifier jar with its own row (as
+    // produced by row-per-file migration imports) could anchor past a
+    // quarantined primary and leak the GAV's companion files.
+    // Escape LIKE metacharacters — sbt artifact IDs contain `_` (SQL wildcard).
+    // A miss means there is no primary to anchor the secondary, so a stray
+    // storage byte at `maven/<path>` (e.g. orphaned by a botched delete) must
+    // not be served.
+    //
+    // The primary/classifier suffix lists below mirror MAVEN_PRIMARY_FILE_EXTENSIONS
+    // and the classifier-jar entries of MAVEN_SECONDARY_FILE_EXTENSIONS; keep them
+    // in sync.
     let gav_dir = match maven_gav_directory(artifact_path) {
         Some(dir) if !dir.is_empty() => dir,
         // Top-level / empty-dir paths can't be valid maven artifact paths.
         _ => return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response()),
     };
-    let sibling_prefix = format!("{}/%", gav_dir);
+    let sibling_like = format!("{}/", super::escape_like_literal(gav_dir)) + "%";
     let primary = sqlx::query_as::<_, LocalArtifactRow>(
         "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 \
-           AND path LIKE $2 \
+           AND path LIKE $2 ESCAPE '\\' \
            AND is_deleted = false \
-         ORDER BY created_at DESC \
+         ORDER BY \
+           CASE WHEN (path LIKE '%.jar' ESCAPE '\\' OR path LIKE '%.aar' ESCAPE '\\' \
+                      OR path LIKE '%.war' ESCAPE '\\' OR path LIKE '%.ear' ESCAPE '\\' \
+                      OR path LIKE '%.zip' ESCAPE '\\' OR path LIKE '%.bundle' ESCAPE '\\' \
+                      OR path LIKE '%.tar.gz' ESCAPE '\\') \
+                     AND path NOT LIKE '%-sources.jar' ESCAPE '\\' \
+                     AND path NOT LIKE '%-javadoc.jar' ESCAPE '\\' \
+                     AND path NOT LIKE '%-tests.jar' ESCAPE '\\' \
+                     AND path NOT LIKE '%-test-sources.jar' ESCAPE '\\' \
+                THEN 0 ELSE 1 END ASC, \
+           created_at DESC \
          LIMIT 1",
     )
     .bind(repo_id)
-    .bind(&sibling_prefix)
+    .bind(&sibling_like)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
@@ -527,10 +614,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_storage_fallback_refuses_primary_extensions() {
-        // SECURITY: even if bytes exist at `maven/<path>.jar`, the
-        // storage fallback must refuse — primaries always have their
-        // own row and must travel the SQL path.
+    async fn test_storage_fallback_refuses_primary_without_sibling_anchor() {
+        // SECURITY: primaries with no live sibling row in the same GAV directory
+        // must return 404 — there is nothing to anchor the GAV policy on.
         let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
             return;
         };
@@ -548,10 +634,96 @@ mod tests {
             .expect("put");
             let err = maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, &path)
                 .await
-                .expect_err(&format!("primary {} must be refused", primary_ext));
+                .expect_err(&format!(
+                    "primary {} with no sibling anchor must be refused",
+                    primary_ext
+                ));
             assert_eq!(err.status(), StatusCode::NOT_FOUND);
         }
 
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_storage_fallback_serves_primary_jar_anchored_by_pom_row() {
+        // A rowless primary JAR must be served when a live sibling POM row
+        // anchors the GAV (sbt/Maven GAV-grouping: AK parks the canonical row
+        // on the POM and the JAR has no own row).
+        let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        let pom_path = "com/example/anc/1.0/anc-1.0.pom";
+        insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            pom_path,
+            &format!("maven/{}", pom_path),
+        )
+        .await;
+        let jar_path = "com/example/anc/1.0/anc-1.0.jar";
+        let jar_bytes = Bytes::from_static(b"primary-jar-bytes");
+        put_artifact_bytes(
+            &state,
+            &repo,
+            &format!("maven/{}", jar_path),
+            jar_bytes.clone(),
+        )
+        .await
+        .expect("put jar");
+        let location = repo.storage_location();
+        let result =
+            maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, jar_path)
+                .await
+                .expect("rowless primary anchored by sibling POM must be served");
+        let content = result.collect().await.unwrap();
+        assert_eq!(&content[..], &jar_bytes[..]);
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_storage_fallback_refuses_deleted_primary_jar() {
+        // SECURITY: a primary JAR with `is_deleted = true` must be refused even
+        // though a live sibling POM exists (Gate 1.5). The artifact was retracted.
+        let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        let pom_path = "com/example/del/1.0/del-1.0.pom";
+        insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            pom_path,
+            &format!("maven/{}", pom_path),
+        )
+        .await;
+        let jar_path = "com/example/del/1.0/del-1.0.jar";
+        let jar_id = insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            jar_path,
+            &format!("maven/{}", jar_path),
+        )
+        .await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(jar_id)
+            .execute(&pool)
+            .await
+            .expect("soft-delete jar");
+        put_artifact_bytes(
+            &state,
+            &repo,
+            &format!("maven/{}", jar_path),
+            Bytes::from_static(b"deleted-jar-must-not-leak"),
+        )
+        .await
+        .expect("put jar bytes");
+        let location = repo.storage_location();
+        let err = maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, jar_path)
+            .await
+            .expect_err("soft-deleted primary must be refused");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 
@@ -705,6 +877,76 @@ mod tests {
         // Same downstream refusal-status set as
         // `test_storage_fallback_honors_quarantine_on_primary` — what
         // matters is that the classifier bytes are NOT served.
+        assert!(
+            err.status() == StatusCode::CONFLICT
+                || err.status() == StatusCode::FORBIDDEN
+                || err.status() == StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+                || err.status() == StatusCode::NOT_FOUND,
+            "expected a refusal status, got {}",
+            err.status()
+        );
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_storage_fallback_anchors_on_true_primary_not_clean_classifier() {
+        // SECURITY: a row-per-file GAV (as produced by migration imports) can
+        // hold both a quarantined true primary `.jar` AND a CLEAN classifier
+        // `-sources.jar`, each with its own row. Gate 2 must anchor the
+        // quarantine check on the true primary (no classifier), not on the
+        // clean classifier jar — otherwise the quarantined GAV's companions
+        // leak. The classifier jar is inserted AFTER the primary so the old
+        // `created_at DESC` tiebreak would have preferred it.
+        let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        let primary_id = insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            "com/example/qclf/1.0/qclf-1.0.jar",
+            "maven/com/example/qclf/1.0/qclf-1.0.jar",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+             quarantine_until = NULL WHERE id = $1",
+        )
+        .bind(primary_id)
+        .execute(&pool)
+        .await
+        .expect("set quarantine");
+        // Clean classifier jar with its own row, created after the primary.
+        insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            "com/example/qclf/1.0/qclf-1.0-sources.jar",
+            "maven/com/example/qclf/1.0/qclf-1.0-sources.jar",
+        )
+        .await;
+        // Companion that would leak if quarantine were checked against the
+        // clean classifier jar instead of the quarantined primary.
+        put_artifact_bytes(
+            &state,
+            &repo,
+            "maven/com/example/qclf/1.0/qclf-1.0.pom",
+            Bytes::from_static(b"<project>qclf</project>"),
+        )
+        .await
+        .expect("put pom");
+
+        let location = repo.storage_location();
+        let err = maven_local_fetch_storage_fallback(
+            &pool,
+            &state,
+            repo_id,
+            &location,
+            "com/example/qclf/1.0/qclf-1.0.pom",
+        )
+        .await
+        .expect_err("clean classifier jar must not anchor past the quarantined primary");
         assert!(
             err.status() == StatusCode::CONFLICT
                 || err.status() == StatusCode::FORBIDDEN
