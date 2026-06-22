@@ -346,6 +346,55 @@ impl ArtifactService {
             }
         }
 
+        // Release-immutability backstop — the single chokepoint every
+        // service-backed upload path flows through (the generic
+        // `upload_artifact`/`upload_artifact_multipart*` endpoints, pypi,
+        // debian, ...). The live-overwrite check above only inspects
+        // *non-deleted* rows, so a DELETE (soft-delete) followed by re-uploading
+        // DIFFERENT bytes to the SAME released coordinate would otherwise slip
+        // through the `ON CONFLICT DO UPDATE` below (which resurrects the
+        // tombstone). Re-query INCLUDING soft-deleted rows and reject the swap.
+        //
+        // The oracle is the artifact's REAL release coordinate, not the
+        // proxy-cache TTL classifier alone: a coordinate is protected when a
+        // prior row exists there AND that path is not a format's genuinely
+        // in-place-rewritten index file (`maven-metadata.xml`, npm packument,
+        // ...). This covers the default-format families (Generic / Nuget /
+        // Conan / Composer / Go / Rpm / Debian / Helm) whose every stored path
+        // is a release coordinate and which `classify` would otherwise treat as
+        // mutable-by-default. Identical-bytes republish (idempotent undelete)
+        // and genuine mutable index files proceed unchanged.
+        if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
+            if !crate::services::cache_classifier::is_explicitly_mutable_index(&repo.format, path) {
+                let prior = sqlx::query!(
+                    "SELECT checksum_sha256, version FROM artifacts \
+                     WHERE repository_id = $1 AND path = $2",
+                    repository_id,
+                    path
+                )
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+                // Only a *released* coordinate is immutable: either the
+                // structural classifier marks it immutable, or the prior row was
+                // published as a versioned artifact (version IS NOT NULL). A
+                // path-less, version-less generic blob remains freely
+                // replaceable.
+                if let Some(prior) = prior {
+                    let is_released = prior.version.is_some()
+                        || crate::services::cache_classifier::classify(&repo.format, path)
+                            .is_immutable();
+                    if is_released && !prior.checksum_sha256.eq_ignore_ascii_case(&checksum_sha256)
+                    {
+                        return Err(AppError::Conflict(
+                            "Artifact version already exists and is immutable".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Check if content already exists (deduplication)
         let content_exists = self.storage.exists(&storage_key).await?;
 
