@@ -2022,6 +2022,19 @@ impl ProxyService {
     /// If the HEAD itself errors (transport failure mid-revalidation), we
     /// treat the cache as not-fresh and fall through to the slow path
     /// rather than silently serving a possibly-stale URL.
+    /// Storage backend handle that owns the proxy cache objects.
+    ///
+    /// Proxy-cache content lives at the storage root (`proxy-cache/<repo>/...`)
+    /// with no configured key prefix. Presigning a cache key MUST go through
+    /// this handle — the same one `is_cache_fresh` and the cache reads/writes
+    /// use — so the signed key matches where the object actually lives. Signing
+    /// via a prefixed handle yields a key the object store has no object for.
+    pub(crate) fn cache_storage_backend(
+        &self,
+    ) -> std::sync::Arc<dyn crate::services::storage_service::StorageBackend> {
+        self.storage.backend()
+    }
+
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
         // A path that fails validation cannot have produced a cache entry
         // we'd want to redirect to anyway: treat it as a miss so the caller
@@ -3141,6 +3154,16 @@ impl ProxyService {
         CacheKeys::derive(repo_key, path).map(|k| k.content)
     }
 
+    /// Whether `storage_key` addresses proxy-cache content.
+    ///
+    /// Proxy-cache keys are `proxy-cache/<repo_key>/<path>/__content__` and live
+    /// at the storage root (no global key prefix), unlike hosted artifacts. The
+    /// distinction matters when presigning: cache keys must be signed through
+    /// the no-prefix [`Self::cache_storage_backend`] handle (#1555).
+    pub fn is_proxy_cache_key(storage_key: &str) -> bool {
+        storage_key.starts_with("proxy-cache/")
+    }
+
     /// Generate storage key for cache metadata
     fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
         CacheKeys::derive(repo_key, path).map(|k| k.metadata)
@@ -3847,6 +3870,48 @@ mod tests {
     fn test_parse_http_date_rejects_garbage() {
         assert!(parse_http_date("not-a-date").is_none());
         assert!(parse_http_date("").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1555 proxy-cache key discrimination
+    //
+    // `is_proxy_cache_key` decides whether a storage key must be presigned
+    // through the no-prefix proxy backend (`cache_storage_backend`) instead of
+    // the prefixed repo handle. Hosted/content-addressed artifacts MUST keep
+    // the prefixed handle, so the predicate must match ONLY the
+    // `proxy-cache/` layout — getting this wrong reintroduces the prefix bug
+    // (signing a key the object store has no object for) or, worse, routes
+    // hosted artifacts through the wrong handle.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_proxy_cache_key_matches_proxy_cache_layout() {
+        assert!(ProxyService::is_proxy_cache_key(
+            "proxy-cache/pypi-remote/pkg/pkg-1.0.0-py3-none-any.whl/__content__"
+        ));
+        assert!(ProxyService::is_proxy_cache_key(
+            "proxy-cache/repo/p/__content__"
+        ));
+        // Bare prefix (defensive): still classified as proxy-cache.
+        assert!(ProxyService::is_proxy_cache_key("proxy-cache/"));
+    }
+
+    #[test]
+    fn test_is_proxy_cache_key_rejects_hosted_and_prefixed_keys() {
+        // Content-addressed hosted artifact under the global prefix — must NOT
+        // be treated as proxy-cache (keeps the prefixed repo handle).
+        assert!(!ProxyService::is_proxy_cache_key(
+            "artifact-keeper/cas/ab/cdef0123456789"
+        ));
+        // A prefixed key that merely *contains* `proxy-cache/` later in the
+        // path must not match: the cache layout is always at the root.
+        assert!(!ProxyService::is_proxy_cache_key(
+            "artifact-keeper/proxy-cache/repo/pkg/__content__"
+        ));
+        assert!(!ProxyService::is_proxy_cache_key("cas/deadbeef"));
+        assert!(!ProxyService::is_proxy_cache_key(""));
+        // Substring, not a path segment prefix — must not match.
+        assert!(!ProxyService::is_proxy_cache_key("not-proxy-cache/x"));
     }
 
     #[test]
