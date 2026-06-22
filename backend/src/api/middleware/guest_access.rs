@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -84,15 +84,32 @@ fn is_allowlisted(path: &str) -> bool {
 }
 
 /// 401 response body returned when guest access is disabled.
+/// Includes `WWW-Authenticate` headers (Basic, Bearer, Cargo) so
+/// RFC 7235-compliant clients (Maven, pip, npm, etc.) can determine
+/// the auth scheme and retry with credentials.
 fn unauthorized_response() -> Response {
-    (
+    let mut response = (
         StatusCode::UNAUTHORIZED,
         Json(json!({
             "error": "GUEST_ACCESS_DISABLED",
             "message": "This instance requires authentication. Please log in.",
         })),
     )
-        .into_response()
+        .into_response();
+
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"artifact-keeper\""),
+    );
+    response.headers_mut().append(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"artifact-keeper\", charset=\"UTF-8\""),
+    );
+    response
+        .headers_mut()
+        .append(header::WWW_AUTHENTICATE, HeaderValue::from_static("Cargo"));
+
+    response
 }
 
 /// Middleware that blocks unauthenticated requests when guest access is
@@ -204,6 +221,54 @@ mod tests {
             .map(|v| v.to_str().unwrap_or("").to_string())
             .unwrap_or_default();
         assert!(ct.starts_with("application/json"));
+    }
+
+    #[test]
+    fn unauthorized_response_includes_www_authenticate_basic() {
+        let resp = unauthorized_response();
+        let challenges: Vec<&str> = resp
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            challenges.contains(&"Basic realm=\"artifact-keeper\""),
+            "expected Basic challenge, got: {:?}",
+            challenges
+        );
+    }
+
+    #[test]
+    fn unauthorized_response_includes_www_authenticate_bearer() {
+        let resp = unauthorized_response();
+        let challenges: Vec<&str> = resp
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            challenges.contains(&"Bearer realm=\"artifact-keeper\", charset=\"UTF-8\""),
+            "expected Bearer challenge, got: {:?}",
+            challenges
+        );
+    }
+
+    #[test]
+    fn unauthorized_response_includes_www_authenticate_cargo() {
+        let resp = unauthorized_response();
+        let challenges: Vec<&str> = resp
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            challenges.contains(&"Cargo"),
+            "expected Cargo challenge, got: {:?}",
+            challenges
+        );
     }
 
     // -- end-to-end behaviour via Axum router (ServiceExt::oneshot) --
