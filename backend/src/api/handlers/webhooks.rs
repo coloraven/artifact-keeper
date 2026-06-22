@@ -43,6 +43,89 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/deliveries/:delivery_id/redeliver", post(redeliver))
 }
 
+/// Pure authorization decision for a webhook, given the two ownership
+/// anchors stored on the row (`created_by`, `repository_id`) and whether the
+/// caller can access that repository.
+///
+/// A caller may act on a webhook iff they are an admin, they created it
+/// (`created_by == user_id`), or it is attached to a repository they can
+/// access (`repo_accessible == true`, as decided by
+/// `RepositoryService::user_can_access_repo`). A webhook with no
+/// `repository_id` (e.g. a global/system webhook) is reachable only by an
+/// admin or its creator — closing the cross-user/cross-tenant BOLA where any
+/// authenticated principal could act on any webhook by id.
+///
+/// This is factored out as a pure function so the authorization invariant
+/// can be regression-tested without standing up a Postgres harness; the
+/// async wrapper supplies the row and the repo-access bit from the DB.
+pub fn webhook_access_allowed(
+    is_admin: bool,
+    user_id: Uuid,
+    created_by: Option<Uuid>,
+    repository_id: Option<Uuid>,
+    repo_accessible: bool,
+) -> bool {
+    if is_admin {
+        return true;
+    }
+    if created_by == Some(user_id) {
+        return true;
+    }
+    repository_id.is_some() && repo_accessible
+}
+
+/// Authorize the caller to act on a specific webhook.
+///
+/// Webhooks are not globally accessible: the isolation boundary is the
+/// repository (per-repo `role_assignments`) plus resource ownership
+/// (`created_by`), the same model the repository handlers enforce. See
+/// [`webhook_access_allowed`] for the decision.
+///
+/// Denials (and missing rows) return `NotFound` rather than `Forbidden` so
+/// the endpoint does not leak the existence of other principals' webhooks,
+/// matching the existence-hiding convention used elsewhere.
+async fn authorize_webhook_access(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+) -> Result<()> {
+    use sqlx::Row;
+    let row = sqlx::query("SELECT created_by, repository_id FROM webhooks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
+
+    let created_by: Option<Uuid> = row.get("created_by");
+    let repository_id: Option<Uuid> = row.get("repository_id");
+
+    // Only consult the (DB-backed) repo-access check when the cheaper
+    // admin/owner checks have not already settled the decision.
+    let repo_accessible = if auth.is_admin || created_by == Some(auth.user_id) {
+        false
+    } else if let Some(repo_id) = repository_id {
+        let repo_service = state.create_repository_service();
+        repo_service
+            .user_can_access_repo(repo_id, auth.user_id)
+            .await?
+    } else {
+        false
+    };
+
+    if webhook_access_allowed(
+        auth.is_admin,
+        auth.user_id,
+        created_by,
+        repository_id,
+        repo_accessible,
+    ) {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("Webhook not found".to_string()))
+    }
+}
+
 /// Webhook event types
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +266,7 @@ pub struct WebhookListResponse {
 )]
 pub async fn list_webhooks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListWebhooksQuery>,
 ) -> Result<Json<WebhookListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
@@ -191,7 +275,37 @@ pub async fn list_webhooks(
 
     use sqlx::Row;
 
-    let webhooks = sqlx::query(
+    // Scope the listing to webhooks the caller is authorized to see. Admins
+    // see everything; non-admins see only webhooks they created or that are
+    // attached to a repository they can access (mirrors
+    // `user_can_access_repo`, including the global `repository_id IS NULL`
+    // role grant). `$5` is NULL for admins, which disables the predicate.
+    let scope_user: Option<Uuid> = if auth.is_admin {
+        None
+    } else {
+        Some(auth.user_id)
+    };
+
+    // The scope predicate is parameterized on a single user id whose
+    // position differs between the list query ($5) and the count query ($3).
+    // It is NULL for admins, which disables the predicate entirely.
+    fn scope_sql(user_param: &str) -> String {
+        format!(
+            "({u}::uuid IS NULL \
+             OR created_by = {u} \
+             OR repository_id IN ( \
+                 SELECT repository_id FROM role_assignments \
+                 WHERE user_id = {u} AND repository_id IS NOT NULL \
+             ) \
+             OR EXISTS ( \
+                 SELECT 1 FROM role_assignments \
+                 WHERE user_id = {u} AND repository_id IS NULL \
+             ))",
+            u = user_param
+        )
+    }
+
+    let webhooks = sqlx::query(&format!(
         r#"
         SELECT id, name, url, events, is_enabled, repository_id, headers,
                payload_template, event_schema_version, secret_digest,
@@ -199,29 +313,35 @@ pub async fn list_webhooks(
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
+          AND {scope}
         ORDER BY name
         OFFSET $3
         LIMIT $4
         "#,
-    )
+        scope = scope_sql("$5"),
+    ))
     .bind(query.repository_id)
     .bind(query.enabled)
     .bind(offset)
     .bind(per_page as i64)
+    .bind(scope_user)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total_row = sqlx::query(
+    let total_row = sqlx::query(&format!(
         r#"
         SELECT COUNT(*) as count
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
+          AND {scope}
         "#,
-    )
+        scope = scope_sql("$3"),
+    ))
     .bind(query.repository_id)
     .bind(query.enabled)
+    .bind(scope_user)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -278,7 +398,7 @@ pub async fn list_webhooks(
 )]
 pub async fn create_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateWebhookRequest>,
 ) -> Result<Json<WebhookSecretCreatedResponse>> {
     // Validate URL (SSRF prevention)
@@ -317,8 +437,8 @@ pub async fn create_webhook(
         r#"
         INSERT INTO webhooks
             (name, url, events, repository_id, headers, payload_template,
-             secret_encrypted, secret_digest, event_schema_version)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             secret_encrypted, secret_digest, event_schema_version, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id, name, url, events, is_enabled, repository_id, headers,
                   payload_template, event_schema_version, secret_digest,
                   secret_previous_expires_at, last_triggered_at, created_at
@@ -333,6 +453,7 @@ pub async fn create_webhook(
     .bind(prepared.encrypted.as_deref())
     .bind(prepared.digest.as_deref())
     .bind(&event_version)
+    .bind(auth.user_id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -454,8 +575,11 @@ fn prepare_secret_for_storage(
 )]
 pub async fn get_webhook(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<WebhookResponse>> {
+    authorize_webhook_access(&state, &auth, id).await?;
+
     use sqlx::Row;
 
     let webhook = sqlx::query(
@@ -512,9 +636,11 @@ pub async fn get_webhook(
 )]
 pub async fn delete_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    authorize_webhook_access(&state, &auth, id).await?;
+
     let result = sqlx::query!("DELETE FROM webhooks WHERE id = $1", id)
         .execute(&state.db)
         .await
@@ -560,9 +686,10 @@ async fn set_webhook_enabled(state: &SharedState, id: Uuid, enabled: bool) -> Re
 )]
 pub async fn enable_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    authorize_webhook_access(&state, &auth, id).await?;
     set_webhook_enabled(&state, id, true).await
 }
 
@@ -583,9 +710,10 @@ pub async fn enable_webhook(
 )]
 pub async fn disable_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    authorize_webhook_access(&state, &auth, id).await?;
     set_webhook_enabled(&state, id, false).await
 }
 
@@ -614,9 +742,11 @@ pub struct TestWebhookResponse {
 )]
 pub async fn test_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TestWebhookResponse>> {
+    authorize_webhook_access(&state, &auth, id).await?;
+
     use sqlx::Row;
 
     let webhook = sqlx::query(
@@ -744,9 +874,13 @@ pub struct DeliveryListResponse {
 )]
 pub async fn list_deliveries(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(webhook_id): Path<Uuid>,
     Query(query): Query<ListDeliveriesQuery>,
 ) -> Result<Json<DeliveryListResponse>> {
+    // Deliveries inherit the authorization of their parent webhook.
+    authorize_webhook_access(&state, &auth, webhook_id).await?;
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -823,9 +957,11 @@ pub async fn list_deliveries(
 )]
 pub async fn redeliver(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path((webhook_id, delivery_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<DeliveryResponse>> {
+    authorize_webhook_access(&state, &auth, webhook_id).await?;
+
     // Get original delivery
     let delivery = sqlx::query!(
         r#"
@@ -992,10 +1128,12 @@ fn rotation_guard_allows(
 )]
 pub async fn rotate_webhook_secret(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
+
+    authorize_webhook_access(&state, &auth, id).await?;
 
     let new_secret = webhook_secret_crypto::generate_secret();
     let new_encrypted = webhook_secret_crypto::encrypt_secret(&new_secret).map_err(|e| {
@@ -1695,6 +1833,90 @@ pub struct WebhooksApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // webhook_access_allowed — object-level authorization invariant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_access_admin_always_allowed() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        // Admin reaches a webhook they neither own nor share a repo with.
+        assert!(webhook_access_allowed(
+            true,
+            me,
+            Some(other),
+            Some(Uuid::new_v4()),
+            false
+        ));
+        // ...including a global (repository-less) webhook.
+        assert!(webhook_access_allowed(true, me, Some(other), None, false));
+    }
+
+    #[test]
+    fn test_webhook_access_creator_allowed() {
+        let me = Uuid::new_v4();
+        // Creator of a global webhook may act on it.
+        assert!(webhook_access_allowed(false, me, Some(me), None, false));
+        // Creator of a repo-attached webhook may act on it even without repo access.
+        assert!(webhook_access_allowed(
+            false,
+            me,
+            Some(me),
+            Some(Uuid::new_v4()),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_webhook_access_repo_member_allowed_only_when_accessible() {
+        let me = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        // Non-owner with repo access to the webhook's repository is allowed.
+        assert!(webhook_access_allowed(
+            false,
+            me,
+            Some(owner),
+            Some(repo),
+            true
+        ));
+        // Same caller, no repo access -> denied.
+        assert!(!webhook_access_allowed(
+            false,
+            me,
+            Some(owner),
+            Some(repo),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_webhook_access_global_webhook_denied_to_stranger() {
+        let me = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        // The BOLA: a non-admin, non-owner cannot reach a global
+        // (repository_id = NULL) webhook regardless of any repo access bit.
+        assert!(!webhook_access_allowed(false, me, Some(owner), None, true));
+        assert!(!webhook_access_allowed(false, me, Some(owner), None, false));
+    }
+
+    #[test]
+    fn test_webhook_access_legacy_null_owner_denied_to_nonadmin() {
+        let me = Uuid::new_v4();
+        // Legacy rows (created_by = NULL) with no repository are reachable
+        // only by admins, never by an arbitrary authenticated caller.
+        assert!(!webhook_access_allowed(false, me, None, None, false));
+        // A legacy repo-attached row still honors repo access.
+        assert!(webhook_access_allowed(
+            false,
+            me,
+            None,
+            Some(Uuid::new_v4()),
+            true
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // WebhookEvent Display
@@ -2868,5 +3090,700 @@ mod tests {
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "supplied-secret-no-key must map to 503, not 500"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed object-level authorization (companion coverage for the BOLA
+    // fix in PR #1942).
+    //
+    // These exercise the *async* authorization seam end-to-end against a real
+    // Postgres so the new authz lines in each per-webhook handler are counted
+    // under `cargo llvm-cov --lib`. The pure decision (`webhook_access_allowed`)
+    // is unit-tested above; here we drive get/delete/enable/disable/test/
+    // deliveries/redeliver/rotate plus list scoping and create-stamps-owner.
+    //
+    // Each test runtime-skips (returns early) when `DATABASE_URL` is unset, so
+    // they no-op locally without Postgres but RUN in CI (which seeds the DB).
+    // -----------------------------------------------------------------------
+    mod object_level_authz_tests {
+        use super::super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        /// Build an `AuthExtension` for a JWT-style (non-token) caller.
+        fn auth_for(user_id: Uuid, is_admin: bool) -> AuthExtension {
+            AuthExtension {
+                user_id,
+                username: format!("u-{}", &user_id.to_string()[..8]),
+                email: format!("{}@test.local", &user_id.to_string()[..8]),
+                is_admin,
+                is_api_token: false,
+                is_service_account: false,
+                scopes: None,
+                allowed_repo_ids: None,
+            }
+        }
+
+        async fn create_user(pool: &PgPool, is_admin: bool) -> Uuid {
+            let id = Uuid::new_v4();
+            let username = format!("wh1942-{}", &id.to_string()[..8]);
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', $4, true)",
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{}@test.local", username))
+            .bind(is_admin)
+            .execute(pool)
+            .await
+            .expect("insert user");
+            id
+        }
+
+        async fn create_repo(pool: &PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            let key = format!("wh1942-repo-{}", &id.to_string()[..8]);
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+                 VALUES ($1, $2, $2, '/tmp/wh1942', 'local', 'docker'::repository_format, false)",
+            )
+            .bind(id)
+            .bind(&key)
+            .execute(pool)
+            .await
+            .expect("insert repo");
+            id
+        }
+
+        /// Grant `user` access to `repo` via a per-repo role assignment (the
+        /// same boundary `user_can_access_repo` consults).
+        async fn grant_repo_access(pool: &PgPool, user: Uuid, repo: Uuid) {
+            let role_id: Uuid = sqlx::query_scalar("SELECT id FROM roles WHERE name = 'developer'")
+                .fetch_one(pool)
+                .await
+                .expect("developer role must exist");
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            )
+            .bind(user)
+            .bind(role_id)
+            .bind(repo)
+            .execute(pool)
+            .await
+            .expect("grant repo access");
+        }
+
+        /// Insert a webhook row directly. `created_by`/`repository_id` are the
+        /// two ownership anchors the authz decision keys off; both may be NULL.
+        async fn insert_webhook(
+            pool: &PgPool,
+            created_by: Option<Uuid>,
+            repository_id: Option<Uuid>,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO webhooks (id, name, url, events, is_enabled, repository_id, \
+                                       payload_template, event_schema_version, created_by) \
+                 VALUES ($1, $2, 'http://198.51.100.7/hook', ARRAY['artifact.created'], true, $3, \
+                         'default', '2026-04-01', $4)",
+            )
+            .bind(id)
+            .bind(format!("wh-{}", &id.to_string()[..8]))
+            .bind(repository_id)
+            .bind(created_by)
+            .execute(pool)
+            .await
+            .expect("insert webhook");
+            id
+        }
+
+        async fn webhook_exists(pool: &PgPool, id: Uuid) -> bool {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM webhooks WHERE id = $1)")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        async fn is_enabled(pool: &PgPool, id: Uuid) -> bool {
+            sqlx::query_scalar::<_, bool>("SELECT is_enabled FROM webhooks WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        fn is_not_found<T: std::fmt::Debug>(r: &Result<T>) -> bool {
+            matches!(r, Err(AppError::NotFound(_)))
+        }
+
+        async fn cleanup(pool: &PgPool, repos: &[Uuid], users: &[Uuid]) {
+            for u in users {
+                sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+                    .bind(u)
+                    .execute(pool)
+                    .await
+                    .ok();
+            }
+            sqlx::query(
+                "DELETE FROM webhooks WHERE created_by = ANY($1) OR repository_id = ANY($2)",
+            )
+            .bind(users)
+            .bind(repos)
+            .execute(pool)
+            .await
+            .ok();
+            for r in repos {
+                sqlx::query("DELETE FROM webhooks WHERE repository_id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await
+                    .ok();
+                sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await
+                    .ok();
+            }
+            for u in users {
+                sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(u)
+                    .execute(pool)
+                    .await
+                    .ok();
+            }
+        }
+
+        // ===================================================================
+        // get_webhook — read path across all four authz outcomes
+        // ===================================================================
+
+        #[tokio::test]
+        async fn get_webhook_authz_matrix() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let admin = create_user(&pool, true).await;
+            let repo = create_repo(&pool).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            // A global (repository-less) webhook owned by `owner`.
+            let global_wh = insert_webhook(&pool, Some(owner), None).await;
+            // A repo-attached webhook owned by `owner`; `stranger` gets repo access.
+            let repo_wh = insert_webhook(&pool, Some(owner), Some(repo)).await;
+            grant_repo_access(&pool, stranger, repo).await;
+            // A legacy row: no creator, no repo (admin-only).
+            let legacy_wh = insert_webhook(&pool, None, None).await;
+
+            // Owner reads their own global webhook.
+            assert!(
+                get_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
+                    axum::extract::Path(global_wh),
+                )
+                .await
+                .is_ok(),
+                "owner must read own global webhook"
+            );
+
+            // Stranger (non-admin, non-owner) is denied on the GLOBAL webhook -> 404.
+            // This is the exact cross-user/cross-tenant BOLA the fix closes.
+            let r = get_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(stranger, false)),
+                axum::extract::Path(global_wh),
+            )
+            .await;
+            assert!(
+                is_not_found(&r),
+                "stranger must get 404 on global webhook, got {r:?}"
+            );
+
+            // Admin reads any webhook, including the legacy NULL-owner row...
+            assert!(get_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::extract::Path(global_wh),
+            )
+            .await
+            .is_ok());
+            assert!(get_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::extract::Path(legacy_wh),
+            )
+            .await
+            .is_ok());
+
+            // ...but a non-admin is denied the legacy NULL-owner row.
+            assert!(is_not_found(
+                &get_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(legacy_wh),
+                )
+                .await
+            ));
+
+            // Repo member can read the repo-attached webhook (not its owner)...
+            assert!(
+                get_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(repo_wh),
+                )
+                .await
+                .is_ok(),
+                "repo member must read repo-attached webhook"
+            );
+            // ...but a non-member, non-owner cannot.
+            let outsider = create_user(&pool, false).await;
+            assert!(is_not_found(
+                &get_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(outsider, false)),
+                    axum::extract::Path(repo_wh),
+                )
+                .await
+            ));
+
+            cleanup(&pool, &[repo], &[owner, stranger, admin, outsider]).await;
+        }
+
+        // ===================================================================
+        // delete_webhook — mutating path; denial must not delete the row
+        // ===================================================================
+
+        #[tokio::test]
+        async fn delete_webhook_authz() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let admin = create_user(&pool, true).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let wh = insert_webhook(&pool, Some(owner), None).await;
+
+            // Stranger denied: 404 AND the row survives.
+            assert!(is_not_found(
+                &delete_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+            assert!(
+                webhook_exists(&pool, wh).await,
+                "denied delete must not remove the row"
+            );
+
+            // Owner can delete their own.
+            assert!(delete_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(owner, false)),
+                axum::extract::Path(wh),
+            )
+            .await
+            .is_ok());
+            assert!(!webhook_exists(&pool, wh).await);
+
+            // Admin can delete another principal's webhook.
+            let wh2 = insert_webhook(&pool, Some(owner), None).await;
+            assert!(delete_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::extract::Path(wh2),
+            )
+            .await
+            .is_ok());
+            assert!(!webhook_exists(&pool, wh2).await);
+
+            cleanup(&pool, &[], &[owner, stranger, admin]).await;
+        }
+
+        // ===================================================================
+        // enable_webhook / disable_webhook — toggle paths
+        // ===================================================================
+
+        #[tokio::test]
+        async fn enable_disable_webhook_authz() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let wh = insert_webhook(&pool, Some(owner), None).await;
+
+            // Stranger denied on disable -> 404, state unchanged (still enabled).
+            assert!(is_not_found(
+                &disable_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+            assert!(
+                is_enabled(&pool, wh).await,
+                "denied disable must not change state"
+            );
+
+            // Owner can disable then enable.
+            assert!(disable_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(owner, false)),
+                axum::extract::Path(wh),
+            )
+            .await
+            .is_ok());
+            assert!(!is_enabled(&pool, wh).await);
+
+            assert!(enable_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(owner, false)),
+                axum::extract::Path(wh),
+            )
+            .await
+            .is_ok());
+            assert!(is_enabled(&pool, wh).await);
+
+            // Stranger denied on enable too.
+            assert!(is_not_found(
+                &enable_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+
+            cleanup(&pool, &[], &[owner, stranger]).await;
+        }
+
+        // ===================================================================
+        // test_webhook — denial must short-circuit BEFORE any outbound delivery
+        // ===================================================================
+
+        #[tokio::test]
+        async fn test_webhook_denied_cross_user() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let wh = insert_webhook(&pool, Some(owner), None).await;
+
+            // Stranger denied -> 404 (authz runs before the delivery attempt, so
+            // no outbound request is made for another principal's endpoint).
+            assert!(is_not_found(
+                &test_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+
+            cleanup(&pool, &[], &[owner, stranger]).await;
+        }
+
+        // ===================================================================
+        // list_deliveries — read path inheriting parent-webhook authz
+        // ===================================================================
+
+        #[tokio::test]
+        async fn list_deliveries_authz() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let wh = insert_webhook(&pool, Some(owner), None).await;
+
+            // Owner can list deliveries of their own webhook.
+            assert!(list_deliveries(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(owner, false)),
+                axum::extract::Path(wh),
+                axum::extract::Query(ListDeliveriesQuery {
+                    status: None,
+                    page: None,
+                    per_page: None,
+                }),
+            )
+            .await
+            .is_ok());
+
+            // Stranger denied -> 404 (delivery listing inherits webhook authz).
+            assert!(is_not_found(
+                &list_deliveries(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(wh),
+                    axum::extract::Query(ListDeliveriesQuery {
+                        status: None,
+                        page: None,
+                        per_page: None,
+                    }),
+                )
+                .await
+            ));
+
+            cleanup(&pool, &[], &[owner, stranger]).await;
+        }
+
+        // ===================================================================
+        // redeliver — denial must short-circuit before re-sending
+        // ===================================================================
+
+        #[tokio::test]
+        async fn redeliver_denied_cross_user() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let wh = insert_webhook(&pool, Some(owner), None).await;
+            let delivery_id = Uuid::new_v4();
+
+            // Stranger denied -> 404 from the webhook authz gate, before the
+            // delivery row is ever looked up or re-sent.
+            assert!(is_not_found(
+                &redeliver(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path((wh, delivery_id)),
+                )
+                .await
+            ));
+
+            cleanup(&pool, &[], &[owner, stranger]).await;
+        }
+
+        // ===================================================================
+        // rotate_webhook_secret — mutating path
+        // ===================================================================
+
+        #[tokio::test]
+        async fn rotate_secret_authz() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let admin = create_user(&pool, true).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let wh = insert_webhook(&pool, Some(owner), None).await;
+
+            // Stranger denied -> 404.
+            assert!(is_not_found(
+                &rotate_webhook_secret(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+
+            // Owner passes the authz gate (the rotation may still fail later if
+            // the deployment has no `AK_WEBHOOK_SECRET_KEY` configured for
+            // encryption — that is orthogonal to authorization, so we only
+            // assert it is NOT the existence-hiding 404 the gate emits).
+            assert!(
+                !is_not_found(
+                    &rotate_webhook_secret(
+                        axum::extract::State(state.clone()),
+                        axum::Extension(auth_for(owner, false)),
+                        axum::extract::Path(wh),
+                    )
+                    .await
+                ),
+                "owner must pass the rotate authz gate"
+            );
+
+            // Admin passes the authz gate on another principal's webhook.
+            assert!(
+                !is_not_found(
+                    &rotate_webhook_secret(
+                        axum::extract::State(state.clone()),
+                        axum::Extension(auth_for(admin, true)),
+                        axum::extract::Path(wh),
+                    )
+                    .await
+                ),
+                "admin must pass the rotate authz gate"
+            );
+
+            cleanup(&pool, &[], &[owner, stranger, admin]).await;
+        }
+
+        // ===================================================================
+        // list_webhooks — scoping: owner sees own, admin sees all, repo member
+        // sees repo-attached.
+        // ===================================================================
+
+        #[tokio::test]
+        async fn list_webhooks_scoping() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let member = create_user(&pool, false).await;
+            let admin = create_user(&pool, true).await;
+            let repo = create_repo(&pool).await;
+            grant_repo_access(&pool, member, repo).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let owner_global = insert_webhook(&pool, Some(owner), None).await;
+            let owner_repo = insert_webhook(&pool, Some(owner), Some(repo)).await;
+
+            let empty_query = || ListWebhooksQuery {
+                repository_id: None,
+                enabled: None,
+                page: None,
+                per_page: Some(100),
+            };
+
+            // Owner sees both of their own webhooks.
+            let owner_list = list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(owner, false)),
+                axum::extract::Query(empty_query()),
+            )
+            .await
+            .unwrap();
+            let owner_ids: Vec<Uuid> = owner_list.0.items.iter().map(|w| w.id).collect();
+            assert!(
+                owner_ids.contains(&owner_global),
+                "owner must see own global webhook"
+            );
+            assert!(
+                owner_ids.contains(&owner_repo),
+                "owner must see own repo webhook"
+            );
+
+            // Stranger (no ownership, no repo role) sees neither.
+            let stranger_list = list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(stranger, false)),
+                axum::extract::Query(empty_query()),
+            )
+            .await
+            .unwrap();
+            let stranger_ids: Vec<Uuid> = stranger_list.0.items.iter().map(|w| w.id).collect();
+            assert!(
+                !stranger_ids.contains(&owner_global) && !stranger_ids.contains(&owner_repo),
+                "stranger must not see other principals' webhooks"
+            );
+
+            // Repo member sees the repo-attached one but not the owner's global one.
+            let member_list = list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(member, false)),
+                axum::extract::Query(empty_query()),
+            )
+            .await
+            .unwrap();
+            let member_ids: Vec<Uuid> = member_list.0.items.iter().map(|w| w.id).collect();
+            assert!(
+                member_ids.contains(&owner_repo),
+                "repo member must see repo-attached webhook"
+            );
+            assert!(
+                !member_ids.contains(&owner_global),
+                "repo member must not see foreign global webhook"
+            );
+
+            // Admin sees everything (scope predicate disabled).
+            let admin_list = list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::extract::Query(empty_query()),
+            )
+            .await
+            .unwrap();
+            let admin_ids: Vec<Uuid> = admin_list.0.items.iter().map(|w| w.id).collect();
+            assert!(
+                admin_ids.contains(&owner_global) && admin_ids.contains(&owner_repo),
+                "admin must see all webhooks"
+            );
+
+            cleanup(&pool, &[repo], &[owner, stranger, member, admin]).await;
+        }
+
+        // ===================================================================
+        // create_webhook — stamps created_by with the caller (ownership anchor).
+        // ===================================================================
+
+        #[tokio::test]
+        async fn create_webhook_records_created_by() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let creator = create_user(&pool, false).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let resp = create_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(creator, false)),
+                axum::Json(CreateWebhookRequest {
+                    name: format!("created-by-{}", &creator.to_string()[..8]),
+                    url: "http://198.51.100.9/hook".to_string(),
+                    events: vec!["artifact.created".to_string()],
+                    repository_id: None,
+                    headers: None,
+                    secret: None,
+                    payload_template: Default::default(),
+                    event_schema_version: None,
+                }),
+            )
+            .await
+            .expect("create webhook");
+
+            let new_id = resp.0.webhook.id;
+            let stored: Option<Uuid> =
+                sqlx::query_scalar("SELECT created_by FROM webhooks WHERE id = $1")
+                    .bind(new_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                stored,
+                Some(creator),
+                "create_webhook must stamp created_by with the caller"
+            );
+
+            // And the creator can immediately reach it (owner path), confirming
+            // the ownership anchor is wired through to the authz decision.
+            assert!(get_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(creator, false)),
+                axum::extract::Path(new_id),
+            )
+            .await
+            .is_ok());
+
+            cleanup(&pool, &[], &[creator]).await;
+        }
     }
 }
