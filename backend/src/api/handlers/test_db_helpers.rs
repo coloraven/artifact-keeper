@@ -232,6 +232,47 @@ pub fn router_anon(router: Router<SharedState>, state: SharedState) -> Router {
         .layer(Extension::<Option<AuthExtension>>(None))
 }
 
+/// Like [`router_with_auth`] but also injects the **non-Option**
+/// `Extension<AuthExtension>`, exactly as the production `auth_middleware`
+/// does (it inserts both `Some(ext)` and `ext`). Handlers that extract
+/// `Extension<AuthExtension>` directly (e.g. the admin-gated peer-label
+/// handlers) require this raw copy to be present, otherwise the extractor
+/// fails with a 500 before the in-handler authorization check ever runs.
+pub fn router_with_auth_ext(
+    router: Router<SharedState>,
+    state: SharedState,
+    auth: AuthExtension,
+) -> Router {
+    router
+        .with_state(state)
+        .layer(Extension::<AuthExtension>(auth.clone()))
+        .layer(Extension::<Option<AuthExtension>>(Some(auth)))
+}
+
+/// Register a peer instance via the real `PeerInstanceService` and return its
+/// id. `name_prefix` namespaces the generated peer name so concurrent suites do
+/// not collide (e.g. "probe", "labels-authz", "map-err"). Centralizes the
+/// `register(RegisterPeerInstanceRequest { .. })` boilerplate shared by every
+/// DB-backed peer test module.
+pub async fn register_test_peer(pool: &PgPool, name_prefix: &str, tag: &str) -> Uuid {
+    use crate::services::peer_instance_service::{
+        PeerInstanceService, RegisterPeerInstanceRequest,
+    };
+    let svc = PeerInstanceService::new(pool.clone());
+    let id = Uuid::new_v4();
+    svc.register(RegisterPeerInstanceRequest {
+        name: format!("{}-{}-{}", name_prefix, tag, &id.to_string()[..8]),
+        endpoint_url: "https://peer.example.test".to_string(),
+        region: Some("us-east".to_string()),
+        cache_size_bytes: 1024,
+        sync_filter: None,
+        api_key: "k".to_string(),
+    })
+    .await
+    .expect("register peer")
+    .id
+}
+
 pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
     let resp = app.oneshot(req).await.expect("oneshot");
     let status = resp.status();
@@ -383,6 +424,18 @@ pub fn put(uri: String, body: Bytes) -> Request<Body> {
         .expect("build PUT request")
 }
 
+/// Build a PUT request carrying a JSON body (sets `content-type` so the
+/// `Json` extractor accepts it; the raw [`put`] helper omits it, which yields
+/// a 415 for handlers that extract `Json<_>`).
+pub fn put_json(uri: String, body: Bytes) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .expect("build PUT JSON request")
+}
+
 /// Bundles all the per-test scaffolding so each handler test body is a
 /// single helper call followed by assertions. Returned `None` indicates
 /// the test should skip (no `DATABASE_URL`).
@@ -480,11 +533,10 @@ pub fn build_proxy_service_with_fs(
 /// Build a [`SharedState`] that includes `proxy` as the proxy service.
 /// Accepts any `PgPool` so callers can supply a lazy/fake pool for tests
 /// that do not need a real database.
-pub fn build_state_with_proxy(
-    pool: PgPool,
-    storage_path: &str,
-    proxy: Arc<crate::services::proxy_service::ProxyService>,
-) -> crate::api::SharedState {
+/// Construct an [`AppState`] from `config` plus a fresh filesystem storage
+/// backend + empty registry rooted at `storage_path`. Shared spine of the
+/// `build_state*` constructors.
+fn app_state_with(config: Config, pool: PgPool, storage_path: &str) -> crate::api::AppState {
     let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
         crate::storage::filesystem::FilesystemStorage::new(storage_path),
     );
@@ -492,7 +544,15 @@ pub fn build_state_with_proxy(
         std::collections::HashMap::new(),
         "filesystem".to_string(),
     ));
-    let mut state = crate::api::AppState::new(cfg(storage_path), pool, storage, registry);
+    crate::api::AppState::new(config, pool, storage, registry)
+}
+
+pub fn build_state_with_proxy(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+) -> crate::api::SharedState {
+    let mut state = app_state_with(cfg(storage_path), pool, storage_path);
     state.set_proxy_service(proxy);
     Arc::new(state)
 }
@@ -506,16 +566,9 @@ pub fn build_state_with_proxy_presigned(
     storage_path: &str,
     proxy: Arc<crate::services::proxy_service::ProxyService>,
 ) -> crate::api::SharedState {
-    let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
-        crate::storage::filesystem::FilesystemStorage::new(storage_path),
-    );
-    let registry = Arc::new(crate::storage::StorageRegistry::new(
-        std::collections::HashMap::new(),
-        "filesystem".to_string(),
-    ));
     let mut config = cfg(storage_path);
     config.presigned_downloads_enabled = true;
-    let mut state = crate::api::AppState::new(config, pool, storage, registry);
+    let mut state = app_state_with(config, pool, storage_path);
     state.set_proxy_service(proxy);
     Arc::new(state)
 }

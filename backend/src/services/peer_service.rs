@@ -9,6 +9,41 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
+/// SQLSTATE for a foreign-key violation.
+const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
+/// SQLSTATE for a check-constraint violation.
+const PG_CHECK_VIOLATION: &str = "23514";
+/// CHECK constraint forbidding a peer from linking to itself.
+const PEER_CONNECTION_NO_SELF_LINK: &str = "peer_connections_no_self_link";
+
+/// Map a database error from `peer_connections` writes to an [`AppError`].
+///
+/// A foreign-key violation means the supplied `source_peer_id` or
+/// `target_peer_id` does not name an existing peer instance — a client error
+/// that must surface as [`AppError::NotFound`] (HTTP 404), not an opaque
+/// [`AppError::Database`] (HTTP 500). A self-link CHECK violation is a client
+/// error too and surfaces as [`AppError::Validation`] (HTTP 400) as a
+/// defensive fallback (the handler also rejects self-probes up front). All
+/// other database errors fall through to [`AppError::Database`].
+fn map_peer_connection_error(err: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(db_err) = &err {
+        match db_err.code().as_deref() {
+            Some(PG_FOREIGN_KEY_VIOLATION) => {
+                return AppError::NotFound("Peer instance not found".to_string());
+            }
+            Some(PG_CHECK_VIOLATION)
+                if db_err.constraint() == Some(PEER_CONNECTION_NO_SELF_LINK) =>
+            {
+                return AppError::Validation(
+                    "target_peer_id must differ from the source peer id".to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    AppError::Database(err.to_string())
+}
+
 /// Peer connection status
 #[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
 #[sqlx(type_name = "peer_status", rename_all = "lowercase")]
@@ -153,7 +188,7 @@ impl PeerService {
         )
         .fetch_one(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(map_peer_connection_error)?;
 
         Ok(peer)
     }
@@ -644,5 +679,109 @@ mod tests {
         };
         let json = serde_json::to_value(&peer).unwrap();
         assert!(json["region"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // map_peer_connection_error: SQLSTATE -> AppError mapping.
+    //
+    // The probe handler rejects self-references up front, so the CHECK
+    // (`peer_connections_no_self_link`) arm and the generic 500 fall-through
+    // are not reachable through the HTTP path. Exercise the mapper directly
+    // against real `sqlx::Error::Database` values produced by the live DB:
+    //   * foreign-key violation (23503)            -> NotFound (404)
+    //   * self-link CHECK violation (23514)        -> Validation (400)
+    //   * any other database error                 -> Database (500)
+    //
+    // Runtime-skips when no `DATABASE_URL` is set (NOT `#[ignore]`), matching
+    // the in-`src` DB-test convention used across this crate.
+    // -----------------------------------------------------------------------
+    mod map_peer_connection_error_db {
+        use super::super::map_peer_connection_error;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::error::AppError;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        async fn make_peer(pool: &PgPool, tag: &str) -> Uuid {
+            tdh::register_test_peer(pool, "map-err", tag).await
+        }
+
+        /// Attempt a `peer_connections` INSERT and return the raw `sqlx::Error`.
+        async fn insert_connection_err(pool: &PgPool, source: Uuid, target: Uuid) -> sqlx::Error {
+            sqlx::query(
+                "INSERT INTO peer_connections \
+                 (source_peer_id, target_peer_id, status, last_probed_at) \
+                 VALUES ($1, $2, 'active', NOW())",
+            )
+            .bind(source)
+            .bind(target)
+            .execute(pool)
+            .await
+            .expect_err("insert was expected to violate a constraint")
+        }
+
+        #[tokio::test]
+        async fn test_foreign_key_violation_maps_to_not_found() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // Non-existent target trips the target FK (23503).
+            let source = make_peer(&pool, "fk").await;
+            let missing = Uuid::new_v4();
+            let err = insert_connection_err(&pool, source, missing).await;
+
+            match map_peer_connection_error(err) {
+                AppError::NotFound(_) => {}
+                other => panic!("FK violation must map to NotFound, got {other:?}"),
+            }
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(source)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_self_link_check_violation_maps_to_validation() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // source == target trips the `peer_connections_no_self_link`
+            // CHECK (23514). Both ids reference the same existing peer so the
+            // FK passes and the CHECK is the failing constraint.
+            let peer = make_peer(&pool, "check").await;
+            let err = insert_connection_err(&pool, peer, peer).await;
+
+            match map_peer_connection_error(err) {
+                AppError::Validation(_) => {}
+                other => {
+                    panic!("self-link CHECK violation must map to Validation, got {other:?}")
+                }
+            }
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_other_database_error_maps_to_database() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // A syntactically invalid statement yields a database error whose
+            // SQLSTATE is neither 23503 nor the self-link CHECK, exercising the
+            // generic fall-through to AppError::Database (500).
+            let err = sqlx::query("SELECT * FROM peer_connections WHERE no_such_column = 1")
+                .execute(&pool)
+                .await
+                .expect_err("query was expected to fail");
+
+            match map_peer_connection_error(err) {
+                AppError::Database(_) => {}
+                other => panic!("unrelated database error must map to Database, got {other:?}"),
+            }
+        }
     }
 }
