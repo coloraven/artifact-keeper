@@ -4813,6 +4813,7 @@ mod tests {
                 ldap_url: None,
                 ldap_base_dn: None,
                 trivy_url: None,
+                trivy_adapter_url: None,
                 openscap_url: None,
                 openscap_profile: "standard".into(),
                 opensearch_url: None,

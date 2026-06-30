@@ -2629,6 +2629,7 @@ impl ScannerService {
         scan_result_service: Arc<ScanResultService>,
         scan_config_service: Arc<ScanConfigService>,
         trivy_url: Option<String>,
+        trivy_adapter_url: Option<String>,
         storage: Arc<dyn StorageBackend>,
         storage_registry: Arc<crate::storage::StorageRegistry>,
         storage_base_path: String,
@@ -2639,16 +2640,28 @@ impl ScannerService {
         let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
         let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
 
+        // Container *image* scanner: Harbor scanner-adapter (#2088). Registered
+        // ONLY when an adapter URL is configured. When unset, no trivy/image
+        // scan row is produced at all (grype still runs) — we do not claim to
+        // have run trivy on images.
+        if let Some(adapter_url) = trivy_adapter_url {
+            info!(
+                "Container image scanner (Harbor adapter) enabled at {}",
+                adapter_url
+            );
+            scanners.push(Arc::new(ImageScanner::new(adapter_url)));
+        }
+
+        // Trivy filesystem + incus (rootfs) scanners drive the trivy server
+        // directly and keep consuming TRIVY_URL unchanged: their
+        // `--server` / dir-mode protocol is incompatible with the Harbor
+        // adapter, so they are NOT repointed at it.
         if let Some(url) = trivy_url {
-            info!("Trivy image scanner enabled at {}", url);
-            scanners.push(Arc::new(ImageScanner::new(url.clone())));
-            // Trivy filesystem scanner for non-container artifacts
             info!("Trivy filesystem scanner enabled");
             scanners.push(Arc::new(TrivyFsScanner::new(
                 url.clone(),
                 scan_workspace_path.clone(),
             )));
-            // Incus/LXC container image scanner (extracts rootfs, scans with trivy)
             info!("Incus container image scanner enabled");
             scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
                 url,
@@ -11822,7 +11835,8 @@ mod tests {
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url: skip image / fs / incus scanners
+            None, // trivy_url: skip fs / incus scanners
+            None, // trivy_adapter_url: skip image scanner
             storage,
             storage_registry,
             storage_base_path,
