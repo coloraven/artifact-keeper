@@ -751,6 +751,7 @@ mod tests {
             ldap_url: Some("ldap://localhost:389".into()),
             ldap_base_dn: Some("dc=example,dc=com".into()),
             trivy_url: None,
+            trivy_adapter_url: None,
             openscap_url: None,
             openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
             opensearch_url: None,

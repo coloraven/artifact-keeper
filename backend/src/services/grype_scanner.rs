@@ -247,8 +247,8 @@ fn classify_grype_spawn_error(err: &std::io::Error) -> AppError {
 /// The returned value has any scheme (`https://`, `http://`) stripped and
 /// trailing `/` trimmed, because Grype expects `host[:port]`, not a URL.
 ///
-/// `pub(crate)` so `ImageScanner::extract_image_ref_for_repo` reuses the same
-/// host-resolution logic when qualifying the Trivy scan target.
+/// `pub(crate)` so `ImageScanner::registry_url` reuses the same host-resolution
+/// logic when telling the Harbor scanner-adapter which registry to pull from.
 pub(crate) fn resolve_registry_host() -> String {
     let raw = std::env::var("AK_GRYPE_REGISTRY_HOST")
         .ok()

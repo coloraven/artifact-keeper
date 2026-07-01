@@ -193,8 +193,21 @@ pub struct Config {
     /// LDAP base DN (optional)
     pub ldap_base_dn: Option<String>,
 
-    /// Trivy server URL for container image scanning (optional)
+    /// Trivy server URL for filesystem / incus (rootfs) scanning (optional).
+    /// Consumed by `TrivyFsScanner` and `IncusScanner`, which drive the trivy
+    /// server directly (`--server` / dir-mode). NOT used for container image
+    /// scanning — see `trivy_adapter_url`.
     pub trivy_url: Option<String>,
+
+    /// Harbor Pluggable Scanner adapter URL for container *image* scanning
+    /// (optional), e.g. `http://trivy:8090` for `harbor-scanner-trivy`. When
+    /// set, `ImageScanner` is registered and scans images via the Harbor
+    /// scanner-adapter API (fail-closed on any adapter error). When unset, no
+    /// container-image (trivy/image) scanner runs — grype still scans. This is
+    /// deliberately separate from `trivy_url`: the adapter's HTTP API is
+    /// incompatible with the trivy-server Twirp/`--server` protocol the
+    /// fs/incus scanners use. See #2088.
+    pub trivy_adapter_url: Option<String>,
 
     /// OpenSCAP wrapper URL for compliance scanning (optional)
     pub openscap_url: Option<String>,
@@ -572,6 +585,7 @@ redacted_debug!(Config {
     show ldap_url,
     show ldap_base_dn,
     show trivy_url,
+    show trivy_adapter_url,
     show openscap_url,
     show openscap_profile,
     show opensearch_url,
@@ -664,6 +678,7 @@ impl Default for Config {
             ldap_url: None,
             ldap_base_dn: None,
             trivy_url: None,
+            trivy_adapter_url: None,
             openscap_url: None,
             openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
             opensearch_url: None,
@@ -778,6 +793,11 @@ impl Config {
             ldap_url: env::var("LDAP_URL").ok(),
             ldap_base_dn: env::var("LDAP_BASE_DN").ok(),
             trivy_url: env::var("TRIVY_URL").ok(),
+            // Treat an empty value as unset: deployment templates commonly
+            // render `TRIVY_ADAPTER_URL=` (present-but-empty) when the feature
+            // is off, and registering the image scanner with an empty URL would
+            // make every image scan fail closed instead of not running at all.
+            trivy_adapter_url: env::var("TRIVY_ADAPTER_URL").ok().filter(|s| !s.is_empty()),
             openscap_url: env::var("OPENSCAP_URL").ok(),
             openscap_profile: env::var("OPENSCAP_PROFILE")
                 .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),

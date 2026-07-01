@@ -167,12 +167,12 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
           /mnt/rootfs/usr/bin/bashbug*
 
 # ---------- Stage 5: Copy scanner CLIs from official images ----------
-# The trivy CLI is intentionally NOT bundled in the runtime image. The backend
-# drives Trivy in server mode against the trivy sidecar (TRIVY_URL) and falls
-# back to the pure-HTTP Twirp endpoint (`scan_with_trivy_http`) when the CLI is
-# absent, so the in-image binary is dead weight. Dropping it removes the trivy
+# The trivy CLI is intentionally NOT bundled in the runtime image. Container
+# image scans go through a Harbor scanner-adapter over HTTP (TRIVY_ADAPTER_URL,
+# #2088); the fs/incus scanners drive the trivy sidecar in server mode
+# (TRIVY_URL). Neither needs an in-image binary. Dropping it removes the trivy
 # binary's HIGH-severity Go-dependency CVEs and ~150 MB of image size with no
-# functional loss. See issue #1544.
+# functional loss. See issues #1544 and #2088.
 #
 # Grype is pinned to v0.114.0, which is the latest upstream release. There is no
 # newer Grype build that picks up fixed versions of its bundled Go deps
