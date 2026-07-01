@@ -504,6 +504,14 @@ impl ImageScanner {
                 e
             ))
         })?;
+        // An empty/whitespace id would produce a bogus `/scan//report` poll URL
+        // that can never resolve; reject it up front (fail-closed) rather than
+        // polling a nonsensical endpoint until the budget is exhausted.
+        if parsed.id.trim().is_empty() {
+            return Err(AppError::BadGateway(
+                "Scanner adapter returned an empty scan id on submit".to_string(),
+            ));
+        }
         Ok(parsed.id)
     }
 
@@ -539,11 +547,14 @@ impl ImageScanner {
                 });
             }
 
-            // "Not ready yet": Harbor signals this with a 302 Found (and a
-            // Refresh-After header) or, on some adapters, a 404 while the id is
-            // still being processed. Anything else is a hard failure.
-            let pending =
-                status == reqwest::StatusCode::FOUND || status == reqwest::StatusCode::NOT_FOUND;
+            // "Not ready yet": Harbor (and our in-house adapter #2092) signal
+            // this with a 302 Found and a `Refresh-After` header. Everything
+            // else — including a 404 — is terminal: #2092 returns 404 for a
+            // genuinely unknown/expired scan id, so treating it as pending would
+            // poll fruitlessly until the ~280s budget is exhausted, tying up a
+            // scan worker for ~5 minutes. Fail fast (still fail-closed: an Err,
+            // never an Ok-with-0-findings).
+            let pending = status == reqwest::StatusCode::FOUND;
             if !pending {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(AppError::BadGateway(format!(
@@ -1132,6 +1143,70 @@ mod tests {
         assert!(
             matches!(result, Err(AppError::BadGateway(_))),
             "a never-ready report must fail the scan (NOT Ok-empty), got {:?}",
+            result
+        );
+    }
+
+    /// A 404 report response is a TERMINAL error, not "pending": our in-house
+    /// adapter (#2092) returns 404 for a genuinely unknown/expired scan id. It
+    /// must fail the scan immediately (fail-fast) rather than polling until the
+    /// ~280s budget is exhausted and tying up a worker. We wrap the call in a
+    /// short timeout to prove it returns promptly rather than waiting out the
+    /// poll budget.
+    #[tokio::test]
+    async fn test_adapter_report_404_fails_fast() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_ready_and_submit(&server, "scan-unknown").await;
+        // Adapter reports 404 for an unknown id — terminal, not pending.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/scan/.+/report$"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unknown scan id"))
+            .mount(&server)
+            .await;
+
+        let scanner = ImageScanner::new(server.uri());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scanner.scan(&oci_image_artifact(), None, &Bytes::new()),
+        )
+        .await
+        .expect("404 report must fail fast, not poll out the ~280s budget");
+        assert!(
+            matches!(result, Err(AppError::BadGateway(_))),
+            "a 404 report (unknown scan id) must fail the scan immediately, got {:?}",
+            result
+        );
+    }
+
+    /// An empty scan id from the submit endpoint must fail the scan up front:
+    /// an empty id yields a bogus `/scan//report` poll URL that never resolves.
+    #[tokio::test]
+    async fn test_adapter_empty_scan_id_fails_scan() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/scan"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({ "id": "" })))
+            .mount(&server)
+            .await;
+
+        let scanner = ImageScanner::new(server.uri());
+        let result = scanner
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await;
+        assert!(
+            matches!(result, Err(AppError::BadGateway(_))),
+            "an empty scan id must fail the scan with BadGateway, got {:?}",
             result
         );
     }
