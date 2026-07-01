@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::extractors::RequestBaseUrl;
+use crate::api::extractors::{trusted_external_url, RequestBaseUrl};
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::validation::validate_outbound_sso_url;
 
@@ -610,6 +610,51 @@ pub async fn ldap_login(
 // SAML login + ACS
 // ---------------------------------------------------------------------------
 
+/// Build the AssertionConsumerService URL the SP embeds in the
+/// AuthnRequest and verifies on the ACS callback.
+///
+/// When `use_absolute` is false (the default, matching the codebase's
+/// pre-138 behaviour), the historical relative path is returned so existing
+/// SAML providers see no wire-format change on upgrade.
+///
+/// When `use_absolute` is true, the URL is rebased onto `trusted_base` —
+/// which MUST come from a trusted config source (`AK_EXTERNAL_URL`), NEVER
+/// from attacker-influenceable request headers (`Host`, `X-Forwarded-Host`,
+/// etc.). This value is embedded in the outbound AuthnRequest's
+/// `AssertionConsumerServiceURL` and validated back on the callback; a
+/// spoofable source would let an attacker advertise a hostile ACS to the
+/// IdP and receive the signed assertion (see PR #2040 review). When the
+/// flag is on but no trusted base is configured, this function fails
+/// closed to the relative form and emits a warning so an operator can spot
+/// the misconfiguration in logs — a hard error here would block SAML
+/// login on the same providers this flag exists to help, and the relative
+/// form is the safe fallback (identical to the pre-138 baseline).
+///
+/// Any trailing slash on `trusted_base` is dropped before concatenation so
+/// the result has exactly one `/` between origin and path.
+fn build_saml_acs_url(use_absolute: bool, trusted_base: Option<&str>, id: Uuid) -> String {
+    if use_absolute {
+        match trusted_base {
+            Some(base) => format!(
+                "{}/api/v1/auth/sso/saml/{}/acs",
+                base.trim_end_matches('/'),
+                id
+            ),
+            None => {
+                tracing::warn!(
+                    saml_provider_id = %id,
+                    "use_absolute_acs_url is enabled on this SAML provider but AK_EXTERNAL_URL is unset. \
+                     Falling back to the relative ACS URL form (identical to use_absolute_acs_url=false). \
+                     Set AK_EXTERNAL_URL to a trusted absolute base to enable the absolute form."
+                );
+                format!("/api/v1/auth/sso/saml/{}/acs", id)
+            }
+        }
+    } else {
+        format!("/api/v1/auth/sso/saml/{}/acs", id)
+    }
+}
+
 /// Initiate SAML login redirect
 #[utoipa::path(
     get,
@@ -631,11 +676,18 @@ pub async fn saml_login(
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
-    // Create SSO session for CSRF
-    let _session = AuthConfigService::create_sso_session(&state.db, "saml", id).await?;
+    // Build ACS URL — per-provider opt-in to absolute form (migration 139).
+    // The trusted base MUST come from AK_EXTERNAL_URL, not from request
+    // headers; otherwise a spoofed X-Forwarded-Host would let an attacker
+    // steer the IdP into POSTing the signed assertion elsewhere.
+    let acs_url = build_saml_acs_url(row.use_absolute_acs_url, trusted_external_url(), id);
 
-    // Build ACS URL
-    let acs_url = format!("/api/v1/auth/sso/saml/{}/acs", id);
+    // Expected ACS URL for the callback-side Destination/Recipient binding.
+    // Only computed when AK_EXTERNAL_URL is set (the trusted absolute form);
+    // otherwise `None` disables the binding check. This is independent of the
+    // wire-format opt-in above — a strict IdP echoes the absolute ACS it
+    // delivered to regardless of whether we advertised it relatively.
+    let expected_acs = trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), id));
 
     // Create SAML service from DB config
     let saml_svc = SamlService::from_db_config(
@@ -646,6 +698,7 @@ pub async fn saml_login(
         Some(&row.certificate),
         &row.sp_entity_id,
         &acs_url,
+        expected_acs.as_deref(),
         &row.name_id_format,
         &row.attribute_mapping,
         row.sign_requests,
@@ -655,6 +708,17 @@ pub async fn saml_login(
 
     // Generate AuthnRequest
     let authn_request = saml_svc.create_authn_request()?;
+
+    // Persist the AuthnRequest ID as a single-use SSO session so the ACS
+    // callback can require + consume a matching `InResponseTo` (replay +
+    // unsolicited-response protection). The state column is the request_id.
+    let _session = AuthConfigService::create_sso_session_with_state(
+        &state.db,
+        "saml",
+        id,
+        &authn_request.request_id,
+    )
+    .await?;
 
     Ok(Redirect::temporary(&authn_request.redirect_url))
 }
@@ -690,8 +754,15 @@ pub async fn saml_acs(
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
-    // Build ACS URL
-    let acs_url = format!("/api/v1/auth/sso/saml/{}/acs", id);
+    // Build ACS URL — must agree with the value bound into the AuthnRequest
+    // in `saml_login`. Sourced from the same trusted-only helper so the
+    // callback-side validation cannot be steered by a spoofed request
+    // header either.
+    let acs_url = build_saml_acs_url(row.use_absolute_acs_url, trusted_external_url(), id);
+
+    // Expected ACS for the Destination/Recipient binding — same trusted-only
+    // derivation as `saml_login` so the two sides agree.
+    let expected_acs = trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), id));
 
     // Create SAML service
     let saml_svc = SamlService::from_db_config(
@@ -702,6 +773,7 @@ pub async fn saml_acs(
         Some(&row.certificate),
         &row.sp_entity_id,
         &acs_url,
+        expected_acs.as_deref(),
         &row.name_id_format,
         &row.attribute_mapping,
         row.sign_requests,
@@ -2536,5 +2608,127 @@ mod tests {
             cleanup_groups(&pool, &[gid]).await;
             cleanup_user(&pool, user_id).await;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_saml_acs_url (migration 139 — per-provider opt-in to absolute
+    // ACS URLs for IdPs that reject the historical relative form)
+    // -----------------------------------------------------------------------
+
+    /// Regression: when the per-provider flag is OFF (the default and the
+    /// pre-138 behaviour), the SP MUST keep emitting the historical relative
+    /// ACS path. Any divergence here changes the AuthnRequest wire format on
+    /// every existing SAML deployment and would break IdPs that have stored
+    /// the relative path as the registered ACS.
+    #[test]
+    fn test_build_saml_acs_url_relative_when_flag_off() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let url = build_saml_acs_url(false, Some("https://pkg.sup-any.com"), id);
+        assert_eq!(
+            url,
+            "/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000001/acs"
+        );
+    }
+
+    /// Regression: with the flag OFF, the result is invariant under the
+    /// trusted base. Pins the zero-behavioural-change guarantee so a future
+    /// refactor cannot quietly start mixing the resolved host into the
+    /// relative form.
+    #[test]
+    fn test_build_saml_acs_url_relative_ignores_trusted_base_when_flag_off() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let url_a = build_saml_acs_url(false, Some("https://pkg.sup-any.com"), id);
+        let url_b = build_saml_acs_url(false, Some("http://localhost:8080"), id);
+        let url_c = build_saml_acs_url(false, None, id);
+        assert_eq!(url_a, url_b);
+        assert_eq!(url_b, url_c);
+        assert!(url_a.starts_with('/'));
+    }
+
+    /// With the flag ON, the ACS URL is rebased onto the trusted base.
+    #[test]
+    fn test_build_saml_acs_url_absolute_uses_trusted_base() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let url = build_saml_acs_url(true, Some("https://pkg.sup-any.com"), id);
+        assert_eq!(
+            url,
+            "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000003/acs"
+        );
+    }
+
+    /// Trailing slashes on the trusted base are dropped so there is exactly
+    /// one `/` between the origin and the API path.
+    #[test]
+    fn test_build_saml_acs_url_absolute_trims_trailing_slash() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
+        let url = build_saml_acs_url(true, Some("https://pkg.sup-any.com/"), id);
+        assert_eq!(
+            url,
+            "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000004/acs"
+        );
+        let url2 = build_saml_acs_url(true, Some("https://pkg.sup-any.com///"), id);
+        assert_eq!(
+            url2,
+            "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000004/acs"
+        );
+    }
+
+    /// Reverse-proxy subpath deployments: the trusted base may end with a
+    /// non-root path. The ACS path is appended verbatim with one boundary
+    /// slash.
+    #[test]
+    fn test_build_saml_acs_url_absolute_handles_subpath_base() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000005").unwrap();
+        let url = build_saml_acs_url(true, Some("https://example.com/ak"), id);
+        assert_eq!(
+            url,
+            "https://example.com/ak/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000005/acs"
+        );
+    }
+
+    /// Security: with the flag ON but no trusted base configured
+    /// (`AK_EXTERNAL_URL` unset), the helper must fail closed to the
+    /// relative form rather than reach for anything spoofable. The relative
+    /// form matches the pre-138 baseline and cannot steer the IdP toward
+    /// an attacker origin. Reported during PR #2040 red-team review.
+    #[test]
+    fn test_build_saml_acs_url_absolute_falls_back_to_relative_when_no_trusted_base() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000006").unwrap();
+        let url = build_saml_acs_url(true, None, id);
+        assert_eq!(
+            url, "/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000006/acs",
+            "flag ON + no trusted base MUST fall back to the relative form; \
+             anything else lets an attacker-controllable request header be \
+             interpolated into the signed AuthnRequest"
+        );
+    }
+
+    /// RED-TEAM regression (#2096 review): `build_saml_acs_url` takes only the
+    /// *trusted* base (resolved from `AK_EXTERNAL_URL` via
+    /// `trusted_external_url()`). There is deliberately no request-header
+    /// parameter, so a spoofed `Host` / `X-Forwarded-Host` simply is not an
+    /// input and cannot change the emitted ACS. This pins that the emitted
+    /// host is always the trusted one, on both flag states, and that an
+    /// attacker-shaped string never appears unless it *is* the configured
+    /// trusted base.
+    #[test]
+    fn test_build_saml_acs_url_uses_trusted_base_only_never_spoofable_host() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000009").unwrap();
+        let trusted = "https://pkg.trusted.example";
+
+        // Flag ON: the only host that can appear is the trusted base.
+        let on = build_saml_acs_url(true, Some(trusted), id);
+        assert_eq!(
+            on,
+            "https://pkg.trusted.example/api/v1/auth/sso/saml/\
+             00000000-0000-0000-0000-000000000009/acs"
+        );
+        assert!(!on.contains("attacker"));
+
+        // Flag OFF: no host is emitted at all — a spoofed header has nothing
+        // to attach to.
+        let off = build_saml_acs_url(false, Some(trusted), id);
+        assert!(off.starts_with('/'));
+        assert!(!off.contains("pkg.trusted.example"));
     }
 }
