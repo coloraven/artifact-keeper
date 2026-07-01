@@ -35,6 +35,7 @@ use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -1293,6 +1294,39 @@ fn resolve_archive_url(download: &serde_json::Value) -> Result<&str, Response> {
     })
 }
 
+/// Derive a scheme-less proxy-cache path for a network-mirror archive
+/// download from the registry-provided (frequently absolute) `download_url`.
+///
+/// `archive_url` is used directly as the upstream fetch target (absolute
+/// `http(s)://` URLs pass through `ProxyService::build_upstream_url`
+/// unchanged), but it cannot double as the proxy-cache path: the `https://`
+/// scheme's `//` trips `ProxyService::validate_cache_path`'s empty-segment
+/// guard. This instead derives a canonical
+/// `<namespace>/<type>/<version>/<os>/<arch>/<filename>` path from the
+/// archive URL's own filename, keeping cache keys stable regardless of which
+/// host or path shape the upstream registry serves archives from (#1998).
+///
+/// Parses `archive_url` instead of splitting the raw string so that a signed
+/// URL's query string (e.g. `?X-Amz-Signature=...`) or fragment is dropped
+/// along with everything else outside the path: query material must never
+/// end up embedded in a proxy-cache object key.
+fn mirror_archive_cache_path(
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+    archive_url: &str,
+) -> String {
+    let filename = reqwest::Url::parse(archive_url)
+        .ok()
+        .and_then(|url| url.path_segments()?.next_back().map(str::to_string))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "provider.zip".to_string());
+
+    format!("{namespace}/{type_name}/{version}/{os}/{arch}/{filename}")
+}
+
 /// Validated context for serving a network-mirror request against a remote
 /// Terraform repository: the resolved repo plus its upstream registry URL.
 struct MirrorRemote<'a> {
@@ -1443,14 +1477,48 @@ async fn mirror_download(
 
     let archive_url = resolve_archive_url(&download)?;
 
-    // `proxy_fetch_streaming` passes absolute URLs through unchanged, so the
-    // archive is streamed (and cached) directly from the registry-provided URL.
-    proxy_helpers::proxy_fetch_streaming(
+    // A malicious/compromised upstream registry could return an internal
+    // address (e.g. the cloud metadata endpoint) as `download_url`. Validate
+    // it against the same anti-SSRF policy used for other registries'
+    // registry-discovered download URLs (see cargo.rs's `download` handler
+    // and pypi.rs's `find_upstream_url_for_file` path) before fetching it.
+    validate_outbound_url(archive_url, "Terraform upstream archive URL").map_err(|e| {
+        // Deliberately omit `archive_url` from this log line: it is
+        // registry-controlled and frequently a signed URL (e.g.
+        // `?X-Amz-Signature=...`), so logging it verbatim would leak
+        // credential-bearing query material. `e` already names the
+        // specific blocked host/IP without echoing the query string.
+        tracing::warn!(
+            "SSRF check rejected upstream download_url for {}/{} {} {}/{}: {}",
+            namespace,
+            type_name,
+            version,
+            os,
+            arch,
+            e
+        );
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream registry returned a disallowed download_url: {e}"),
+        )
+            .into_response()
+    })?;
+
+    // `archive_url` is frequently an absolute `https://` URL (#1998): fine as
+    // the upstream fetch target (absolute URLs pass through unchanged), but
+    // not as the proxy-cache path (its `https://` scheme trips the
+    // empty-segment guard). Fetch from `archive_url` but cache under a
+    // derived, scheme-less canonical path instead.
+    let cache_path =
+        mirror_archive_cache_path(&namespace, &type_name, &version, &os, &arch, archive_url);
+
+    proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
         remote.proxy,
         remote.repo.id,
         &repo_key,
         &remote.upstream_url,
         archive_url,
+        &cache_path,
         "application/zip",
     )
     .await
@@ -2483,6 +2551,133 @@ mod tests {
 
         let err2 = resolve_archive_url(&serde_json::json!({ "download_url": "" })).unwrap_err();
         assert_eq!(err2.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Regression guard for the SSRF gap found in review of #1998: a
+    /// malicious/compromised upstream Terraform registry must not be able to
+    /// redirect `mirror_download` at an internal address via `download_url`.
+    /// Mirrors `test_build_download_url_rejects_internal_addresses` in
+    /// cargo.rs — one realistic bypass case pins the integration; the full
+    /// bypass matrix lives in `api::validation::tests`.
+    #[test]
+    fn test_resolve_archive_url_rejects_ssrf_targets() {
+        let metadata =
+            serde_json::json!({ "download_url": "http://169.254.169.254/latest/meta-data/" });
+        let archive_url = resolve_archive_url(&metadata).unwrap();
+        let err = validate_outbound_url(archive_url, "Terraform upstream archive URL")
+            .expect_err("cloud metadata download_url must be rejected");
+        assert!(
+            err.to_string().contains("private/internal network")
+                || err.to_string().contains("not allowed"),
+            "expected SSRF rejection reason in error message, got: {err}"
+        );
+
+        let legit = serde_json::json!({
+            "download_url": "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip"
+        });
+        let archive_url = resolve_archive_url(&legit).unwrap();
+        assert!(
+            validate_outbound_url(archive_url, "Terraform upstream archive URL").is_ok(),
+            "legitimate external archive URL should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_strips_signed_url_query_string() {
+        // A signed archive URL (e.g. an S3 presigned link) must not leak its
+        // query-string credentials into the derived cache path / storage
+        // object key.
+        let cache_path = mirror_archive_cache_path(
+            "hashicorp",
+            "null",
+            "3.2.3",
+            "linux",
+            "arm64",
+            "https://provider-bucket.s3.amazonaws.com/terraform-provider-null_3.2.3_linux_arm64.zip\
+             ?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAEXAMPLE%2F20260630%2Fus-east-1",
+        );
+        assert_eq!(
+            cache_path,
+            "hashicorp/null/3.2.3/linux/arm64/terraform-provider-null_3.2.3_linux_arm64.zip"
+        );
+        assert!(
+            !cache_path.contains("X-Amz"),
+            "cache path must not contain signed-URL query material, got: {cache_path}"
+        );
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_hashicorp_release_url() {
+        // Reproduces the exact #1998 repro: an absolute releases.hashicorp.com
+        // archive URL must derive a clean, scheme-less canonical cache path.
+        let cache_path = mirror_archive_cache_path(
+            "hashicorp",
+            "null",
+            "3.2.3",
+            "linux",
+            "arm64",
+            "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip",
+        );
+        assert_eq!(
+            cache_path,
+            "hashicorp/null/3.2.3/linux/arm64/terraform-provider-null_3.2.3_linux_arm64.zip"
+        );
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_third_party_host() {
+        // OpenTofu-style / third-party mirrors (e.g. a provider hosted on
+        // GitHub Releases) serve from a different host and path shape; only
+        // the archive's filename should influence the derived cache path.
+        let cache_path = mirror_archive_cache_path(
+            "carlpett",
+            "sops",
+            "1.0.0",
+            "darwin",
+            "arm64",
+            "https://github.com/carlpett/terraform-provider-sops/releases/download/v1.0.0/terraform-provider-sops_1.0.0_darwin_arm64.zip",
+        );
+        assert_eq!(
+            cache_path,
+            "carlpett/sops/1.0.0/darwin/arm64/terraform-provider-sops_1.0.0_darwin_arm64.zip"
+        );
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_trailing_slash_falls_back_to_default_filename() {
+        // A URL ending in `/` has no filename segment; falling back to a
+        // fixed name avoids producing an empty final path segment.
+        let cache_path = mirror_archive_cache_path(
+            "hashicorp",
+            "null",
+            "3.2.3",
+            "linux",
+            "arm64",
+            "https://example.com/download/",
+        );
+        assert_eq!(cache_path, "hashicorp/null/3.2.3/linux/arm64/provider.zip");
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_accepted_by_cache_storage_key_1998() {
+        // Regression guard for #1998: the raw absolute archive URL must NOT
+        // be usable as a proxy-cache path (its `https://` scheme's `//`
+        // trips the empty-segment guard), but the derived cache path must be.
+        use crate::services::proxy_service::ProxyService;
+
+        let archive_url = "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip";
+
+        let raw_err = ProxyService::cache_storage_key("tf-mirror", archive_url).unwrap_err();
+        assert!(
+            raw_err.to_string().contains("empty segments"),
+            "raw absolute archive URL must be rejected as a cache path, got: {}",
+            raw_err
+        );
+
+        let cache_path =
+            mirror_archive_cache_path("hashicorp", "null", "3.2.3", "linux", "arm64", archive_url);
+        ProxyService::cache_storage_key("tf-mirror", &cache_path)
+            .expect("derived cache path must be a valid proxy-cache path");
     }
 
     #[test]

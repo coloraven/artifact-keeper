@@ -195,6 +195,28 @@ pub fn reject_direct_upload_if_promotion_only(
     }
 }
 
+/// Strip query strings and fragments before logging a proxy path. Some
+/// split-path proxy callers fetch absolute, signed upstream URLs while caching
+/// under a stable local key; the fetch target must remain raw for the outbound
+/// request, but diagnostics must not preserve credential-bearing URL material.
+fn redact_proxy_path_for_diagnostics(path: &str) -> String {
+    if let Ok(mut parsed) = reqwest::Url::parse(path) {
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        return parsed.to_string();
+    }
+
+    let query_pos = path.find('?');
+    let fragment_pos = path.find('#');
+    let end = match (query_pos, fragment_pos) {
+        (Some(q), Some(f)) => q.min(f),
+        (Some(q), None) => q,
+        (None, Some(f)) => f,
+        (None, None) => path.len(),
+    };
+    path[..end].to_string()
+}
+
 /// Map a proxy service error to an HTTP error response.
 ///
 /// * `NotFound` → 404 (upstream definitively does not have the artifact)
@@ -233,11 +255,12 @@ pub fn reject_direct_upload_if_promotion_only(
 ///   failures, body read errors) stays at `warn` because those genuinely
 ///   warrant operator attention.
 fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Response {
+    let diagnostic_path = redact_proxy_path_for_diagnostics(path);
     match &e {
         crate::error::AppError::NotFound(_) => {
             tracing::info!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Upstream returned 404 (artifact or tag does not exist): {}",
                 e
             );
@@ -253,7 +276,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::Validation(_) => {
             tracing::warn!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Proxy rejected request path: {}",
                 e
             );
@@ -266,7 +289,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::ServiceUnavailable(_) => {
             tracing::warn!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Upstream transient failure (5xx); returning 503: {}",
                 e
             );
@@ -284,7 +307,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::Conflict(msg) => {
             tracing::info!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Proxy download blocked by quarantine policy: {}",
                 e
             );
@@ -295,7 +318,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::Authorization(msg) => {
             tracing::info!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Proxy download forbidden by quarantine policy: {}",
                 e
             );
@@ -304,7 +327,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         _ => {
             tracing::warn!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Proxy fetch failed: {}",
                 e
             );
@@ -928,6 +951,36 @@ pub async fn proxy_fetch_streaming_with_cache_key(
         },
     )
     .await
+}
+
+/// Response-producing sibling of [`proxy_fetch_streaming_with_cache_key`]:
+/// fetches with split fetch/cache paths and builds the outbound streaming
+/// [`Response`] via [`stream_fetch_result`], the same way [`proxy_fetch_streaming`]
+/// does for the common (single-path) case. Format handlers whose upstream
+/// download URL cannot double as a safe proxy-cache path — e.g. Terraform/
+/// OpenTofu network-mirror archive downloads, where the registry-provided
+/// `download_url` is an absolute URL and `https://` trips the cache path's
+/// empty-segment guard — use this instead of `proxy_fetch_streaming` (#1998).
+pub async fn proxy_fetch_streaming_response_with_cache_key(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    default_content_type: &str,
+) -> Result<Response, Response> {
+    let result = proxy_fetch_streaming_with_cache_key(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        cache_path,
+    )
+    .await?;
+
+    stream_fetch_result(result, default_content_type, None)
 }
 
 /// Streaming sibling of [`proxy_check_cache`]: probe the proxy cache for
@@ -3005,6 +3058,20 @@ mod tests {
             "upstream".into()
         )));
         assert!(!is_quarantine_block(&AppError::Storage("io".into())));
+    }
+
+    #[test]
+    fn test_redact_proxy_path_for_diagnostics_strips_signed_url_query() {
+        let signed = "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip\
+                      ?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAEXAMPLE#frag";
+        assert_eq!(
+            redact_proxy_path_for_diagnostics(signed),
+            "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip"
+        );
+        assert_eq!(
+            redact_proxy_path_for_diagnostics("packages/pkg.zip?token=secret#frag"),
+            "packages/pkg.zip"
+        );
     }
 
     #[test]
@@ -5951,6 +6018,72 @@ mod tests {
         );
         assert!(h.get("content-length").is_none());
         assert!(h.get("content-disposition").is_none());
+    }
+
+    /// End-to-end pin for [`proxy_fetch_streaming_response_with_cache_key`]
+    /// (#1998): the upstream fetch and the proxy cache key must be allowed to
+    /// diverge. This mirrors the Terraform/OpenTofu network-mirror archive
+    /// download bug, where the registry-provided `download_url` is an
+    /// absolute URL (fine as a fetch target) but unsafe as a cache path (its
+    /// `https://` scheme's `//` trips `validate_cache_path`'s empty-segment
+    /// guard). `fetch_path` here is deliberately an absolute URL while
+    /// `cache_path` is a canonical, scheme-less path, so a regression that
+    /// collapses the wrapper back to `fetch_path == cache_path` would fail
+    /// cache-path validation rather than just silently caching under the
+    /// wrong key.
+    ///
+    /// Skipped when `DATABASE_URL` is unset (CI always sets it).
+    #[tokio::test]
+    async fn test_proxy_fetch_streaming_response_with_cache_key_streams_split_paths_1998() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let archive_bytes = b"fake-provider-archive-bytes";
+        Mock::given(method("GET"))
+            .and(path("/terraform-provider-null_3.2.3_linux_arm64.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive_bytes.as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("tf-mirror-cache-key-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        // The absolute-URL fetch target, exactly as an upstream registry's
+        // download document would provide it.
+        let fetch_path = format!(
+            "{}/terraform-provider-null_3.2.3_linux_arm64.zip",
+            server.uri()
+        );
+        // The canonical, scheme-less cache path `mirror_archive_cache_path`
+        // derives for this archive.
+        let cache_path =
+            "hashicorp/null/3.2.3/linux/arm64/terraform-provider-null_3.2.3_linux_arm64.zip";
+
+        let response = proxy_fetch_streaming_response_with_cache_key(
+            &proxy,
+            Uuid::new_v4(),
+            "tf-mirror",
+            &server.uri(),
+            &fetch_path,
+            cache_path,
+            "application/zip",
+        )
+        .await
+        .expect("streaming response must succeed for a split fetch/cache path");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&body[..], archive_bytes.as_ref());
     }
 
     // -------------------------------------------------------------------
