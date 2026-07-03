@@ -1220,6 +1220,16 @@ async fn fetch_maven_metadata_bytes(
         }
     }
 
+    if let Some((group_id, artifact_id, version)) = parse_snapshot_metadata_path(path) {
+        let entries =
+            collect_snapshot_entries(&state.db, repo.id, &group_id, &artifact_id, &version).await;
+        if let Some(xml) =
+            generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &entries)
+        {
+            return Ok(Bytes::from(xml));
+        }
+    }
+
     Err(AppError::NotFound("Metadata not found".to_string()).into_response())
 }
 
@@ -3093,6 +3103,70 @@ mod tests {
         let xml = r#"<metadata><groupId>g</groupId><artifactId>a</artifactId></metadata>"#;
         let parsed = parse_snapshot_versions_xml(xml);
         assert!(parsed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hosted_snapshot_metadata_generated_from_replicated_timestamped_rows() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let router = fx.router_with_auth(super::router());
+        let base = "org/example/ak/maven/ak-snapshot/1.0-SNAPSHOT";
+        let timestamped = "1.0-20260702.120000-1";
+        let uploads = [
+            (
+                format!("{base}/ak-snapshot-{timestamped}.jar"),
+                bytes::Bytes::from_static(b"snapshot jar bytes"),
+            ),
+            (
+                format!("{base}/ak-snapshot-{timestamped}.pom"),
+                bytes::Bytes::from_static(
+                    br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example.ak.maven</groupId>
+  <artifactId>ak-snapshot</artifactId>
+  <version>1.0-SNAPSHOT</version>
+</project>"#,
+                ),
+            ),
+        ];
+
+        for (path, body) in uploads {
+            let (status, response_body) = tdh::send(
+                router.clone(),
+                tdh::put(format!("/{}/{}", fx.repo_key, path), body),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "Maven PUT must create {path}; body={}",
+                String::from_utf8_lossy(&response_body)
+            );
+        }
+
+        let metadata_path = format!("/{}/{}/maven-metadata.xml", fx.repo_key, base);
+        let (status, body) = tdh::send(router, tdh::get(metadata_path.clone())).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "hosted target peer must synthesize SNAPSHOT metadata from replicated timestamped rows; body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let xml = String::from_utf8(body.to_vec()).expect("metadata is utf-8");
+        assert!(xml.contains("<groupId>org.example.ak.maven</groupId>"));
+        assert!(xml.contains("<artifactId>ak-snapshot</artifactId>"));
+        assert!(xml.contains("<version>1.0-SNAPSHOT</version>"));
+        assert!(xml.contains("<extension>jar</extension>"));
+        assert!(xml.contains("<extension>pom</extension>"));
+        assert!(xml.contains("<value>1.0-20260702.120000-1</value>"));
     }
 
     // ── DB-backed HTTP-level regression tests (no_op without DATABASE_URL) ──
