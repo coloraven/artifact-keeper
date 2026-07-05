@@ -292,6 +292,11 @@ mod tests {
     fn lazy_pool() -> sqlx::PgPool {
         PgPoolOptions::new()
             .max_connections(1)
+            // This pool can only ever fail (the DB does not exist); a short
+            // acquire deadline makes that failure prompt. sqlx's default 30s
+            // otherwise stalls every guard test that touches the API-token
+            // path for the full timeout under parallel coverage runs.
+            .acquire_timeout(std::time::Duration::from_secs(1))
             .connect_lazy("postgresql://localhost/__guest_access_unit_test__")
             .expect("lazy connect should succeed without contacting the DB")
     }

@@ -828,7 +828,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn lazy_service() -> PermissionService {
-        let pool = PgPool::connect_lazy("postgres://fake:fake@localhost/fake").expect("lazy pool");
+        // Fake-DB pool: every acquire is doomed, so fail it in 1s instead of
+        // sqlx's default 30s — the cache fall-through tests otherwise each
+        // stall a full 30s (60s when two queries fail) under coverage runs.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("lazy pool");
         PermissionService::new(pool)
     }
 

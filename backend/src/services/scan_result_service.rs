@@ -2905,7 +2905,11 @@ mod tests {
     // =======================================================================
 
     fn unreachable_pool() -> PgPool {
-        PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none")
+        // Every acquire is doomed by construction; a 1s deadline keeps the
+        // connection-failure tests from waiting out sqlx's default 30s.
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy("postgres://fake:fake@127.0.0.1:1/none")
             .expect("connect_lazy never fails for a syntactically valid URL")
     }
 

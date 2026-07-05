@@ -2008,6 +2008,10 @@ mod tests {
         PgPoolOptions::new()
             .max_connections(1)
             .idle_timeout(std::time::Duration::from_secs(1))
+            // Every acquire is doomed (no DB at localhost/test); fail in 1s
+            // instead of sqlx's default 30s so the db-unreachable tests do
+            // not serialize 30-60s sleeps through the db-serial group.
+            .acquire_timeout(std::time::Duration::from_secs(1))
             .connect_lazy_with(
                 sqlx::postgres::PgConnectOptions::new()
                     .host("localhost")

@@ -1345,7 +1345,11 @@ mod tests {
     // Helper: create a minimal LifecycleService for calling validate_policy_config.
     // PgPool::connect_lazy requires a Tokio context, so these tests use #[tokio::test].
     fn make_service_for_validation() -> LifecycleService {
-        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+        // Fake-DB pool: any test that reaches the INSERT is asserting on the
+        // Database error, so fail acquires in 1s, not sqlx's default 30s.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy should not fail");
         LifecycleService::new(pool)
     }
