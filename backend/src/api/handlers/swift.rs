@@ -1532,7 +1532,7 @@ mod db_cov_tests {
             // Before the second request, wait for the streaming write-back to
             // commit so the cache is deterministically WARM.
             if i == 1 {
-                tdh::wait_for_cached_blob(&fx.storage_dir, zip_bytes.len() as u64).await;
+                tdh::wait_for_cache_commit(&fx.storage_dir, zip_bytes.len() as u64).await;
             }
             let result = super::download_archive(
                 state.clone(),
