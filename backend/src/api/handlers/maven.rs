@@ -1068,6 +1068,10 @@ async fn fetch_maven_metadata_bytes(
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
             let mut all_versions: Vec<String> = Vec::new();
+            // Newest `<lastUpdated>` reported by any member. Reused for the
+            // merged body so it is byte-identical across the separate metadata
+            // and checksum requests (#1922) instead of a per-request wall clock.
+            let mut max_last_updated: Option<String> = None;
 
             // Fan out across members CONCURRENTLY (#2069) in priority-order
             // batches of at most `MAX_VIRTUAL_FANOUT`: Remote members proxy their
@@ -1091,6 +1095,11 @@ async fn fetch_maven_metadata_bytes(
                 }))
                 .await;
                 for xml in member_docs.into_iter().flatten() {
+                    if let Some(ts) = crate::formats::maven::parse_metadata_last_updated(&xml) {
+                        if max_last_updated.as_deref() < Some(ts.as_str()) {
+                            max_last_updated = Some(ts);
+                        }
+                    }
                     if let Some((_, _, versions)) =
                         crate::formats::maven::parse_metadata_versions(&xml)
                     {
@@ -1108,9 +1117,12 @@ async fn fetch_maven_metadata_bytes(
                 let latest = sorted.last().unwrap().clone();
                 let release = maven_version::latest_release(&sorted).cloned();
 
-                // No single `MAX(updated_at)` across heterogeneous members;
-                // wall clock is the best we can do for the virtual aggregate.
-                let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+                // Reuse the newest member `<lastUpdated>` so the merged body is
+                // reproducible across the separate metadata and checksum
+                // requests (#1922); fall back to wall clock only if no member
+                // reported one (e.g. all-remote members omitting the element).
+                let last_updated = max_last_updated
+                    .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d%H%M%S").to_string());
                 let xml = generate_metadata_xml(
                     &group_id,
                     &artifact_id,

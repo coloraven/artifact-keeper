@@ -449,6 +449,25 @@ pub fn parse_metadata_versions(xml: &str) -> Option<(String, String, Vec<String>
     Some((group_id, artifact_id, versions))
 }
 
+/// Extract the `<lastUpdated>` timestamp (Maven wire format `YYYYMMDDHHMMSS`)
+/// from a maven-metadata.xml, if present. Used when merging virtual-repo member
+/// metadata to derive a *stable* aggregate timestamp, so the generated body is
+/// byte-reproducible across the separate `maven-metadata.xml` and
+/// `maven-metadata.xml.sha1` requests (#1922).
+pub fn parse_metadata_last_updated(xml: &str) -> Option<String> {
+    let ts = xml
+        .split("<lastUpdated>")
+        .nth(1)?
+        .split("</lastUpdated>")
+        .next()?
+        .trim();
+    if ts.is_empty() {
+        None
+    } else {
+        Some(ts.to_string())
+    }
+}
+
 /// A `<plugin>` entry from a group-level plugin-prefix maven-metadata.xml
 /// (e.g. `org/apache/maven/plugins/maven-metadata.xml`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +816,29 @@ mod tests {
         assert_eq!(g, "com.example");
         assert_eq!(a, "my-lib");
         assert_eq!(versions, vec!["1.0.0", "1.1.0"]);
+    }
+
+    #[test]
+    fn test_parse_metadata_last_updated() {
+        let xml = generate_metadata_xml(
+            "com.example",
+            "my-lib",
+            &["1.0.0".into()],
+            "1.0.0",
+            Some("1.0.0"),
+            "20260704133248",
+        );
+        assert_eq!(
+            parse_metadata_last_updated(&xml).as_deref(),
+            Some("20260704133248")
+        );
+        // No `<lastUpdated>` element -> None, so callers fall back to wall clock.
+        assert_eq!(parse_metadata_last_updated("<metadata></metadata>"), None);
+        // Present but empty -> None.
+        assert_eq!(
+            parse_metadata_last_updated("<lastUpdated>  </lastUpdated>"),
+            None
+        );
     }
 
     const PLUGIN_PREFIX_DOC_A: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
