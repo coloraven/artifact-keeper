@@ -7239,8 +7239,11 @@ mod tests {
             storage_path: storage_dir.to_string_lossy().into_owned(),
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
+            format: "chef".to_string(),
             upstream_url: None,
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let payload = b"streamed-artifact-body".repeat(64);
