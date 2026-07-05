@@ -198,6 +198,81 @@ fn cached_packument_response(entry: &CachedPackument) -> Response {
     response
 }
 
+/// How the age gate affects computed-packument cache eligibility for a repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackumentCacheAgeGateCheck {
+    /// No age-gate influence; the repo may use the cache.
+    Cacheable,
+    /// The gate applies to this repo directly; bypass the cache.
+    Bypass,
+    /// Virtual repo with the gate service present: eligibility depends on
+    /// whether any member repo is age-gated, which needs a DB lookup.
+    CheckVirtualMembers,
+}
+
+/// Pure part of the age-gate cache-eligibility decision.
+///
+/// The computed-packument cache stores final response bytes served verbatim
+/// to every later client, but an age-gated repo's packument is a policy- and
+/// time-dependent VIEW of that response: storing the filtered bytes would pin
+/// one moment's view for everyone (a version stays hidden for up to the stale
+/// window after aging past the threshold, and one repo's policy could poison
+/// another's entry), while serving pre-gate cached bytes would leak unfiltered
+/// packuments through the SWR fast path. Rather than keying the cache by a
+/// decision that changes with wall-clock time, age-gated repos bypass the
+/// cache and compute per-request; repos without the gate keep the full #2162
+/// speedup.
+fn classify_packument_cache_age_gate(
+    has_age_gate_service: bool,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+) -> PackumentCacheAgeGateCheck {
+    if !has_age_gate_service {
+        return PackumentCacheAgeGateCheck::Cacheable;
+    }
+    if AgeGateService::is_applicable(params) {
+        return PackumentCacheAgeGateCheck::Bypass;
+    }
+    if params.repo_type == RepositoryType::Virtual {
+        return PackumentCacheAgeGateCheck::CheckVirtualMembers;
+    }
+    PackumentCacheAgeGateCheck::Cacheable
+}
+
+/// Whether this repo must bypass the computed-packument cache because the age
+/// gate can filter its packuments (see [`classify_packument_cache_age_gate`]).
+/// Remote repos consult their own configuration; virtual repos bypass when
+/// ANY member has the gate enabled, because the virtual metadata path filters
+/// each member's contribution with that member's own params. A failed member
+/// lookup also bypasses: recomputing is merely slower, while serving a
+/// possibly-unfiltered cached packument is wrong.
+async fn age_gate_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo) -> bool {
+    match classify_packument_cache_age_gate(
+        state.age_gate_service.is_some(),
+        &proxy_helpers::age_gate_params(repo),
+    ) {
+        PackumentCacheAgeGateCheck::Cacheable => false,
+        PackumentCacheAgeGateCheck::Bypass => true,
+        PackumentCacheAgeGateCheck::CheckVirtualMembers => {
+            virtual_has_age_gated_member(&state.db, repo.id).await
+        }
+    }
+}
+
+/// True when any member of a virtual repository has the age gate enabled.
+/// Errs on the side of `true` (bypass) if the lookup fails.
+pub(crate) async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: uuid::Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+            SELECT 1 FROM repositories r \
+            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
+            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
+    )
+    .bind(virtual_repo_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
 /// Cache-fronted packument fetch used by the GET-metadata handlers.
 ///
 /// Only remote and virtual repositories are cached: that is where the
@@ -205,6 +280,8 @@ fn cached_packument_response(entry: &CachedPackument) -> Response {
 /// a cheap indexed DB read, and caching them would break read-your-writes
 /// across replicas with the in-process backend (a publish on one pod would
 /// leave other pods serving the pre-publish entry for the fresh window).
+/// Age-gated repos bypass the cache entirely (see
+/// [`classify_packument_cache_age_gate`]).
 ///
 /// Fresh hits serve the pre-computed, pre-encoded response with no upstream
 /// fetch, tarball-URL rewrite, abbreviation or serialize/compress. Stale hits
@@ -222,8 +299,9 @@ async fn get_package_metadata_cached(
     // One indexed lookup to classify the repo before consulting the cache;
     // its cost is negligible next to the upstream round-trip a hit saves.
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
-    let cache_eligible =
-        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual;
+    let cache_eligible = (repo.repo_type == RepositoryType::Remote
+        || repo.repo_type == RepositoryType::Virtual)
+        && !age_gate_bypasses_packument_cache(state, &repo).await;
     let Some(cache) = state.npm_packument_cache.clone().filter(|_| cache_eligible) else {
         return get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated)
             .await;
@@ -1592,8 +1670,18 @@ async fn npm_publish_time_for_version(
 ) -> Option<chrono::DateTime<Utc>> {
     if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
         let encoded_name = encode_package_name_for_upstream(package_name);
-        if let Ok((content, _)) =
-            proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &encoded_name).await
+        // Capped like every other buffered packument read (#2181): this runs
+        // on the tarball download path, where an unbounded upstream metadata
+        // body must not be able to balloon memory.
+        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &encoded_name,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
         {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
                 let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
@@ -5622,6 +5710,49 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_packument_cache_age_gate() {
+        use crate::models::repository::RepositoryFormat;
+        use crate::services::age_gate_service::AgeGateRepoParams;
+
+        let params = |repo_type: RepositoryType, enabled: bool| {
+            AgeGateRepoParams::from_parts(
+                uuid::Uuid::new_v4(),
+                "cache-bypass-test",
+                repo_type,
+                RepositoryFormat::Npm,
+                enabled,
+                7,
+            )
+        };
+
+        // Without the service, nothing bypasses — even a gated remote.
+        assert_eq!(
+            classify_packument_cache_age_gate(false, &params(RepositoryType::Remote, true)),
+            PackumentCacheAgeGateCheck::Cacheable
+        );
+        // A gated remote bypasses directly.
+        assert_eq!(
+            classify_packument_cache_age_gate(true, &params(RepositoryType::Remote, true)),
+            PackumentCacheAgeGateCheck::Bypass
+        );
+        // An ungated remote stays cacheable.
+        assert_eq!(
+            classify_packument_cache_age_gate(true, &params(RepositoryType::Remote, false)),
+            PackumentCacheAgeGateCheck::Cacheable
+        );
+        // A virtual repo is never gated directly (is_applicable is
+        // remote-only); with the service present its members decide.
+        assert_eq!(
+            classify_packument_cache_age_gate(true, &params(RepositoryType::Virtual, true)),
+            PackumentCacheAgeGateCheck::CheckVirtualMembers
+        );
+        assert_eq!(
+            classify_packument_cache_age_gate(true, &params(RepositoryType::Virtual, false)),
+            PackumentCacheAgeGateCheck::CheckVirtualMembers
+        );
+    }
+
+    #[test]
     fn test_is_cacheable_packument_content_type() {
         assert!(is_cacheable_packument_content_type("application/json"));
         assert!(is_cacheable_packument_content_type(
@@ -5759,6 +5890,44 @@ mod db_cov_tests {
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Age-gate packument-cache bypass: virtual member lookup
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_virtual_has_age_gated_member_lookup() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _vkey, _vdir) = tdh::create_repo(&pool, "virtual", "npm").await;
+        let (member_id, _mkey, _mdir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(&pool)
+        .await
+        .expect("add virtual member");
+
+        assert!(
+            !super::virtual_has_age_gated_member(&pool, virtual_id).await,
+            "ungated member must not force a cache bypass"
+        );
+
+        sqlx::query("UPDATE repositories SET age_gate_enabled = true WHERE id = $1")
+            .bind(member_id)
+            .execute(&pool)
+            .await
+            .expect("enable member age gate");
+
+        assert!(
+            super::virtual_has_age_gated_member(&pool, virtual_id).await,
+            "age-gated member must force a cache bypass"
+        );
     }
 
     // -----------------------------------------------------------------------
