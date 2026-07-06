@@ -10038,8 +10038,14 @@ mod tests {
         );
         assert_eq!(&body[..], pom.as_ref());
 
-        // Give the background cache writer time to flush the sidecar.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the streaming write-back to fully COMMIT the cache entry
+        // (full-size `__content__` object + matching `__cache_meta__.json`
+        // sidecar) rather than a fixed 100ms sleep. The tee flushes the sidecar
+        // on a background task; under parallel test load 100ms is not always
+        // enough, so `is_cache_fresh` (which requires the sidecar) intermittently
+        // reads false. This is the same sidecar-commit race the warm-cache tests
+        // fixed (#2203); reuse the same poller.
+        tdh::wait_for_cache_commit(&tmp, pom.len() as u64).await;
 
         // The cache must now be fresh with the correct length.
         assert!(
