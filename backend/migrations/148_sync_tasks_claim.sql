@@ -22,7 +22,7 @@ COMMENT ON COLUMN sync_tasks.claim_expires_at IS
 -- token-fenced finalizer. Mark them as expired claims so the recovery sweep can
 -- reset them instead of letting them count as live peer capacity forever.
 UPDATE sync_tasks
-SET claimed_by = COALESCE(claimed_by, 'migration-144-legacy-in-progress'),
+SET claimed_by = COALESCE(claimed_by, 'migration-148-legacy-in-progress'),
     claim_token = COALESCE(claim_token, gen_random_uuid()),
     claim_expires_at = COALESCE(claim_expires_at, NOW() - INTERVAL '1 second')
 WHERE status = 'in_progress'

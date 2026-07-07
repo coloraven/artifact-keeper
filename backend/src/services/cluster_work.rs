@@ -14,7 +14,7 @@
 //!   an unclaimed call site does not typecheck.
 //! * [`SchedulerLease`] / [`try_acquire_scheduler_lease`] — a durable lease
 //!   for singleton periodic jobs, backed by the `scheduler_leases` table
-//!   (migration 143).
+//!   (migration 147).
 //!
 //! Coordination patterns (declare one when adding recurring work):
 //!
