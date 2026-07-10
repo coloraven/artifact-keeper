@@ -59,7 +59,9 @@ fn log_proxy_env() {
 pub fn base_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let mut builder = reqwest::Client::builder().redirect(ssrf_redirect_policy());
+    let mut builder = reqwest::Client::builder()
+        .redirect(ssrf_redirect_policy())
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver());
 
     if let Ok(ca_path) = std::env::var("CUSTOM_CA_CERT_PATH") {
         match std::fs::read(&ca_path) {
@@ -269,6 +271,70 @@ mod tests {
         assert!(
             err.to_string().contains("SSRF") || err.is_redirect(),
             "expected redirect-rejection error, got: {err}"
+        );
+    }
+
+    /// A hostname resolving to a blocked IP must be refused at DNS time, not
+    /// connected to. `localhost` resolves to 127.0.0.1/::1 (blocked).
+    ///
+    /// This test is deliberately discriminating: a plain "connection
+    /// refused" (e.g. nothing listening on the port) also satisfies
+    /// `err.is_connect()`, so an assertion on the error alone would pass
+    /// even if `.dns_resolver(...)` were removed from `base_client_builder`
+    /// entirely (a false negative). To rule that out, we bind a *real*
+    /// listener on `127.0.0.1` and target it via `localhost:{port}` — an
+    /// unprotected client WOULD successfully connect to this listener, so
+    /// asserting the listener never receives a connection is what actually
+    /// proves the resolver blocked the request rather than merely finding
+    /// nothing to talk to.
+    #[tokio::test]
+    async fn test_client_refuses_host_resolving_to_blocked_ip() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        // Bound the request with a short timeout: `base_client_builder`
+        // itself sets no total request timeout, and this test's listener
+        // never writes an HTTP response. If the resolver regressed and the
+        // client actually connected, `.send().await` would otherwise hang
+        // forever waiting on a response that never arrives, hanging the
+        // test (and CI) instead of failing it. With the resolver correctly
+        // in place, rejection happens at the DNS stage well within this
+        // bound, so the timeout never fires on the passing path.
+        let client = base_client_builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let url = format!("http://localhost:{port}/");
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("host resolving to a blocked IP must be refused");
+        // A DNS/connect-layer rejection (not a live HTTP response).
+        assert!(
+            err.is_connect()
+                || err.is_request()
+                || err.to_string().to_lowercase().contains("ssrf")
+                || err.to_string().to_lowercase().contains("block"),
+            "expected resolver rejection, got: {err}"
+        );
+
+        // Discriminating check: the listener must never have accepted a
+        // connection. If the resolver were not wired in (or removed), the
+        // client would successfully connect to 127.0.0.1:{port} via
+        // `localhost`, and this would find a pending connection instead of
+        // timing out.
+        let accept_result =
+            tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accept_result.is_err(),
+            "listener must never accept a connection; the SSRF resolver should have \
+             blocked the request before any TCP connection was attempted, but a \
+             connection was accepted: {accept_result:?}"
         );
     }
 

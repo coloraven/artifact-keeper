@@ -215,6 +215,12 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // rewritten in place by upstream.
         RepositoryFormat::Debian => classify_debian(&lower),
 
+        // -- RPM / YUM ------------------------------------------------------
+        // repomd.xml(+.asc) is the single mutable entry point; every other
+        // repodata file is content-addressed (checksum-prefixed filename) and
+        // packages are version-pinned — both immutable.
+        RepositoryFormat::Rpm => classify_rpm(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -261,7 +267,8 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         | RepositoryFormat::WasmOci
         | RepositoryFormat::HelmOci
         | RepositoryFormat::Cargo
-        | RepositoryFormat::Debian => !classify(format, &lower).is_immutable(),
+        | RepositoryFormat::Debian
+        | RepositoryFormat::Rpm => !classify(format, &lower).is_immutable(),
 
         // Conan revision-file coordinates
         // (`.../revisions/{rev}/files/{file}`) are legitimately rewritten in
@@ -273,7 +280,7 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         // is a no-op for conan (matching the conan upload handlers' intent).
         RepositoryFormat::Conan => true,
 
-        // Default-format families (Generic, Nuget, Composer, Go, Rpm,
+        // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
         // every stored path is a release coordinate.
         _ => false,
@@ -395,9 +402,84 @@ fn classify_debian(lower: &str) -> Mutability {
     Mutability::mutable_default()
 }
 
+/// RPM: `repodata/repomd.xml`(+`.asc`) is the mutable index; all other
+/// `repodata/<checksum>-*` files are content-addressed and packages
+/// (`.rpm`/`.drpm`) are version-pinned — both immutable.
+fn classify_rpm(lower: &str) -> Mutability {
+    let leaf = leaf(lower);
+    // The mutable pointer and its detached signature.
+    if leaf == "repomd.xml" || leaf == "repomd.xml.asc" {
+        return Mutability::mutable_default();
+    }
+    // Packages are immutable.
+    if leaf.ends_with(".rpm") || leaf.ends_with(".drpm") {
+        return Mutability::Immutable;
+    }
+    // Content-addressed metadata under repodata/: a checksum-prefixed name such
+    // as `<hex>-primary.xml.gz` / `.zck`. Require a hex prefix before the first
+    // '-' so a bare `primary.xml.gz` (no unique-filename) stays conservative.
+    if lower.contains("repodata/") {
+        if let Some((prefix, _rest)) = leaf.split_once('-') {
+            let looks_hashed = prefix.len() >= 8 && prefix.chars().all(|c| c.is_ascii_hexdigit());
+            if looks_hashed {
+                return Mutability::Immutable;
+            }
+        }
+    }
+    // Unknown path: revalidate.
+    Mutability::mutable_default()
+}
+
 /// The final path segment (after the last `/`), or the whole string.
 fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// If `path` is a createrepo unique-filename (`repodata/<sha256>-<name>`),
+/// return the 64-hex-char checksum prefix. Used to verify a content-addressed
+/// body's integrity before caching it as immutable (design S3): the RPM
+/// `createrepo --unique-md-filenames` convention embeds the SHA-256 of the
+/// file's own content in its name (e.g.
+/// `repodata/1a2b...-primary.xml.gz`), so the path itself is an assertion
+/// about the body that a proxy can verify before trusting it forever.
+///
+/// Returns `None` for any path whose leaf does not have a 64-hex-char prefix
+/// before the first `-` (e.g. `repomd.xml`, a package file, or a
+/// non-checksum-prefixed metadata file) — those paths are not
+/// content-addressed and this check does not apply to them.
+pub fn expected_sha256_from_path(path: &str) -> Option<&str> {
+    let lower = path.to_ascii_lowercase();
+    let leaf = leaf(&lower);
+    let (prefix, _) = leaf.split_once('-')?;
+    if prefix.len() == 64 && prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Return the slice from the ORIGINAL path (case-insensitive hex).
+        let start = path.len() - leaf.len();
+        Some(&path[start..start + 64])
+    } else {
+        None
+    }
+}
+
+/// Phase-1 interim over-quota guard for a single object about to be cached
+/// (bug artifact-keeper-x70). Returns `true` when `quota_bytes` is set and
+/// `object_len` exceeds it, in which case the caller must skip the cache
+/// write for this object (still serving the body to the client).
+///
+/// This is deliberately NOT full per-repo usage accounting: the proxy cache
+/// is not recorded in the `artifacts` table (#1278), so there is no running
+/// per-repo proxy-cache total to check a request against yet. Full quota
+/// enforcement (usage tracking + eviction) is deferred to P4; this is only a
+/// cheap guard against a single object that is, by itself, already larger
+/// than the whole configured quota.
+///
+/// `quota_bytes = None` (no quota configured) never exceeds. An object
+/// exactly equal to the quota does NOT exceed (the quota is an inclusive
+/// ceiling, not an exclusive bound).
+pub fn exceeds_single_object_quota(quota_bytes: Option<i64>, object_len: i64) -> bool {
+    match quota_bytes {
+        Some(quota) => object_len > quota,
+        None => false,
+    }
 }
 
 /// Concrete versioned Maven artifact extensions (immutable). Checksums and
@@ -475,7 +557,7 @@ mod tests {
         ));
         // Default-format families have NO in-place index at a coordinate; every
         // stored path is a release coordinate -> always false (protected).
-        for f in [Generic, Nuget, Composer, Go, Rpm, Helm] {
+        for f in [Generic, Nuget, Composer, Go, Helm] {
             assert!(
                 !is_explicitly_mutable_index(&f, "anything/1.0.0/file.bin"),
                 "{f:?} coordinates must be treated as release coordinates"
@@ -697,5 +779,153 @@ mod tests {
     #[test]
     fn negative_ttl_constant_is_short() {
         assert!((30..=60).contains(&NEGATIVE_CACHE_TTL_SECS));
+    }
+
+    #[test]
+    fn test_classify_rpm() {
+        use RepositoryFormat::Rpm;
+        // repomd.xml and its signature are the mutable entry point.
+        assert_eq!(
+            classify(&Rpm, "repodata/repomd.xml"),
+            Mutability::mutable_default()
+        );
+        assert_eq!(
+            classify(&Rpm, "repodata/repomd.xml.asc"),
+            Mutability::mutable_default()
+        );
+        // Content-addressed metadata (checksum-prefixed) is immutable.
+        assert_eq!(
+            classify(&Rpm, "repodata/1a2b3c4d-primary.xml.gz"),
+            Mutability::Immutable
+        );
+        assert_eq!(
+            classify(&Rpm, "repodata/deadbeef-primary.xml.zck"),
+            Mutability::Immutable
+        );
+        // Packages are immutable.
+        assert_eq!(
+            classify(&Rpm, "Packages/foo-1.2-3.x86_64.rpm"),
+            Mutability::Immutable
+        );
+        assert_eq!(
+            classify(&Rpm, "getPackage/bar-2.0-1.noarch.drpm"),
+            Mutability::Immutable
+        );
+        // Unknown / directory-ish paths stay conservative.
+        assert_eq!(classify(&Rpm, "repodata/"), Mutability::mutable_default());
+        // A bare, non-checksum-prefixed metadata file stays conservative (mutable).
+        assert_eq!(
+            classify(&Rpm, "repodata/primary.xml.gz"),
+            Mutability::mutable_default()
+        );
+        // A prefix shorter than 8 hex chars is NOT treated as content-addressed.
+        assert_eq!(
+            classify(&Rpm, "repodata/1234567-primary.xml.gz"),
+            Mutability::mutable_default()
+        );
+        // Content-addressed metadata nested under a subpath is still immutable.
+        assert_eq!(
+            classify(&Rpm, "centos/9/repodata/deadbeef12-primary.xml.gz"),
+            Mutability::Immutable
+        );
+    }
+
+    #[test]
+    fn test_rpm_explicit_mutable_index() {
+        use RepositoryFormat::Rpm;
+        assert!(is_explicitly_mutable_index(&Rpm, "repodata/repomd.xml"));
+        assert!(!is_explicitly_mutable_index(
+            &Rpm,
+            "Packages/foo-1.2-3.x86_64.rpm"
+        ));
+        assert!(!is_explicitly_mutable_index(
+            &Rpm,
+            "repodata/deadbeef-primary.xml.gz"
+        ));
+    }
+
+    // ----- expected_sha256_from_path(): content-addressed integrity (S3) ----
+
+    #[test]
+    fn test_expected_sha256_from_path() {
+        // Full SHA-256 (64 hex) prefix is returned.
+        let p = "repodata/9f".to_string() + &"a".repeat(62) + "-primary.xml.gz";
+        assert!(expected_sha256_from_path(&p).is_some());
+        // repomd.xml and packages have no embedded checksum.
+        assert_eq!(expected_sha256_from_path("repodata/repomd.xml"), None);
+        assert_eq!(
+            expected_sha256_from_path("Packages/foo-1.2-3.x86_64.rpm"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_returns_exact_slice_of_original_path() {
+        let hex = "9f".to_string() + &"a".repeat(62);
+        let p = format!("repodata/{hex}-primary.xml.gz");
+        assert_eq!(expected_sha256_from_path(&p), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_case_insensitive_hex() {
+        // Uppercase hex in the path is still recognized as a checksum
+        // prefix, and the returned slice is the ORIGINAL (uppercase) bytes so
+        // the caller can compare byte-for-byte with a lowercase hex digest
+        // using an ascii-case-insensitive comparison.
+        let hex_upper = "9F".to_string() + &"A".repeat(62);
+        let p = format!("repodata/{hex_upper}-primary.xml.gz");
+        assert_eq!(expected_sha256_from_path(&p), Some(hex_upper.as_str()));
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_rejects_short_prefix() {
+        // A prefix shorter than 64 hex chars is not a full SHA-256 and must
+        // not be treated as content-addressed.
+        let p = "repodata/deadbeef-primary.xml.gz";
+        assert_eq!(expected_sha256_from_path(p), None);
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_rejects_non_hex_prefix() {
+        // 64 characters but not all hex digits.
+        let p = "repodata/".to_string() + &"z".repeat(64) + "-primary.xml.gz";
+        assert_eq!(expected_sha256_from_path(&p), None);
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_no_dash_in_leaf() {
+        // No '-' separator at all -> no checksum prefix to extract.
+        assert_eq!(
+            expected_sha256_from_path("repodata/primarynodash.xml"),
+            None
+        );
+    }
+
+    // ----- exceeds_single_object_quota(): Phase-1 interim guard (x70) -------
+
+    #[test]
+    fn test_exceeds_single_object_quota_table() {
+        // (quota_bytes, object_len, expected)
+        let cases: Vec<(Option<i64>, i64, bool)> = vec![
+            // No quota configured -> never exceeds.
+            (None, 0, false),
+            (None, i64::MAX, false),
+            // Object strictly larger than quota -> exceeds.
+            (Some(100), 101, true),
+            // Object exactly at quota -> does NOT exceed (quota is a ceiling,
+            // not an exclusive bound).
+            (Some(100), 100, false),
+            // Object smaller than quota -> does not exceed.
+            (Some(100), 99, false),
+            // Zero-byte object never exceeds any positive quota.
+            (Some(100), 0, false),
+        ];
+        for (quota_bytes, object_len, expected) in cases {
+            assert_eq!(
+                exceeds_single_object_quota(quota_bytes, object_len),
+                expected,
+                "exceeds_single_object_quota({quota_bytes:?}, {object_len}) expected {expected}"
+            );
+        }
     }
 }
