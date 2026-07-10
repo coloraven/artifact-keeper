@@ -881,6 +881,28 @@ impl ArtifactService {
             });
         }
 
+        // Best-effort audit trail (#2366): record who uploaded which artifact.
+        // Fire-and-forget so an audit-table outage can never fail an upload,
+        // mirroring the download/stats contract.
+        {
+            use crate::services::audit_service::{
+                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+            };
+            let mut entry = AuditEntry::new(AuditAction::ArtifactUploaded, ResourceType::Artifact)
+                .resource(artifact.id)
+                .details(serde_json::json!({
+                    "repository_id": artifact.repository_id.to_string(),
+                    "path": artifact.path,
+                    "name": artifact.name,
+                    "version": artifact.version,
+                    "size_bytes": artifact.size_bytes,
+                }));
+            if let Some(uid) = uploaded_by {
+                entry = entry.user(uid);
+            }
+            audit_fire_and_forget(self.db.clone(), entry).await;
+        }
+
         Ok(artifact)
     }
 
@@ -958,6 +980,33 @@ impl ArtifactService {
         .execute(&self.db)
         .await
         .ok(); // Ignore stats errors
+
+        // Best-effort audit trail (#2366). An `ARTIFACT_DOWNLOADED` event is the
+        // per-access record auditors need to answer "who fetched this artifact,
+        // and when?". Fire-and-forget: a download must never fail because the
+        // audit table is unavailable, mirroring the download-statistics write
+        // above. The IP is parsed leniently; a malformed value is simply omitted.
+        {
+            use crate::services::audit_service::{
+                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+            };
+            let mut entry =
+                AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
+                    .resource(artifact_id)
+                    .details(serde_json::json!({
+                        "repository_id": artifact_info.repository_id.to_string(),
+                        "path": artifact_info.path,
+                        "name": artifact_info.name,
+                        "version": artifact_info.version,
+                    }));
+            if let Some(uid) = user_id {
+                entry = entry.user(uid);
+            }
+            if let Some(ip) = ip_address.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
+                entry = entry.ip(ip);
+            }
+            audit_fire_and_forget(self.db.clone(), entry).await;
+        }
 
         // Trigger AfterDownload hooks (non-blocking)
         self.trigger_hook_non_blocking(PluginEventType::AfterDownload, artifact_info)
@@ -1265,6 +1314,27 @@ impl ArtifactService {
                     );
                     e
                 });
+        }
+
+        // Best-effort audit trail (#2366): record artifact deletion (soft
+        // delete). Fire-and-forget; never fails the delete.
+        {
+            use crate::services::audit_service::{
+                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+            };
+            // The service-layer delete does not carry the acting principal, so
+            // `user_id` (the actor) is intentionally left unset here; the
+            // original uploader is recorded in `details` for context.
+            let entry = AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact)
+                .resource(artifact.id)
+                .details(serde_json::json!({
+                    "repository_id": artifact.repository_id.to_string(),
+                    "path": artifact.path,
+                    "name": artifact.name,
+                    "version": artifact.version,
+                    "uploaded_by": artifact.uploaded_by.map(|u| u.to_string()),
+                }));
+            audit_fire_and_forget(self.db.clone(), entry).await;
         }
 
         // Trigger AfterDelete hooks (non-blocking)
@@ -2337,6 +2407,79 @@ mod tests {
             swap.map(|a| a.path)
         );
 
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #2366: the artifact lifecycle emits audit events. Upload -> download ->
+    /// delete each writes exactly one `audit_log` row for the artifact, keyed
+    /// by the shared service-layer choke points (`finalize_upload`,
+    /// `finish_download`, `delete_with_sync_options`). The download event also
+    /// carries the client IP and acting user. Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_artifact_lifecycle_emits_audit_events_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+
+        // Upload -> ARTIFACT_UPLOADED (audit write is awaited inside
+        // finalize_upload, so it has landed by the time upload() returns).
+        let artifact = svc
+            .upload(
+                repo_id,
+                "audit/pkg.txt",
+                "pkg.txt",
+                Some("1.0"),
+                "text/plain",
+                Bytes::from_static(b"audit-bytes"),
+                Some(user_id),
+            )
+            .await
+            .expect("upload succeeds");
+        assert_eq!(
+            tdh::audit_count(&pool, artifact.id, "ARTIFACT_UPLOADED").await,
+            1,
+            "upload emits exactly one ARTIFACT_UPLOADED event"
+        );
+
+        // Download -> ARTIFACT_DOWNLOADED with a resolved client IP + user.
+        let _ = svc
+            .download(
+                repo_id,
+                "audit/pkg.txt",
+                Some(user_id),
+                Some("203.0.113.5".to_string()),
+                Some("test-ua"),
+            )
+            .await
+            .expect("download succeeds");
+        assert_eq!(
+            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DOWNLOADED").await,
+            1,
+            "download emits exactly one ARTIFACT_DOWNLOADED event"
+        );
+
+        // Delete -> ARTIFACT_DELETED.
+        svc.delete(artifact.id).await.expect("delete succeeds");
+        assert_eq!(
+            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DELETED").await,
+            1,
+            "delete emits exactly one ARTIFACT_DELETED event"
+        );
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(artifact.id)
+            .execute(&pool)
+            .await;
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
