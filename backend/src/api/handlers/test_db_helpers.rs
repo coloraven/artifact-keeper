@@ -428,6 +428,34 @@ pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     .expect("grant developer role");
 }
 
+/// Like [`make_auth`] but for a GLOBAL admin (`is_admin = true`). Used by
+/// handler tests that must pass an admin-only gate (#2321 G3/G4/G5) to reach
+/// the downstream validation/update/not-found logic they cover.
+pub fn admin_auth(user_id: Uuid, username: &str) -> AuthExtension {
+    AuthExtension {
+        is_admin: true,
+        ..make_auth(user_id, username)
+    }
+}
+
+/// Grant `user_id` the fine-grained `repository:admin` action on `repo_id`
+/// (a `permissions` rule, distinct from the `role_assignments` membership row
+/// `grant_repo_access` inserts). Repo-admin-gated handlers (`set_cache_ttl`,
+/// `invalidate_cache`) require this for non-admins; the smoke tests that assert
+/// a successful admin-tier call grant it here. Cleaned up by `cleanup`.
+pub async fn grant_repo_admin(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO permissions \
+         (principal_type, principal_id, target_type, target_id, actions) \
+         VALUES ('user', $1, 'repository', $2, ARRAY['admin'])",
+    )
+    .bind(user_id)
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .expect("grant repository:admin");
+}
+
 /// Insert a fine-grained `permissions` rule granting `user_id` exactly the
 /// listed `actions` on `repo_id` (e.g. `["read", "write", "delete"]`).
 ///
@@ -581,9 +609,9 @@ pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
         .bind(repo_id)
         .execute(pool)
         .await;
-    // Fine-grained rules (`grant_repo_actions`) are polymorphic on
-    // (target_type, target_id) with no FK cascade from `repositories`, so
-    // remove them explicitly to keep the row self-cleaning.
+    // Fine-grained rules (`grant_repo_admin` / `grant_repo_actions`) are
+    // polymorphic on (target_type, target_id) with no FK cascade from
+    // `repositories`, so remove them explicitly to keep the fixture self-cleaning.
     let _ =
         sqlx::query("DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1")
             .bind(repo_id)
