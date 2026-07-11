@@ -1225,6 +1225,175 @@ async fn fetch_npm_artifacts(
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// npm scope policy (#2327)
+// ---------------------------------------------------------------------------
+
+/// `repository_config` key holding the JSON array of allowed npm scopes.
+pub(crate) const NPM_ALLOWED_SCOPES_KEY: &str = "npm_allowed_scopes";
+/// `repository_config` key holding the unscoped-package toggle ("true"/"false").
+pub(crate) const NPM_ALLOW_UNSCOPED_KEY: &str = "npm_allow_unscoped";
+
+/// Parsed shape of an npm package name for scope-policy evaluation.
+#[derive(Debug, PartialEq, Eq)]
+enum NpmNameShape<'a> {
+    /// `@scope/name` — carries the `@scope` part (including the `@`).
+    Scoped(&'a str),
+    /// Plain `name` with no scope.
+    Unscoped,
+    /// Not a well-formed npm package name (e.g. `@scope` without a name,
+    /// `@/x`, or an empty string).
+    Invalid,
+}
+
+/// Split an npm package name into its scope-policy-relevant shape.
+fn npm_name_shape(package_name: &str) -> NpmNameShape<'_> {
+    if package_name.is_empty() {
+        return NpmNameShape::Invalid;
+    }
+    let Some(rest) = package_name.strip_prefix('@') else {
+        return NpmNameShape::Unscoped;
+    };
+    match rest.split_once('/') {
+        Some((scope, name)) if !scope.is_empty() && !name.is_empty() && !name.contains('/') => {
+            NpmNameShape::Scoped(&package_name[..scope.len() + 1])
+        }
+        _ => NpmNameShape::Invalid,
+    }
+}
+
+/// Validate an npm scope literal (`@scope`) for the policy allow-list.
+///
+/// npm scope names follow the same character rules as package names: ASCII
+/// lowercase letters, digits, `-`, `_` and `.`, not starting with `.` or `_`,
+/// and at most 214 characters. Callers normalise to lowercase before
+/// validating, so uppercase input is accepted but stored case-folded.
+pub(crate) fn is_valid_npm_scope(scope: &str) -> bool {
+    let Some(rest) = scope.strip_prefix('@') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 214
+        && !rest.starts_with('.')
+        && !rest.starts_with('_')
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Per-repository npm name-namespace policy (#2327).
+///
+/// Stored in `repository_config` (`npm_allowed_scopes` = JSON array,
+/// `npm_allow_unscoped` = bool) for Remote repositories. Virtual candidate
+/// selection consults the policy before proxying a package name to a Remote
+/// member. A repository with no stored policy is unrestricted (default
+/// behaviour unchanged).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NpmScopePolicy {
+    /// Allowed `@scope` values, case-folded to lowercase. Empty = no scope
+    /// restriction.
+    pub(crate) allowed_scopes: Vec<String>,
+    /// Whether unscoped package names may be resolved through this
+    /// repository. `None` = not configured; treated as "deny" once the
+    /// policy is otherwise active (fail-closed) and "allow" otherwise.
+    pub(crate) allow_unscoped: Option<bool>,
+}
+
+impl NpmScopePolicy {
+    /// A policy participates in filtering iff an allow-list is present or
+    /// unscoped resolution was explicitly switched off.
+    pub(crate) fn is_active(&self) -> bool {
+        !self.allowed_scopes.is_empty() || self.allow_unscoped == Some(false)
+    }
+
+    /// Whether `package_name` may be resolved through the repository this
+    /// policy belongs to. Inactive policies allow everything; active
+    /// policies fail closed on malformed names.
+    pub(crate) fn allows(&self, package_name: &str) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        match npm_name_shape(package_name) {
+            NpmNameShape::Scoped(scope) => {
+                self.allowed_scopes.is_empty()
+                    || self
+                        .allowed_scopes
+                        .iter()
+                        .any(|allowed| allowed == &scope.to_ascii_lowercase())
+            }
+            NpmNameShape::Unscoped => self.allow_unscoped == Some(true),
+            NpmNameShape::Invalid => false,
+        }
+    }
+}
+
+/// Batch-load the npm scope policies for a set of member repositories in a
+/// single query. Repositories with no stored policy are absent from the map
+/// (treated as unrestricted). Mirrors the runtime-query style of
+/// `fetch_pypi_upstream_index_path` (no compile-time sqlx macro) so offline
+/// `cargo check` needs no prepared query data.
+async fn fetch_npm_scope_policies(
+    db: &PgPool,
+    repo_ids: &[uuid::Uuid],
+) -> std::collections::HashMap<uuid::Uuid, NpmScopePolicy> {
+    let mut policies: std::collections::HashMap<uuid::Uuid, NpmScopePolicy> =
+        std::collections::HashMap::new();
+    if repo_ids.is_empty() {
+        return policies;
+    }
+    let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+        "SELECT repository_id, key, value FROM repository_config \
+         WHERE repository_id = ANY($1) AND key IN ($2, $3)",
+    )
+    .bind(repo_ids)
+    .bind(NPM_ALLOWED_SCOPES_KEY)
+    .bind(NPM_ALLOW_UNSCOPED_KEY)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for (repo_id, key, value) in rows {
+        let policy = policies.entry(repo_id).or_default();
+        if key == NPM_ALLOWED_SCOPES_KEY {
+            policy.allowed_scopes = serde_json::from_str::<Vec<String>>(&value)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+        } else if key == NPM_ALLOW_UNSCOPED_KEY {
+            policy.allow_unscoped = value.parse::<bool>().ok();
+        }
+    }
+    policies
+}
+
+/// Fetch the npm scope policy for a single repository. Returns the default
+/// (inactive, unrestricted) policy when nothing is configured.
+pub(crate) async fn fetch_npm_scope_policy(db: &PgPool, repo_id: uuid::Uuid) -> NpmScopePolicy {
+    fetch_npm_scope_policies(db, &[repo_id])
+        .await
+        .remove(&repo_id)
+        .unwrap_or_default()
+}
+
+/// Whether a virtual-repo member may serve as a candidate for
+/// `package_name`. Only Remote members are subject to the scope policy;
+/// Local/Staging members (and members with no stored policy) are always
+/// eligible. Pure so the loop wiring is unit-testable without network/DB.
+fn npm_member_eligible(
+    member_repo_type: &RepositoryType,
+    policy: Option<&NpmScopePolicy>,
+    package_name: &str,
+) -> bool {
+    if member_repo_type != &RepositoryType::Remote {
+        return true;
+    }
+    match policy {
+        Some(p) => p.allows(package_name),
+        None => true,
+    }
+}
+
 /// Return the package metadata: the full packument, or the abbreviated document
 /// when the client requests it.
 async fn get_package_metadata(
@@ -1281,6 +1450,10 @@ async fn get_package_metadata(
             );
         }
 
+        // Batch-load per-member npm scope policies once per request (#2327).
+        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+
         for member in &members {
             // For Local/Staging members, query artifacts from the DB.
             if member.repo_type == RepositoryType::Local
@@ -1303,6 +1476,19 @@ async fn get_package_metadata(
 
             // For Remote members, proxy metadata from upstream.
             if member.repo_type != RepositoryType::Remote {
+                continue;
+            }
+            // Honour the member's npm scope policy before proxying (#2327).
+            if !npm_member_eligible(
+                &member.repo_type,
+                scope_policies.get(&member.id),
+                package_name,
+            ) {
+                debug!(
+                    member_key = %member.key,
+                    package = %package_name,
+                    "npm virtual member skipped by scope policy"
+                );
                 continue;
             }
             let Some(ref upstream_url) = member.upstream_url else {
@@ -1488,6 +1674,10 @@ async fn fetch_virtual_packument(
         );
     }
 
+    // Batch-load per-member npm scope policies once per request (#2327).
+    let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+
     for member in &members {
         if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
         {
@@ -1519,6 +1709,19 @@ async fn fetch_virtual_packument(
         }
 
         if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        // Honour the member's npm scope policy before proxying (#2327).
+        if !npm_member_eligible(
+            &member.repo_type,
+            scope_policies.get(&member.id),
+            package_name,
+        ) {
+            debug!(
+                member_key = %member.key,
+                package = %package_name,
+                "npm virtual member skipped by scope policy"
+            );
             continue;
         }
         let Some(ref upstream_url) = member.upstream_url else {
@@ -2878,6 +3081,361 @@ fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // npm scope policy (#2327)
+    // -----------------------------------------------------------------------
+
+    fn policy(scopes: &[&str], allow_unscoped: Option<bool>) -> NpmScopePolicy {
+        NpmScopePolicy {
+            allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            allow_unscoped,
+        }
+    }
+
+    #[test]
+    fn npm_name_shape_classifies_names() {
+        assert_eq!(
+            npm_name_shape("@types/node"),
+            NpmNameShape::Scoped("@types")
+        );
+        assert_eq!(npm_name_shape("lodash"), NpmNameShape::Unscoped);
+        assert_eq!(npm_name_shape(""), NpmNameShape::Invalid);
+        assert_eq!(npm_name_shape("@types"), NpmNameShape::Invalid);
+        assert_eq!(npm_name_shape("@/node"), NpmNameShape::Invalid);
+        assert_eq!(npm_name_shape("@types/"), NpmNameShape::Invalid);
+        assert_eq!(npm_name_shape("@a/b/c"), NpmNameShape::Invalid);
+    }
+
+    #[test]
+    fn scope_policy_allow_list_without_unscoped() {
+        let p = policy(&["@types"], Some(false));
+        assert!(p.is_active());
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("@partner/x"));
+        assert!(!p.allows("lodash"));
+    }
+
+    #[test]
+    fn scope_policy_allow_list_with_unscoped() {
+        let p = policy(&["@types"], Some(true));
+        assert!(p.is_active());
+        assert!(p.allows("lodash"));
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("@partner/x"));
+    }
+
+    #[test]
+    fn scope_policy_default_allows_everything() {
+        let p = NpmScopePolicy::default();
+        assert!(!p.is_active());
+        assert!(p.allows("lodash"));
+        assert!(p.allows("@anything/x"));
+        // Even a malformed name passes through an inactive policy: legacy
+        // behaviour is preserved bit-for-bit when nothing is configured.
+        assert!(p.allows("@broken"));
+    }
+
+    #[test]
+    fn scope_policy_explicit_allow_unscoped_true_only_is_inactive() {
+        // {allowed_scopes: [], allow_unscoped: true} places no restriction.
+        let p = policy(&[], Some(true));
+        assert!(!p.is_active());
+        assert!(p.allows("lodash"));
+        assert!(p.allows("@anything/x"));
+    }
+
+    #[test]
+    fn scope_policy_unscoped_only_restriction() {
+        // Empty allow-list + explicit unscoped=false: any scope is fine,
+        // unscoped names are not.
+        let p = policy(&[], Some(false));
+        assert!(p.is_active());
+        assert!(p.allows("@anything/x"));
+        assert!(!p.allows("lodash"));
+    }
+
+    #[test]
+    fn scope_policy_unscoped_unset_fails_closed_when_active() {
+        // Allow-list present but allow_unscoped never configured: unscoped
+        // resolution is denied (fail-closed).
+        let p = policy(&["@types"], None);
+        assert!(p.is_active());
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("lodash"));
+    }
+
+    #[test]
+    fn scope_policy_match_is_case_insensitive() {
+        // Loader case-folds stored scopes; the requested name may still
+        // arrive in mixed case.
+        let p = policy(&["@types"], Some(false));
+        assert!(p.allows("@Types/Node"));
+        assert!(p.allows("@TYPES/node"));
+    }
+
+    #[test]
+    fn scope_policy_malformed_name_denied_when_active() {
+        let p = policy(&["@types"], Some(true));
+        assert!(!p.allows("@types"));
+        assert!(!p.allows("@/x"));
+        assert!(!p.allows(""));
+    }
+
+    #[test]
+    fn npm_scope_literal_validation() {
+        assert!(is_valid_npm_scope("@types"));
+        assert!(is_valid_npm_scope("@my-org.sub_team"));
+        assert!(!is_valid_npm_scope("types"));
+        assert!(!is_valid_npm_scope("@"));
+        assert!(!is_valid_npm_scope("@Types")); // callers lowercase first
+        assert!(!is_valid_npm_scope("@.hidden"));
+        assert!(!is_valid_npm_scope("@_private"));
+        assert!(!is_valid_npm_scope("@sc/ope"));
+        assert!(!is_valid_npm_scope(&format!("@{}", "a".repeat(215))));
+    }
+
+    #[test]
+    fn member_eligibility_only_gates_remote_members() {
+        let restrictive = policy(&["@types"], Some(false));
+        // Remote member with an active policy: filtered by name.
+        assert!(npm_member_eligible(
+            &RepositoryType::Remote,
+            Some(&restrictive),
+            "@types/node"
+        ));
+        assert!(!npm_member_eligible(
+            &RepositoryType::Remote,
+            Some(&restrictive),
+            "lodash"
+        ));
+        // Remote member with no stored policy: always eligible.
+        assert!(npm_member_eligible(&RepositoryType::Remote, None, "lodash"));
+        // Local/Staging members are never subject to the scope policy.
+        assert!(npm_member_eligible(
+            &RepositoryType::Local,
+            Some(&restrictive),
+            "lodash"
+        ));
+        assert!(npm_member_eligible(
+            &RepositoryType::Staging,
+            Some(&restrictive),
+            "lodash"
+        ));
+    }
+
+    /// DB-backed: `fetch_npm_scope_policy` / `fetch_npm_scope_policies` read
+    /// the `repository_config` rows written by the admin endpoint and
+    /// tolerate every degenerate stored shape — no rows (default policy),
+    /// malformed JSON in the scope list, an unparseable boolean, mixed-case
+    /// stored scopes (case-folded), and an empty id set (no query at all).
+    /// Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn fetch_npm_scope_policy_parses_stored_config_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let upsert = |key: &'static str, value: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO repository_config (repository_id, key, value) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (repository_id, key) DO UPDATE SET value = $3",
+                )
+                .bind(repo_id)
+                .bind(key)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .expect("upsert repository_config");
+            }
+        };
+
+        // Empty id slice: no rows requested, empty map back.
+        assert!(fetch_npm_scope_policies(&pool, &[]).await.is_empty());
+
+        // No rows stored: default (inactive, unrestricted) policy.
+        let empty = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert_eq!(empty, NpmScopePolicy::default());
+        assert!(!empty.is_active());
+
+        // Malformed JSON scope list + unparseable boolean: both degrade to
+        // the unrestricted default rather than erroring the request path.
+        upsert(NPM_ALLOWED_SCOPES_KEY, "not-json").await;
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "garbage").await;
+        let degenerate = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert!(degenerate.allowed_scopes.is_empty());
+        assert_eq!(degenerate.allow_unscoped, None);
+        assert!(!degenerate.is_active());
+
+        // Well-formed rows: scopes case-folded, boolean parsed.
+        upsert(NPM_ALLOWED_SCOPES_KEY, "[\"@Types\",\"@partner\"]").await;
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "false").await;
+        let stored = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert_eq!(stored.allowed_scopes, vec!["@types", "@partner"]);
+        assert_eq!(stored.allow_unscoped, Some(false));
+        assert!(stored.is_active());
+        assert!(stored.allows("@types/node"));
+        assert!(!stored.allows("lodash"));
+
+        // Boolean flips to true: unscoped resolution allowed again.
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "true").await;
+        let flipped = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert_eq!(flipped.allow_unscoped, Some(true));
+        assert!(flipped.allows("lodash"));
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// DB-backed (#2327 secondary): a virtual repo with two Remote members —
+    /// the first carrying a scope policy that excludes the requested name,
+    /// the second unrestricted — resolves both the metadata and the
+    /// packument through the second member, and the policy-restricted
+    /// member's upstream is NEVER contacted (wiremock `expect(0)`). Covers
+    /// the candidate-selection wiring in `get_package_metadata` and
+    /// `fetch_virtual_packument`. Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn test_virtual_member_scope_policy_filters_candidates_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "scope-policy-pkg";
+
+        // Member A upstream: would serve the package, but must never be
+        // asked because A's scope policy excludes unscoped names.
+        let blocked_upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package, "versions": {}
+            })))
+            .expect(0)
+            .mount(&blocked_upstream)
+            .await;
+
+        // Member B upstream: unrestricted, serves the packument.
+        let open_upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": package,
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {"name": package, "version": "1.0.0",
+                          "dist": {"tarball": format!(
+                              "{}/{}/-/{}-1.0.0.tgz", open_upstream.uri(), package, package)}},
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+            .mount(&open_upstream)
+            .await;
+
+        let mut member_ids = Vec::new();
+        for (upstream, priority) in [(&blocked_upstream, 1), (&open_upstream, 2)] {
+            let (member_id, _mkey, _mdir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2",
+            )
+            .bind(upstream.uri())
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member");
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+            member_ids.push(member_id);
+        }
+        // Member A: scoped-only policy — the unscoped test package is out of
+        // scope, so A must be skipped by candidate selection.
+        for (key, value) in [
+            (NPM_ALLOWED_SCOPES_KEY, "[\"@types\"]"),
+            (NPM_ALLOW_UNSCOPED_KEY, "false"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+            )
+            .bind(member_ids[0])
+            .bind(key)
+            .bind(value)
+            .execute(&fx.pool)
+            .await
+            .expect("store member policy");
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // Metadata loop: resolved via member B (member A skipped by policy).
+        let meta =
+            super::get_package_metadata(&state, &fx.repo_key, package, "http://localhost", false)
+                .await;
+        match meta {
+            Ok(resp) => assert_eq!(resp.status(), StatusCode::OK),
+            Err(r) => panic!(
+                "virtual metadata must resolve via member B: HTTP {}",
+                r.status()
+            ),
+        }
+
+        // Packument loop: same filtering on the version-metadata path.
+        let repo = fx.repo_info("virtual", None);
+        let packument_json = super::fetch_virtual_packument(
+            &state,
+            &repo,
+            &fx.repo_key,
+            package,
+            "http://localhost",
+        )
+        .await;
+        match packument_json {
+            Ok(json) => assert_eq!(json["name"], package),
+            Err(r) => panic!(
+                "virtual packument must resolve via member B: HTTP {}",
+                r.status()
+            ),
+        }
+
+        // Cleanup (wiremock verifies `expect(0)` for member A on drop).
+        for member_id in member_ids {
+            let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)
