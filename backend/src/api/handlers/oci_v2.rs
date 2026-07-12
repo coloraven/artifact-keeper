@@ -34,7 +34,7 @@ use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers;
 use crate::api::SharedState;
 use crate::error::AppError;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
@@ -2852,6 +2852,7 @@ pub async fn resolve_virtual_blob(
                         &upstream_path,
                         &upstream_path,
                         expected_checksum.clone(),
+                        member.format.clone(),
                     )
                     .await
                     {
@@ -3486,6 +3487,7 @@ async fn try_upstream_fetch_streaming_blob(
         upstream_url,
         &upstream_path,
         &upstream_path,
+        RepositoryFormat::Docker,
     )
     .await
     .ok()?;

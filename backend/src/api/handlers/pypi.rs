@@ -34,7 +34,7 @@ use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
 use crate::services::upstream_metadata::metadata_http_client;
 use chrono::Utc;
@@ -1464,6 +1464,7 @@ async fn enforce_pypi_download_age_gate(
         repo_key,
         upstream_url,
         &lkg_cache_path,
+        RepositoryFormat::Pypi,
     )
     .await
     {
@@ -1478,6 +1479,7 @@ async fn enforce_pypi_download_age_gate(
         project,
         &lkg_filename,
         &index_path,
+        RepositoryFormat::Pypi,
     )
     .await?;
     Ok(Some(build_streaming_file_response(&lkg_filename, result)))
@@ -1551,6 +1553,7 @@ async fn serve_file(
                         repo_key,
                         upstream_url,
                         &local_cache_path,
+                        RepositoryFormat::Pypi,
                     )
                     .await
                     {
@@ -1568,6 +1571,7 @@ async fn serve_file(
                         project,
                         filename,
                         &index_path,
+                        RepositoryFormat::Pypi,
                     )
                     .await?;
 
@@ -1737,6 +1741,7 @@ async fn serve_file(
                                 &member.key,
                                 upstream_url,
                                 &local_cache_path,
+                                member.format.clone(),
                             )
                             .await
                             {
@@ -1753,6 +1758,7 @@ async fn serve_file(
                                 project,
                                 filename,
                                 &member_index_path,
+                                member.format.clone(),
                             )
                             .await
                             {
@@ -1824,6 +1830,7 @@ async fn serve_file(
                         project,
                         filename,
                         &index_path,
+                        RepositoryFormat::Pypi,
                     )
                     .await
                 },
@@ -2164,6 +2171,7 @@ async fn pypi_proxy_cache_redirect(
 /// (CUDA / ML packages routinely exceed 400 MiB) previously OOM-killed
 /// memory-constrained pods when several `pip install` runs downloaded
 /// concurrently through the buffered path.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_from_pypi_remote_streaming(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -2172,6 +2180,7 @@ async fn fetch_from_pypi_remote_streaming(
     project: &str,
     filename: &str,
     index_path: &str,
+    format: RepositoryFormat,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     let target = resolve_pypi_remote_fetch_target(
         proxy,
@@ -2191,6 +2200,7 @@ async fn fetch_from_pypi_remote_streaming(
         &target.fetch_base,
         &target.fetch_path,
         &target.cache_path,
+        format,
     )
     .await
 }
@@ -6983,6 +6993,7 @@ mod tests {
             "numpy",
             "numpy-2.0.0-py3-none-any.whl",
             "simple",
+            RepositoryFormat::Pypi,
         )
         .await
         .expect("streaming fetch via fallback path must succeed");
@@ -6992,8 +7003,27 @@ mod tests {
         while let Some(chunk) = body.next().await {
             body_bytes.extend_from_slice(&chunk.expect("stream chunk must be Ok"));
         }
-        let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(body_bytes, wheel_body);
+
+        tdh::wait_for_cache_commit(&tmp, wheel_body.len() as u64).await;
+        let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
+        let metadata_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
+            "pypi-remote",
+            cache_path,
+        )
+        .expect("metadata key");
+        let metadata = proxy
+            .load_cache_metadata_pub(&metadata_key)
+            .await
+            .expect("streaming fetch must write cache metadata");
+        let ttl_secs = (metadata.expires_at - metadata.cached_at).num_seconds();
+        assert_eq!(
+            ttl_secs,
+            crate::services::cache_classifier::Mutability::Immutable.write_ttl_secs(),
+            "PyPI wheel cache entries must use the immutable 10-year TTL"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -7215,6 +7245,7 @@ mod tests {
             "pypi-remote",
             "https://pypi.org/simple",
             "simple/numpy/numpy-2.0.0-py3-none-any.whl",
+            RepositoryFormat::Pypi,
         )
         .await;
 
