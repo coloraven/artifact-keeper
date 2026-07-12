@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::services::audit_export::{self, Outcome};
 
 /// Audit action types
 #[derive(Debug, Clone, Copy)]
@@ -184,13 +185,126 @@ impl ResourceType {
 
 /// Audit log entry builder
 pub struct AuditEntry {
+    /// Client-minted event id (#2413). Passed explicitly to the INSERT so the
+    /// exported stream record and the DB row share one id — the SIEM ↔
+    /// admin-API join key — and so a record can be emitted even when the row
+    /// write fails.
+    event_id: Uuid,
     user_id: Option<Uuid>,
     action: AuditAction,
     resource_type: ResourceType,
     resource_id: Option<Uuid>,
+    /// Best-effort resource name for the export envelope (#2413); never stored
+    /// in the DB row.
+    resource_name: Option<String>,
     details: Option<serde_json::Value>,
     ip_address: Option<IpAddr>,
     correlation_id: String,
+    /// Best-effort actor display name for the export envelope (#2413); populated
+    /// where the handler already has it, never via a query-time join. Not stored
+    /// in the DB row (the admin API joins `users` at query time, #2392).
+    actor_name: Option<String>,
+    /// Optional explicit outcome for the export envelope (#2413). When unset the
+    /// outcome is derived from the action name. Not stored in the DB row.
+    outcome_override: Option<Outcome>,
+    /// Export-envelope actor-id override (#2413) for entries whose DB `user_id`
+    /// deliberately records a different principal (the subject-keyed password /
+    /// session events). Not stored in the DB row.
+    actor_id_override: Option<Uuid>,
+}
+
+/// Central sanitation for the free-form compatibility payload: the anti-spoof
+/// `actor` strip, normalization of legacy scalar payloads, and recursive
+/// redaction of known secret-bearing keys — the last line of defense before a
+/// `details` value reaches the DB row or the export stream. Size-bounding of
+/// the exported copy lives in [`crate::services::audit_export`]; the DB row
+/// always keeps the full (sanitized) payload.
+const AUDIT_LABEL_MAX_BYTES: usize = 4096;
+const AUDIT_REDACTED_VALUE: &str = "[REDACTED]";
+
+fn clamp_audit_label(value: impl Into<String>) -> String {
+    let mut value = value.into();
+    if value.len() <= AUDIT_LABEL_MAX_BYTES {
+        return value;
+    }
+    let mut end = AUDIT_LABEL_MAX_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+fn audit_detail_key_is_sensitive(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxy_authorization"
+            | "cookie"
+            | "set_cookie"
+            | "password"
+            | "password_hash"
+            | "current_password"
+            | "new_password"
+            | "old_password"
+            | "secret"
+            | "client_secret"
+            | "credential"
+            | "credentials"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "totp_token"
+            | "totp_secret"
+            | "api_key"
+            | "private_key"
+            | "saml_response"
+            | "upstream_password"
+    )
+}
+
+fn redact_audit_detail_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if audit_detail_key_is_sensitive(key) {
+                    *child = serde_json::Value::String(AUDIT_REDACTED_VALUE.to_owned());
+                } else {
+                    redact_audit_detail_secrets(child);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                redact_audit_detail_secrets(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_audit_details(mut details: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut details {
+        if map.remove("actor").is_some() {
+            tracing::error!(
+                "AuditEntry::details received an 'actor' key from a caller; \
+                 stripping to prevent system-actor spoofing. Use \
+                 AuditEntry::system_actor() for system-initiated entries."
+            );
+        }
+    }
+
+    // The published envelope permits `details` as object|null. Preserve legacy
+    // scalar/array payloads under a stable object key instead of emitting a
+    // schema-invalid record.
+    if !details.is_object() && !details.is_null() {
+        details = serde_json::json!({ "value": details });
+    }
+
+    redact_audit_detail_secrets(&mut details);
+    details
 }
 
 impl AuditEntry {
@@ -208,15 +322,20 @@ impl AuditEntry {
     /// operation.
     pub fn new(action: AuditAction, resource_type: ResourceType) -> Self {
         Self {
+            event_id: Uuid::new_v4(),
             user_id: None,
             action,
             resource_type,
             resource_id: None,
+            resource_name: None,
             details: None,
             ip_address: None,
             correlation_id: crate::api::middleware::tracing::current_correlation_id()
                 .map(crate::api::middleware::tracing::CorrelationId::into_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            actor_name: None,
+            outcome_override: None,
+            actor_id_override: None,
         }
     }
 
@@ -245,20 +364,7 @@ impl AuditEntry {
     /// method bypasses the user-input path and is the only sanctioned way
     /// to populate the field.
     pub fn details(mut self, details: serde_json::Value) -> Self {
-        let sanitized = match details {
-            serde_json::Value::Object(mut map) => {
-                if map.remove("actor").is_some() {
-                    tracing::error!(
-                        "AuditEntry::details received an 'actor' key from a caller; \
-                         stripping to prevent system-actor spoofing. Use \
-                         AuditEntry::system_actor() for system-initiated entries."
-                    );
-                }
-                serde_json::Value::Object(map)
-            }
-            other => other,
-        };
-        self.details = Some(sanitized);
+        self.details = Some(sanitize_audit_details(details));
         self
     }
 
@@ -273,10 +379,9 @@ impl AuditEntry {
     /// label is taken from a static / build-time string in the caller, not
     /// from request input.
     ///
-    /// If `.details(...)` was not called first, this seeds an Object with
-    /// just the actor key. If `.details(...)` was called with a non-Object
-    /// value, that value is replaced (the schema requires an Object for
-    /// `actor` to live in).
+    /// If `.details(...)` was not called first, this seeds an Object with just
+    /// the actor key. Legacy scalar/array payloads have already been normalized
+    /// under `details.value`, so they remain intact when this label is added.
     pub fn system_actor(mut self, label: &'static str) -> Self {
         let mut map = match self.details.take() {
             Some(serde_json::Value::Object(map)) => map,
@@ -293,6 +398,64 @@ impl AuditEntry {
     pub fn ip(mut self, ip_address: IpAddr) -> Self {
         self.ip_address = Some(ip_address);
         self
+    }
+
+    /// Attach a best-effort actor display name for the export envelope (#2413).
+    ///
+    /// Populate this where the handler already has the acting principal's name
+    /// in hand (login, token, repository, role handlers). It is emitted as
+    /// `actor.name` in the audit stream and is NOT written to the DB row — the
+    /// admin API still joins `users` at query time (#2392). Absent, `actor.name`
+    /// serializes to `null`.
+    pub fn actor_name(mut self, name: impl Into<String>) -> Self {
+        self.actor_name = Some(clamp_audit_label(name));
+        self
+    }
+
+    /// Attach a best-effort resource name for the export envelope (#2413).
+    ///
+    /// Emitted as `resource.name` in the audit stream; not stored in the DB row.
+    pub fn resource_name(mut self, name: impl Into<String>) -> Self {
+        self.resource_name = Some(clamp_audit_label(name));
+        self
+    }
+
+    /// Override the exported outcome (#2413). Unset, the outcome is derived from
+    /// the action name ([`AuditAction::outcome`](crate::services::audit_export)).
+    /// For future emitters that record one action with variable outcomes.
+    pub fn outcome(mut self, outcome: Outcome) -> Self {
+        self.outcome_override = Some(outcome);
+        self
+    }
+
+    /// Override the export envelope's `actor.id` (#2413) where the DB row's
+    /// `user_id` deliberately records a different principal — the subject-keyed
+    /// password / session events, whose column semantics predate the export and
+    /// must not change underneath existing consumers. Envelope-only: the DB
+    /// row, the admin API, and its `user_id` filter are unaffected. Unset,
+    /// `actor.id` is `user_id`.
+    pub fn actor_id(mut self, actor_id: Uuid) -> Self {
+        self.actor_id_override = Some(actor_id);
+        self
+    }
+
+    /// Attach a typed detail payload (#2413), serialized into the existing
+    /// `details` column through the same anti-spoof sanitization as
+    /// [`AuditEntry::details`]. The typed structs in
+    /// [`crate::services::audit_export`] anchor the published JSON Schema for
+    /// the representative security-lifecycle events.
+    ///
+    /// A serialization failure (not expected for the plain detail structs)
+    /// leaves `details` unchanged and logs at error level rather than dropping
+    /// the whole audit entry.
+    pub fn details_typed<T: serde::Serialize>(self, payload: T) -> Self {
+        match serde_json::to_value(payload) {
+            Ok(value) => self.details(value),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize typed audit details; leaving details unset");
+                self
+            }
+        }
     }
 
     /// Override the correlation ID (#2414: a string — caller-supplied header
@@ -337,16 +500,42 @@ impl AuditEntry {
         self.details.as_ref()
     }
 
-    // `ip_address` not yet used by a batched call site; kept symmetric so
-    // future system emitters (e.g. periodic lifecycle scheduler) can write
-    // an originating IP via the same accessor surface.
-    #[allow(dead_code)]
     pub(crate) fn ip_address(&self) -> Option<IpAddr> {
         self.ip_address
     }
 
     pub(crate) fn correlation_id(&self) -> &str {
         &self.correlation_id
+    }
+
+    /// The client-minted event id (#2413), shared with the DB row.
+    pub(crate) fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+
+    /// Best-effort actor display name for the export envelope (#2413).
+    /// Named `_ref` to avoid colliding with the [`AuditEntry::actor_name`]
+    /// builder setter of the same base name.
+    pub(crate) fn actor_name_ref(&self) -> Option<&str> {
+        self.actor_name.as_deref()
+    }
+
+    /// Best-effort resource name for the export envelope (#2413).
+    /// Named `_ref` to avoid colliding with the [`AuditEntry::resource_name`]
+    /// builder setter of the same base name.
+    pub(crate) fn resource_name_ref(&self) -> Option<&str> {
+        self.resource_name.as_deref()
+    }
+
+    /// Explicit outcome override for the export envelope (#2413), if set.
+    pub(crate) fn outcome_override(&self) -> Option<Outcome> {
+        self.outcome_override
+    }
+
+    /// Export-envelope actor-id override (#2413), if set. Named `_override` to
+    /// avoid colliding with the [`AuditEntry::actor_id`] builder setter.
+    pub(crate) fn actor_id_override(&self) -> Option<Uuid> {
+        self.actor_id_override
     }
 }
 
@@ -362,17 +551,30 @@ impl AuditService {
 
     /// Log an audit entry.
     ///
+    /// Emits the structured export record (#2413) to the audit stream BEFORE
+    /// the row INSERT and regardless of its outcome: the stdout stream is the
+    /// SIEM-availability story, so a DB outage (or the fire-and-forget swallow
+    /// path) must not also lose the SIEM copy. The `id` is minted client-side
+    /// ([`AuditEntry::new`]) and passed explicitly to the INSERT so the exported
+    /// record and the DB row share one id. When the stream is off (the default)
+    /// the emit is a cheap no-op — the export record is never even constructed,
+    /// so existing deployments pay one sink check and nothing more.
+    ///
     /// Runtime (non-macro) query so the #2414 `correlation_id` type change
     /// (UUID -> TEXT) needs no offline `.sqlx` prepare, matching the pattern
-    /// [`AuditService::query`] already uses.
+    /// [`AuditService::query`] already uses; the #2413 change only adds the `id`
+    /// column to this INSERT's column list.
     pub async fn log(&self, entry: AuditEntry) -> Result<Uuid> {
-        let id: Uuid = sqlx::query_scalar(
+        audit_export::emit_entry(&entry);
+
+        let id = entry.event_id;
+        sqlx::query(
             r#"
-            INSERT INTO audit_log (user_id, action, resource_type, resource_id, details, ip_address, correlation_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id
+            INSERT INTO audit_log (id, user_id, action, resource_type, resource_id, details, ip_address, correlation_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
+        .bind(id)
         .bind(entry.user_id)
         .bind(entry.action.as_str())
         .bind(entry.resource_type.as_str())
@@ -380,7 +582,7 @@ impl AuditService {
         .bind(entry.details)
         .bind(entry.ip_address.map(|ip| ip.to_string()))
         .bind(entry.correlation_id)
-        .fetch_one(&self.db)
+        .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -571,11 +773,11 @@ pub async fn audit_admin_permission_denied(
     let entry = AuditEntry::new(AuditAction::PermissionDenied, resource_type)
         .user(user_id)
         .resource(user_id)
-        .details(serde_json::json!({
-            "path": path,
-            "method": method,
-            "reason": "admin_privileges_required",
-        }));
+        .details_typed(audit_export::details::AuthDetails::permission_denied(
+            path,
+            method,
+            "admin_privileges_required",
+        ));
     audit_fire_and_forget(db, entry).await;
 }
 
@@ -637,29 +839,33 @@ pub fn api_token_audit_entry(
     token_name: Option<&str>,
     surface: &str,
 ) -> AuditEntry {
+    // Typed payload (#2413): `TokenDetails` has no secret field, so the token
+    // secret cannot leak into the audit stream by construction, and the shape is
+    // pinned by the published schema.
     AuditEntry::new(action, ResourceType::ApiToken)
         .user(actor)
         .resource(token_id)
-        .details(serde_json::json!({
-            "token_id": token_id.to_string(),
-            "token_name": token_name,
-            "surface": surface,
-        }))
+        .details_typed(audit_export::details::TokenDetails::new(
+            token_id, token_name, surface,
+        ))
 }
 
 /// Build an audit entry for a self-service or admin password change (#386 /
 /// #1617 Phase 1).
 ///
 /// `subject` is the user whose password changed (recorded as `user_id` and the
-/// resource). `actor` is the principal that performed the change; it equals
-/// `subject` on a self-change and is the acting admin on an admin reset. The
-/// plaintext password and any hash are NEVER included. The acting principal is
-/// recorded under `actor_id` (not the reserved `actor` key, which
-/// [`AuditEntry::details`] strips as an anti-spoof measure). Pure builder —
-/// unit-testable without a database.
+/// resource — the established column semantics, unchanged by #2413). `actor` is
+/// the principal that performed the change; it equals `subject` on a
+/// self-change and is the acting admin on an admin reset. It is recorded under
+/// `details.actor_id` (not the reserved `actor` key, which
+/// [`AuditEntry::details`] strips as an anti-spoof measure) and exported as the
+/// envelope's `actor.id` via the envelope-only [`AuditEntry::actor_id`]
+/// override. The plaintext password and any hash are NEVER included. Pure
+/// builder — unit-testable without a database.
 pub fn password_change_audit_entry(subject: Uuid, actor: Uuid, by_admin: bool) -> AuditEntry {
     AuditEntry::new(AuditAction::PasswordChanged, ResourceType::User)
         .user(subject)
+        .actor_id(actor)
         .resource(subject)
         .details(serde_json::json!({
             "actor_id": actor.to_string(),
@@ -679,15 +885,18 @@ pub fn totp_audit_entry(action: AuditAction, subject: Uuid) -> AuditEntry {
 
 /// Build an audit entry for a mass session / refresh-token invalidation (#386).
 ///
-/// `subject` is the user whose sessions were invalidated; `actor` is the
-/// principal that triggered it (equals `subject` on a self-service change,
-/// the acting admin otherwise). `trigger` is a stable static label
-/// (`"totp_enable"` | `"totp_disable"` | `"password_change"` |
-/// `"password_reset"` | `"force_password_change"`). Recorded under `actor_id`
-/// (not the reserved `actor` key). Pure builder — unit-testable.
+/// `subject` is the user whose sessions were invalidated (recorded as
+/// `user_id` and the resource — the established column semantics, unchanged by
+/// #2413); `actor` is the principal that triggered it (equals `subject` on a
+/// self-service change, the acting admin otherwise), recorded under
+/// `details.actor_id` and exported as the envelope's `actor.id` via the
+/// envelope-only [`AuditEntry::actor_id`] override. `trigger` is a stable
+/// static label (`"totp_enable"` | `"totp_disable"` | `"password_change"` |
+/// `"password_reset"` | `"force_password_change"`). Pure builder.
 pub fn sessions_invalidated_audit_entry(subject: Uuid, actor: Uuid, trigger: &str) -> AuditEntry {
     AuditEntry::new(AuditAction::SessionsInvalidated, ResourceType::User)
         .user(subject)
+        .actor_id(actor)
         .resource(subject)
         .details(serde_json::json!({
             "actor_id": actor.to_string(),
@@ -966,14 +1175,42 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_entry_details_passes_non_object_values_through() {
-        // Non-Object values cannot carry a key, so the strip is a no-op.
+    fn test_audit_entry_details_wraps_non_object_values() {
+        // The envelope contract requires an object/null details value.
         let entry = AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
             .details(serde_json::json!("a scalar string"));
-        assert_eq!(
-            entry.details,
-            Some(serde_json::Value::String("a scalar string".to_string()))
+        assert_eq!(entry.details.unwrap()["value"], "a scalar string");
+    }
+
+    #[test]
+    fn test_audit_entry_details_recursively_redacts_secret_keys() {
+        let entry = AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting).details(
+            serde_json::json!({
+                "password": "hunter2",
+                "nested": {
+                    "Authorization": "Bearer secret",
+                    "token_name": "safe metadata"
+                },
+                "items": [{"client-secret": "secret-value"}]
+            }),
         );
+        let details = entry.details.unwrap();
+        assert_eq!(details["password"], AUDIT_REDACTED_VALUE);
+        assert_eq!(details["nested"]["Authorization"], AUDIT_REDACTED_VALUE);
+        assert_eq!(details["nested"]["token_name"], "safe metadata");
+        assert_eq!(details["items"][0]["client-secret"], AUDIT_REDACTED_VALUE);
+    }
+
+    #[test]
+    fn test_audit_entry_details_keeps_oversized_payload_for_the_db_row() {
+        // Size-bounding applies only to the exported copy (see audit_export's
+        // `bounded_details_for_export`); the stored details must never lose
+        // data to an export concern.
+        let big = "x".repeat(70_000);
+        let entry = AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
+            .details(serde_json::json!({"value": big}));
+        let details = entry.details.unwrap();
+        assert_eq!(details["value"].as_str().unwrap().len(), 70_000);
     }
 
     #[test]
@@ -1059,10 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_entry_system_actor_replaces_non_object_details() {
-        // If `.details(...)` was set to a scalar, `system_actor()` cannot
-        // attach a key in place; the documented behaviour is to seed a
-        // fresh Object so the schema is consistent.
+    fn test_audit_entry_system_actor_preserves_wrapped_scalar_details() {
         let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
             .details(serde_json::json!("scalar"))
             .system_actor("system:stuck_scan_janitor");
@@ -1070,8 +1304,9 @@ mod tests {
             .details
             .as_ref()
             .and_then(|v| v.as_object())
-            .expect("details replaced with Object");
-        assert_eq!(obj.len(), 1);
+            .expect("details normalized to Object");
+        assert_eq!(obj.len(), 2);
+        assert_eq!(obj.get("value"), Some(&serde_json::json!("scalar")));
         assert_eq!(
             obj.get("actor"),
             Some(&serde_json::Value::String(
@@ -1123,6 +1358,73 @@ mod tests {
         assert_eq!(entry.details, Some(details));
         assert_eq!(entry.ip_address, Some(ip));
         assert_eq!(entry.correlation_id, correlation_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2413: export-envelope builder fields (event_id, actor_name,
+    // resource_name, outcome override, typed details).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_audit_entry_mints_unique_event_id() {
+        let a = AuditEntry::new(AuditAction::Login, ResourceType::User);
+        let b = AuditEntry::new(AuditAction::Login, ResourceType::User);
+        assert!(!a.event_id().is_nil());
+        assert_ne!(a.event_id(), b.event_id(), "each entry gets a fresh id");
+    }
+
+    #[test]
+    fn test_audit_entry_actor_and_resource_name_builders() {
+        let entry = AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+            .actor_name("alice")
+            .resource_name("maven-releases");
+        assert_eq!(entry.actor_name_ref(), Some("alice"));
+        assert_eq!(entry.resource_name_ref(), Some("maven-releases"));
+    }
+
+    #[test]
+    fn test_audit_entry_labels_are_bounded_on_utf8_boundary() {
+        let oversized = "é".repeat(AUDIT_LABEL_MAX_BYTES);
+        let entry = AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+            .actor_name(&oversized)
+            .resource_name(&oversized);
+        for value in [
+            entry.actor_name_ref().unwrap(),
+            entry.resource_name_ref().unwrap(),
+        ] {
+            assert!(value.len() <= AUDIT_LABEL_MAX_BYTES);
+            assert!(value.is_char_boundary(value.len()));
+        }
+    }
+
+    #[test]
+    fn test_audit_entry_outcome_override_builder() {
+        let entry =
+            AuditEntry::new(AuditAction::Login, ResourceType::User).outcome(Outcome::Failure);
+        assert_eq!(entry.outcome_override(), Some(Outcome::Failure));
+        // Unset by default.
+        let plain = AuditEntry::new(AuditAction::Login, ResourceType::User);
+        assert_eq!(plain.outcome_override(), None);
+    }
+
+    #[test]
+    fn test_audit_entry_details_typed_serializes_and_sanitizes() {
+        #[derive(serde::Serialize)]
+        struct Payload {
+            key: &'static str,
+            actor: &'static str,
+        }
+        // The typed path routes through `details(...)`, so the reserved `actor`
+        // key is still stripped (anti-spoof).
+        let entry = AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
+            .details_typed(Payload {
+                key: "maven-releases",
+                actor: "spoof",
+            });
+        let details = entry.details_ref().expect("details present");
+        let obj = details.as_object().unwrap();
+        assert_eq!(obj.get("key").unwrap(), "maven-releases");
+        assert!(!obj.contains_key("actor"), "typed details still sanitized");
     }
 
     // -----------------------------------------------------------------------
@@ -1321,7 +1623,10 @@ mod tests {
         let subject = Uuid::new_v4();
         let actor = Uuid::new_v4();
         let entry = password_change_audit_entry(subject, actor, true);
+        // DB column semantics unchanged by #2413: `user_id` stays the subject;
+        // the initiator rides the envelope-only override and details.actor_id.
         assert_eq!(entry.user_id(), Some(subject));
+        assert_eq!(entry.actor_id_override(), Some(actor));
         let details = entry.details_ref().expect("details present");
         assert_eq!(details["actor_id"], actor.to_string());
         assert_eq!(details["by_admin"], true);
@@ -1353,7 +1658,9 @@ mod tests {
         let entry = sessions_invalidated_audit_entry(subject, actor, "password_change");
         assert_eq!(entry.action().as_str(), "SESSIONS_INVALIDATED");
         assert_eq!(entry.resource_type().as_str(), "user");
+        // DB column semantics unchanged by #2413 (see password-change test).
         assert_eq!(entry.user_id(), Some(subject));
+        assert_eq!(entry.actor_id_override(), Some(actor));
         assert_eq!(entry.resource_id(), Some(subject));
         let details = entry.details_ref().expect("details present");
         assert_eq!(details["actor_id"], actor.to_string());
@@ -1435,6 +1742,98 @@ mod tests {
             .bind(resource_id)
             .execute(&service.db)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2413: the exported stream record shares the DB row's id (the SIEM ↔
+    // admin-API join key) and is emitted even when the DB write fails.
+    // -----------------------------------------------------------------------
+
+    /// The emitted record's `event_id` equals the `audit_log` row id, so a SIEM
+    /// can join a stream event back to `GET /api/v1/admin/audit`. Requires a DB.
+    #[tokio::test]
+    async fn test_log_emits_record_sharing_event_id_with_db_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::audit_export::test_sink;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (buffer, _guard) = test_sink::install();
+        let service = AuditService::new(pool);
+
+        let resource_id = Uuid::new_v4();
+        let corr = format!("emit-join-{}", Uuid::new_v4());
+        let entry = AuditEntry::new(AuditAction::RepositoryDeleted, ResourceType::Repository)
+            .resource(resource_id)
+            .correlation(&corr)
+            .actor_name("bob");
+        let id = service.log(entry).await.expect("log succeeds");
+
+        let mine: Vec<_> = buffer
+            .records()
+            .into_iter()
+            .filter(|r| r["correlation_id"] == corr)
+            .collect();
+        assert_eq!(mine.len(), 1, "exactly one stream record for this event");
+        assert_eq!(mine[0]["event_id"], id.to_string());
+        assert_eq!(mine[0]["actor"]["name"], "bob");
+
+        // The DB row carries the same id the record advertised.
+        let (rows, _) = service
+            .query(
+                None,
+                None,
+                Some("repository"),
+                Some(resource_id),
+                None,
+                None,
+                None,
+                0,
+                10,
+            )
+            .await
+            .expect("query succeeds");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&service.db)
+            .await;
+    }
+
+    /// A DB-write failure must not also lose the SIEM copy: emission happens
+    /// before the INSERT, so an unreachable pool still yields the stream record.
+    /// Needs no database (the pool is lazy and never connects).
+    #[tokio::test]
+    async fn test_log_emits_record_even_when_db_write_fails() {
+        use crate::services::audit_export::test_sink;
+        use sqlx::postgres::PgPoolOptions;
+
+        let (buffer, _guard) = test_sink::install();
+        // Lazy pool to an unreachable address: connect_lazy never blocks; the
+        // execute() inside log() is what fails.
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://u:p@127.0.0.1:1/none")
+            .expect("lazy pool builds");
+        let service = AuditService::new(pool);
+
+        let corr = format!("db-down-{}", Uuid::new_v4());
+        let entry =
+            AuditEntry::new(AuditAction::LoginFailed, ResourceType::User).correlation(&corr);
+        let event_id = entry.event_id();
+        let result = service.log(entry).await;
+        assert!(result.is_err(), "write fails against an unreachable pool");
+
+        let mine: Vec<_> = buffer
+            .records()
+            .into_iter()
+            .filter(|r| r["correlation_id"] == corr)
+            .collect();
+        assert_eq!(mine.len(), 1, "record emitted despite DB failure");
+        assert_eq!(mine[0]["event_id"], event_id.to_string());
+        assert_eq!(mine[0]["outcome"], "failure");
     }
 
     // -----------------------------------------------------------------------

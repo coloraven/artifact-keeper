@@ -15,6 +15,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
+use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{
     api_token_audit_entry, audit_fire_and_forget, password_change_audit_entry,
     sessions_invalidated_audit_entry, AuditAction, AuditEntry, ResourceType,
@@ -785,10 +786,13 @@ pub async fn assign_role(
         AuditEntry::new(AuditAction::RoleAssigned, ResourceType::User)
             .user(auth.user_id)
             .resource(id)
-            .details(serde_json::json!({
-                "actor_id": auth.user_id.to_string(),
-                "role_id": payload.role_id.to_string(),
-            })),
+            .actor_name(auth.username.clone())
+            .details_typed(audit_details::PermissionDetails {
+                actor_id: auth.user_id,
+                role_id: payload.role_id,
+                grantee_id: id,
+                repository_id: None,
+            }),
     )
     .await;
 
@@ -838,10 +842,13 @@ pub async fn revoke_role(
         AuditEntry::new(AuditAction::RoleRevoked, ResourceType::User)
             .user(auth.user_id)
             .resource(user_id)
-            .details(serde_json::json!({
-                "actor_id": auth.user_id.to_string(),
-                "role_id": role_id.to_string(),
-            })),
+            .actor_name(auth.username.clone())
+            .details_typed(audit_details::PermissionDetails {
+                actor_id: auth.user_id,
+                role_id,
+                grantee_id: user_id,
+                repository_id: None,
+            }),
     )
     .await;
 

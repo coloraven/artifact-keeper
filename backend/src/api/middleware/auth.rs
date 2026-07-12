@@ -1217,11 +1217,14 @@ pub async fn admin_middleware(
             let entry = AuditEntry::new(AuditAction::PermissionDenied, ResourceType::User)
                 .user(auth_ext.user_id)
                 .resource(auth_ext.user_id)
-                .details(serde_json::json!({
-                    "path": request.uri().path(),
-                    "method": request.method().as_str(),
-                    "reason": "admin_privileges_required",
-                }));
+                .actor_name(auth_ext.username.clone())
+                .details_typed(
+                    crate::services::audit_export::details::AuthDetails::permission_denied(
+                        request.uri().path(),
+                        request.method().as_str(),
+                        "admin_privileges_required",
+                    ),
+                );
             audit_fire_and_forget(auth_service.db().clone(), entry).await;
         }
         return (StatusCode::FORBIDDEN, "Admin access required").into_response();

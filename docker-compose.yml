@@ -220,6 +220,8 @@ services:
       # Read it with: docker exec artifact-keeper-backend cat /data/storage/admin.password
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
+      LOG_FORMAT: ${LOG_FORMAT:-pretty}
+      AUDIT_STREAM: ${AUDIT_STREAM:-off}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}
       # Trusted reverse-proxy CIDRs (#2298 / #2023). Caddy terminates all

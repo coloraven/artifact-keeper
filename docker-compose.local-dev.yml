@@ -199,6 +199,8 @@ services:
       JWT_SECRET: dev-secret-change-in-production
       ADMIN_PASSWORD: admin
       RUST_LOG: info,artifact_keeper=debug
+      LOG_FORMAT: ${LOG_FORMAT:-pretty}
+      AUDIT_STREAM: ${AUDIT_STREAM:-off}
       ENVIRONMENT: development
       CORS_ORIGINS: http://localhost:3000,http://localhost:8080
       TRIVY_URL: http://trivy:8090

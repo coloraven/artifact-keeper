@@ -60,10 +60,17 @@ async fn audit_federated_login(
     provider: &str,
     extra: serde_json::Value,
 ) {
+    let actor_name = extra
+        .get("username")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     let mut entry = AuditEntry::new(action, ResourceType::User)
         .details(federated_login_details(provider, extra));
     if let Some(id) = user_id {
         entry = entry.user(id).resource(id);
+    }
+    if let Some(name) = actor_name {
+        entry = entry.actor_name(name);
     }
     audit_fire_and_forget(state.db.clone(), entry).await;
 }

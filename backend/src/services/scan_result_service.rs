@@ -479,12 +479,20 @@ impl ScanResultService {
         // `get_by_correlation` query. The janitor runs outside any request
         // scope, so the ID is generated here rather than inherited.
         let sweep_correlation = crate::api::middleware::tracing::CorrelationId::generate();
+        let mut event_ids: Vec<Uuid> = Vec::with_capacity(reaped.len());
         let mut user_ids: Vec<Option<Uuid>> = Vec::with_capacity(reaped.len());
         let mut actions: Vec<String> = Vec::with_capacity(reaped.len());
         let mut resource_types: Vec<String> = Vec::with_capacity(reaped.len());
         let mut resource_ids: Vec<Option<Uuid>> = Vec::with_capacity(reaped.len());
         let mut details_blobs: Vec<serde_json::Value> = Vec::with_capacity(reaped.len());
         let mut correlation_ids: Vec<String> = Vec::with_capacity(reaped.len());
+        // Structured export records (#2413): built from the same builders as
+        // the DB rows so the emitted `event_id` matches the row id; emission
+        // happens after the sweep commits (below). Skipped entirely when the
+        // stream is off — no record construction on the default path.
+        let stream_on = crate::services::audit_export::stream_enabled();
+        let mut export_records: Vec<crate::services::audit_export::AuditEventRecord> =
+            Vec::with_capacity(if stream_on { reaped.len() } else { 0 });
         for row in &reaped {
             let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
                 .resource(row.id)
@@ -498,6 +506,12 @@ impl ScanResultService {
                 ))
                 .system_actor(STUCK_SCAN_AUDIT_ACTOR)
                 .correlation(sweep_correlation.as_str());
+            if stream_on {
+                export_records.push(crate::services::audit_export::AuditEventRecord::from_entry(
+                    &entry,
+                ));
+            }
+            event_ids.push(entry.event_id());
             user_ids.push(entry.user_id());
             actions.push(entry.action().as_str().to_string());
             resource_types.push(entry.resource_type().as_str().to_string());
@@ -531,14 +545,17 @@ impl ScanResultService {
         let audit_result = sqlx::query(
             r#"
             INSERT INTO audit_log
-                (user_id, action, resource_type, resource_id, details,
+                (id, user_id, action, resource_type, resource_id, details,
                  ip_address, correlation_id)
             SELECT * FROM UNNEST(
-                $1::uuid[], $2::text[], $3::text[], $4::uuid[],
-                $5::jsonb[], $6::text[], $7::text[]
+                $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::uuid[],
+                $6::jsonb[], $7::text[], $8::text[]
             )
             "#,
         )
+        // id: client-minted per row (#2413) so the DB row and the exported
+        // stream record share one id.
+        .bind(&event_ids)
         .bind(&user_ids)
         .bind(&actions)
         .bind(&resource_types)
@@ -579,6 +596,17 @@ impl ScanResultService {
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Emit the structured export records (#2413) AFTER the sweep commits: a
+        // failed commit means no reap happened, so nothing may be streamed (the
+        // re-run re-reaps under fresh event ids). If only the batched audit
+        // INSERT failed (savepoint rollback above), the records ARE still
+        // emitted — the same emit-even-on-DB-write-failure semantics as
+        // `AuditService::log()`: the stream is the SIEM-availability backstop
+        // for exactly that gap. Empty (no-op) when the stream is off.
+        for record in &export_records {
+            crate::services::audit_export::emit_audit_event(record);
+        }
 
         Ok(reaped.len() as u64)
     }
@@ -3953,6 +3981,59 @@ mod tests {
             );
 
             // Cleanup.
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+                .bind(stuck_id)
+                .execute(&pool)
+                .await;
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #2413: a reap emits one structured export record per reaped row,
+        /// each carrying the system actor and an `event_id` equal to the
+        /// committed audit_log row id, and all sharing the sweep correlation.
+        #[tokio::test]
+        async fn cleanup_stuck_scans_emits_export_record_matching_row_id() {
+            use crate::services::audit_export::test_sink;
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let (buffer, _guard) = test_sink::install();
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "export").await;
+            let stuck_id = insert_stuck_running_scan(&pool, aid, repo_id, 3600).await;
+
+            let reaped = svc
+                .cleanup_stuck_scans(Duration::from_secs(60))
+                .await
+                .expect("janitor returned Ok");
+            assert!(reaped >= 1);
+
+            // The committed row id for our scan.
+            let row_id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM audit_log \
+                 WHERE resource_id = $1 AND action = 'SCAN_REAPED' LIMIT 1",
+            )
+            .bind(stuck_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read audit row id");
+
+            // Exactly one emitted record targets this scan; it matches the row
+            // id, is a system actor, and shares the sweep correlation.
+            let mine: Vec<_> = buffer
+                .records()
+                .into_iter()
+                .filter(|r| r["resource"]["id"] == serde_json::json!(stuck_id.to_string()))
+                .collect();
+            assert_eq!(mine.len(), 1, "one export record per reaped row");
+            assert_eq!(mine[0]["event_id"], row_id.to_string());
+            assert_eq!(mine[0]["action"], "SCAN_REAPED");
+            assert_eq!(mine[0]["actor"]["type"], "system");
+            assert_eq!(mine[0]["actor"]["name"], STUCK_SCAN_AUDIT_ACTOR);
+            assert_eq!(mine[0]["outcome"], "success");
+
             let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
                 .bind(stuck_id)
                 .execute(&pool)

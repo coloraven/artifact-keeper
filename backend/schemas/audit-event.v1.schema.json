@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://artifact-keeper.dev/schemas/audit-event.v1.schema.json",
+  "title": "Artifact Keeper audit event",
+  "description": "One exported audit event (#2413). Every recorded audit action is emitted as one self-contained NDJSON line matching this schema. `category` is always \"audit\" so a collector can distinguish audit events from ordinary diagnostics without parsing message text. `event_id` equals the audit_log row id (the SIEM to admin-API join key). Additive fields within schema_version 1 are non-breaking; new `action` and `actor.type` values may be added, so consumers must tolerate unknown values.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "category",
+    "event_id",
+    "timestamp",
+    "action",
+    "outcome",
+    "actor",
+    "source_ip",
+    "resource",
+    "correlation_id",
+    "details"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Envelope schema version. Bumped only on a breaking change."
+    },
+    "category": {
+      "type": "string",
+      "const": "audit",
+      "description": "Machine marker distinguishing audit events from diagnostics."
+    },
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Event id, shared with the audit_log row."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Emit-time timestamp (UTC, RFC 3339)."
+    },
+    "action": {
+      "type": "string",
+      "description": "Action name (SCREAMING_SNAKE). Consumers must tolerate unknown values."
+    },
+    "outcome": {
+      "$ref": "#/$defs/Outcome"
+    },
+    "actor": {
+      "$ref": "#/$defs/Actor"
+    },
+    "source_ip": {
+      "type": ["string", "null"],
+      "description": "Source IP for request-scoped events; null otherwise."
+    },
+    "resource": {
+      "$ref": "#/$defs/Resource"
+    },
+    "correlation_id": {
+      "type": "string",
+      "description": "Request/operation correlation id; joins to request logs and traces."
+    },
+    "details": {
+      "type": ["object", "null"],
+      "description": "Typed payload for representative events (enforced by the action-discriminated allOf rules below), or a permissive object for actions not yet typed. Known secret-bearing keys are centrally redacted before storage and export."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["action"],
+        "properties": { "action": { "enum": ["REPOSITORY_CREATED", "REPOSITORY_UPDATED", "REPOSITORY_DELETED"] } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/RepositoryDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    },
+    {
+      "if": {
+        "required": ["action"],
+        "properties": { "action": { "enum": ["ROLE_ASSIGNED", "ROLE_REVOKED", "REPOSITORY_PERMISSION_CHANGED"] } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/PermissionDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    },
+    {
+      "if": {
+        "required": ["action"],
+        "properties": { "action": { "enum": ["API_TOKEN_CREATED", "API_TOKEN_REVOKED"] } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/TokenDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    },
+    {
+      "if": {
+        "required": ["action"],
+        "properties": { "action": { "enum": ["LOGIN_FAILED", "PERMISSION_DENIED"] } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/AuthDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    },
+    {
+      "if": {
+        "required": ["action"],
+        "properties": { "action": { "enum": ["ARTIFACT_UPLOADED", "ARTIFACT_DOWNLOADED", "ARTIFACT_DELETED"] } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/ArtifactDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    },
+    {
+      "if": {
+        "required": ["action"],
+        "properties": { "action": { "const": "SETTING_CHANGED" } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/SettingDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    }
+  ],
+  "$defs": {
+    "TruncatedDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["details_truncated", "original_size_bytes"],
+      "properties": {
+        "details_truncated": { "const": true },
+        "original_size_bytes": { "type": "integer", "minimum": 65537 }
+      }
+    },
+    "Outcome": {
+      "type": "string",
+      "enum": ["success", "failure", "denied"],
+      "description": "Result flavor, derived from the action name."
+    },
+    "ActorType": {
+      "type": "string",
+      "examples": ["system", "user", "anonymous", "service_account"],
+      "description": "Principal classification. `service_account` is reserved and not yet emitted."
+    },
+    "Actor": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "name", "type"],
+      "properties": {
+        "id": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "Acting user id, when known."
+        },
+        "name": {
+          "type": ["string", "null"],
+          "description": "Best-effort display name / label; null when unknown. Informational only: on failed-authentication events (anonymous actors) this can carry the attempted, unauthenticated username — key detection logic on actor.type and actor.id."
+        },
+        "type": {
+          "$ref": "#/$defs/ActorType"
+        }
+      }
+    },
+    "Resource": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["type", "id", "name"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Resource type (user, repository, artifact, ...)."
+        },
+        "id": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "Resource id, when the action targets a specific row."
+        },
+        "name": {
+          "type": ["string", "null"],
+          "description": "Best-effort resource name; null when unknown."
+        }
+      }
+    },
+    "RepositoryDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["actor_id", "key", "is_public"],
+      "description": "details for REPOSITORY_CREATED / REPOSITORY_UPDATED / REPOSITORY_DELETED.",
+      "properties": {
+        "actor_id": { "type": "string", "format": "uuid" },
+        "key": { "type": "string" },
+        "is_public": { "type": "boolean" },
+        "format": { "type": "string" },
+        "visibility": { "type": "string" },
+        "age_gate_enabled": { "type": "boolean" },
+        "age_gate_min_age_days": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "PermissionDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["actor_id", "role_id", "grantee_id"],
+      "description": "details for ROLE_ASSIGNED / ROLE_REVOKED / REPOSITORY_PERMISSION_CHANGED.",
+      "properties": {
+        "actor_id": { "type": "string", "format": "uuid" },
+        "role_id": { "type": "string", "format": "uuid" },
+        "grantee_id": { "type": "string", "format": "uuid" },
+        "repository_id": { "type": "string", "format": "uuid" }
+      }
+    },
+    "TokenDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["token_id", "surface"],
+      "description": "details for API_TOKEN_CREATED / API_TOKEN_REVOKED. Never includes the token secret.",
+      "properties": {
+        "token_id": { "type": "string" },
+        "token_name": { "type": "string" },
+        "surface": { "type": "string" }
+      }
+    },
+    "AuthDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [],
+      "description": "details for LOGIN_FAILED / PERMISSION_DENIED and related authorization events.",
+      "properties": {
+        "username": { "type": "string" },
+        "path": { "type": "string" },
+        "method": { "type": "string" },
+        "reason": { "type": "string" },
+        "provider": { "type": "string" },
+        "auth_method": { "type": "string" }
+      }
+    },
+    "ArtifactDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["repository_id", "path", "name"],
+      "description": "details for ARTIFACT_UPLOADED / ARTIFACT_DOWNLOADED / ARTIFACT_DELETED.",
+      "properties": {
+        "repository_id": { "type": "string", "format": "uuid" },
+        "path": { "type": "string" },
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "digest": { "type": "string" },
+        "uploaded_by": { "type": "string", "format": "uuid" }
+      }
+    },
+    "SettingDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key"],
+      "description": "details for SETTING_CHANGED. Secret-bearing values are redacted by the caller.",
+      "properties": {
+        "key": { "type": "string" },
+        "old_value": { "type": "string" },
+        "new_value": { "type": "string" }
+      }
+    }
+  }
+}

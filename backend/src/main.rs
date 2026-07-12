@@ -145,6 +145,16 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         &otel_service_name,
     );
 
+    // Initialize the structured audit-event stream (#2413) from AUDIT_STREAM,
+    // following the same pre-Config env-read pattern as telemetry. Default
+    // `off`; `stdout` opts in to NDJSON audit records on stdout.
+    let _audit_stream_guard =
+        artifact_keeper_backend::services::audit_export::init_audit_stream_from_env();
+    tracing::info!(
+        audit_stream = _audit_stream_guard.mode().name(),
+        "audit event stream configured"
+    );
+
     // Load configuration
     let config = Config::from_env()?;
 

@@ -14,6 +14,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryType;
 use crate::services::age_gate_service::AgeGateReview;
+use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::repository_service::RepositoryService as RepoSvc;
 
@@ -145,14 +146,6 @@ fn build_review_audit_details(
         "package": review.package_name,
         "version": review.package_version,
         "reason": reason,
-    })
-}
-
-/// Build the audit-log details for a per-repo age-gate config update.
-fn build_repo_config_audit_details(enabled: bool, min_age_days: i32) -> serde_json::Value {
-    serde_json::json!({
-        "age_gate_enabled": enabled,
-        "age_gate_min_age_days": min_age_days,
     })
 }
 
@@ -366,10 +359,19 @@ pub async fn update_repo_age_gate(
             AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
                 .user(auth.user_id)
                 .resource(repo.id)
-                .details(build_repo_config_audit_details(
-                    body.enabled,
-                    body.min_age_days,
-                )),
+                .actor_name(auth.username.clone())
+                .resource_name(repo.key.clone())
+                .details_typed(audit_details::RepositoryDetails {
+                    actor_id: auth.user_id,
+                    key: repo.key.clone(),
+                    is_public: repo.is_public,
+                    format: Some(crate::services::repository_service::derive_format_key(
+                        &repo.format,
+                    )),
+                    visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                    age_gate_enabled: Some(body.enabled),
+                    age_gate_min_age_days: Some(body.min_age_days),
+                }),
         )
         .await;
 
@@ -495,13 +497,6 @@ mod tests {
         assert_eq!(details["package"], "react");
         assert_eq!(details["version"], "18.0.0");
         assert_eq!(details["reason"], "looks safe");
-    }
-
-    #[test]
-    fn build_repo_config_audit_details_includes_fields() {
-        let d = build_repo_config_audit_details(true, 14);
-        assert_eq!(d["age_gate_enabled"], true);
-        assert_eq!(d["age_gate_min_age_days"], 14);
     }
 
     #[test]

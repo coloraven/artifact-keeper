@@ -31,6 +31,7 @@ use crate::formats::maven::MavenHandler;
 use crate::models::access_scope::AccessScope;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
+use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
@@ -38,8 +39,8 @@ use crate::services::cache_classifier;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
 use crate::services::repository_service::{
-    CreateRepositoryRequest as ServiceCreateRepoReq, RepoVisibility, RepositoryService,
-    UpdateRepositoryRequest as ServiceUpdateRepoReq,
+    derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, RepoVisibility,
+    RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
 use crate::services::upload_service;
@@ -1831,11 +1832,17 @@ pub async fn create_repository(
         AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
             .user(auth.user_id)
             .resource(repo.id)
-            .details(serde_json::json!({
-                "actor_id": auth.user_id.to_string(),
-                "key": repo.key,
-                "is_public": repo.is_public,
-            })),
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details_typed(audit_details::RepositoryDetails {
+                actor_id: auth.user_id,
+                key: repo.key.clone(),
+                is_public: repo.is_public,
+                format: Some(derive_format_key(&repo.format)),
+                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                age_gate_enabled: None,
+                age_gate_min_age_days: None,
+            }),
     )
     .await;
 
@@ -2072,10 +2079,17 @@ pub async fn update_repository(
         AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
             .user(auth.user_id)
             .resource(repo.id)
-            .details(serde_json::json!({
-                "actor_id": auth.user_id.to_string(),
-                "key": repo.key,
-            })),
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details_typed(audit_details::RepositoryDetails {
+                actor_id: auth.user_id,
+                key: repo.key.clone(),
+                is_public: repo.is_public,
+                format: Some(derive_format_key(&repo.format)),
+                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                age_gate_enabled: None,
+                age_gate_min_age_days: None,
+            }),
     )
     .await;
 
@@ -2399,10 +2413,17 @@ pub async fn delete_repository(
         AuditEntry::new(AuditAction::RepositoryDeleted, ResourceType::Repository)
             .user(auth.user_id)
             .resource(repo.id)
-            .details(serde_json::json!({
-                "actor_id": auth.user_id.to_string(),
-                "key": repo.key,
-            })),
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details_typed(audit_details::RepositoryDetails {
+                actor_id: auth.user_id,
+                key: repo.key.clone(),
+                is_public: repo.is_public,
+                format: Some(derive_format_key(&repo.format)),
+                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                age_gate_enabled: None,
+                age_gate_min_age_days: None,
+            }),
     )
     .await;
 

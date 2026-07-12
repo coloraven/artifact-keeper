@@ -32,15 +32,19 @@ use std::sync::atomic::Ordering;
 
 /// Fire-and-forget auth audit log. Failures are silently ignored so audit
 /// issues never break the auth flow.
-async fn audit_auth(
+async fn audit_auth<T: serde::Serialize>(
     state: &SharedState,
     action: AuditAction,
     user_id: Option<Uuid>,
-    details: serde_json::Value,
+    actor_name: Option<&str>,
+    details: T,
 ) {
-    let mut entry = AuditEntry::new(action, ResourceType::User).details(details);
+    let mut entry = AuditEntry::new(action, ResourceType::User).details_typed(details);
     if let Some(id) = user_id {
         entry = entry.user(id).resource(id);
+    }
+    if let Some(name) = actor_name {
+        entry = entry.actor_name(name);
     }
     let _ = AuditService::new(state.db.clone()).log(entry).await;
 }
@@ -244,10 +248,11 @@ async fn enforce_local_login_sso_policy(
                 state,
                 AuditAction::LoginFailed,
                 Some(user_id),
-                serde_json::json!({
-                    "username": username,
-                    "reason": "local_login_disabled_sso",
-                }),
+                Some(username),
+                crate::services::audit_export::details::AuthDetails::failed_login(
+                    Some(username),
+                    Some("local_login_disabled_sso"),
+                ),
             )
             .await;
             Err(AppError::Authentication(
@@ -293,7 +298,11 @@ pub async fn login(
                 &state,
                 AuditAction::LoginFailed,
                 None,
-                serde_json::json!({ "username": payload.username }),
+                None,
+                crate::services::audit_export::details::AuthDetails::failed_login(
+                    Some(&payload.username),
+                    None,
+                ),
             )
             .await;
             return Err(err);
@@ -336,7 +345,14 @@ pub async fn login(
         // break-glass login so it is visible in the audit trail.
         login_details["sso_break_glass"] = serde_json::json!(true);
     }
-    audit_auth(&state, AuditAction::Login, Some(user.id), login_details).await;
+    audit_auth(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        Some(&user.username),
+        login_details,
+    )
+    .await;
 
     Ok(login_response(
         &tokens,
@@ -388,6 +404,7 @@ pub async fn logout(
             &state,
             AuditAction::Logout,
             Some(auth.user_id),
+            Some(&auth.username),
             serde_json::json!({}),
         )
         .await;
@@ -429,6 +446,7 @@ pub async fn refresh_token(
         &state,
         AuditAction::Login,
         Some(user.id),
+        Some(&user.username),
         serde_json::json!({ "method": "token_refresh" }),
     )
     .await;

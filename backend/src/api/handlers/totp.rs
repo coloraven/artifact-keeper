@@ -374,7 +374,12 @@ pub async fn verify_totp(
             AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
                 .user(claims.sub)
                 .resource(claims.sub)
-                .details(serde_json::json!({ "reason": "totp_not_enabled" })),
+                .details_typed(
+                    crate::services::audit_export::details::AuthDetails::failed_login(
+                        None,
+                        Some("totp_not_enabled"),
+                    ),
+                ),
         )
         .await;
         return Err(AppError::Authentication(
@@ -455,10 +460,14 @@ pub async fn verify_totp(
                 AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
                     .user(claims.sub)
                     .resource(claims.sub)
-                    .details(serde_json::json!({
-                        "reason": "invalid_totp_code",
-                        "method": "totp",
-                    })),
+                    .details_typed(crate::services::audit_export::details::AuthDetails {
+                        username: None,
+                        path: None,
+                        method: Some("totp".to_owned()),
+                        reason: Some("invalid_totp_code".to_owned()),
+                        provider: None,
+                        auth_method: None,
+                    }),
             )
             .await;
             return Err(AppError::Authentication("Invalid TOTP code".to_string()));

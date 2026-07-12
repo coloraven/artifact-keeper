@@ -8,11 +8,64 @@
 //! environment variable:
 //!   - `grpc` (default) -- gRPC over HTTP/2 using tonic
 //!   - `http/protobuf`  -- HTTP/1.1 with binary protobuf bodies using reqwest
+//!
+//! The diagnostics stdout format is selected via `LOG_FORMAT`:
+//!   - `pretty` (default) -- the human-readable multi-line `fmt` output
+//!   - `json` -- one JSON object per line, for structured stdout collection by a SIEM / log shipper (#2413 item 1)
 
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
+/// Diagnostics stdout log format, selected via `LOG_FORMAT` (#2413 item 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    /// Human-readable multi-line `fmt` output (default, unchanged behavior).
+    Pretty,
+    /// One JSON object per line for structured stdout collection.
+    Json,
+}
+
+impl LogFormat {
+    /// Parse a `LOG_FORMAT` value. Defaults to `pretty` for empty or
+    /// unrecognised values so an operator typo never silently drops
+    /// diagnostics to an unexpected shape.
+    fn from_value(val: &str) -> Self {
+        match val.trim().to_lowercase().as_str() {
+            "json" => Self::Json,
+            _ => Self::Pretty,
+        }
+    }
+
+    /// Read from `LOG_FORMAT`. Defaults to `pretty` when unset or unrecognised.
+    fn from_env() -> Self {
+        Self::from_value(&std::env::var("LOG_FORMAT").unwrap_or_default())
+    }
+
+    /// Canonical name, for the startup log line.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pretty => "pretty",
+            Self::Json => "json",
+        }
+    }
+}
+
+/// Build the diagnostics `fmt` layer in the configured format.
+///
+/// Boxed so both arms have the same type regardless of the concrete
+/// per-format layer. The workspace `tracing-subscriber` dependency already
+/// carries the `json` feature, so the JSON arm adds no new dependency.
+fn build_fmt_layer<S>(format: LogFormat) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    match format {
+        LogFormat::Pretty => tracing_subscriber::fmt::layer().boxed(),
+        LogFormat::Json => tracing_subscriber::fmt::layer().json().boxed(),
+    }
+}
 
 /// OTLP transport protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,15 +136,17 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         "artifact_keeper_backend=debug,tower_http=debug,sqlx::query=info".into()
     });
+    let log_format = LogFormat::from_env();
 
     match otel_endpoint {
         Some(endpoint) => {
             let protocol = OtlpProtocol::from_env();
-            let guard = init_with_otel(endpoint, service_name, env_filter, protocol);
+            let guard = init_with_otel(endpoint, service_name, env_filter, protocol, log_format);
             tracing::info!(
                 otel_endpoint = endpoint,
                 service_name,
                 protocol = protocol.name(),
+                log_format = log_format.name(),
                 "OpenTelemetry tracing enabled"
             );
             Some(guard)
@@ -99,7 +154,7 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
         None => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(tracing_subscriber::fmt::layer())
+                .with(build_fmt_layer(log_format))
                 .init();
             None
         }
@@ -125,6 +180,7 @@ fn init_with_otel(
     service_name: &str,
     env_filter: EnvFilter,
     protocol: OtlpProtocol,
+    log_format: LogFormat,
 ) -> OtelGuard {
     use opentelemetry::trace::TracerProvider;
     use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
@@ -142,7 +198,7 @@ fn init_with_otel(
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(build_fmt_layer(log_format))
         .with(otel_layer)
         .init();
 
@@ -268,6 +324,66 @@ mod tests {
         assert_eq!(OtlpProtocol::Grpc, OtlpProtocol::Grpc);
         assert_eq!(OtlpProtocol::HttpProtobuf, OtlpProtocol::HttpProtobuf);
         assert_ne!(OtlpProtocol::Grpc, OtlpProtocol::HttpProtobuf);
+    }
+
+    // ── LogFormat (#2413 item 1) ────────────────────────────────────────
+
+    #[test]
+    fn test_log_format_defaults_to_pretty_for_empty_string() {
+        assert_eq!(LogFormat::from_value(""), LogFormat::Pretty);
+    }
+
+    #[test]
+    fn test_log_format_accepts_json_variants() {
+        for val in ["json", "JSON", "Json", " json ", "json\n"] {
+            assert_eq!(
+                LogFormat::from_value(val),
+                LogFormat::Json,
+                "failed for {val:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_format_pretty_explicit() {
+        assert_eq!(LogFormat::from_value("pretty"), LogFormat::Pretty);
+        assert_eq!(LogFormat::from_value("PRETTY"), LogFormat::Pretty);
+    }
+
+    #[test]
+    fn test_log_format_unrecognised_falls_back_to_pretty() {
+        assert_eq!(LogFormat::from_value("logfmt"), LogFormat::Pretty);
+        assert_eq!(LogFormat::from_value("bogus"), LogFormat::Pretty);
+    }
+
+    #[test]
+    fn test_log_format_from_env_defaults_to_pretty_when_unset() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("LOG_FORMAT");
+        assert_eq!(LogFormat::from_env(), LogFormat::Pretty);
+    }
+
+    #[test]
+    fn test_log_format_from_env_reads_json() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("LOG_FORMAT", "json");
+        let result = LogFormat::from_env();
+        std::env::remove_var("LOG_FORMAT");
+        assert_eq!(result, LogFormat::Json);
+    }
+
+    #[test]
+    fn test_log_format_name() {
+        assert_eq!(LogFormat::Pretty.name(), "pretty");
+        assert_eq!(LogFormat::Json.name(), "json");
+    }
+
+    #[test]
+    fn test_build_fmt_layer_builds_both_formats() {
+        // Both arms must type-check to the same boxed layer and construct
+        // without panicking against the registry subscriber type.
+        let _pretty = build_fmt_layer::<tracing_subscriber::Registry>(LogFormat::Pretty);
+        let _json = build_fmt_layer::<tracing_subscriber::Registry>(LogFormat::Json);
     }
 
     // ── build_otel_resource ─────────────────────────────────────────────

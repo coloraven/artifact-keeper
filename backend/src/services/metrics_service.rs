@@ -217,6 +217,14 @@ pub fn record_cleanup(cleanup_type: &str, items_removed: u64) {
         .increment(items_removed);
 }
 
+/// Record a structured audit-stream delivery failure. `reason` is a bounded
+/// internal label (`queue_full`, `writer_disconnected`, or `write_error`) so
+/// backpressure and broken stdout delivery are observable without logging back
+/// into the same potentially-blocked stream.
+pub fn record_audit_stream_failure(reason: &'static str) {
+    counter!("ak_audit_stream_failures_total", "reason" => reason).increment(1);
+}
+
 /// Record an email dispatch that was dropped by the per-event rate limiter.
 /// `reason` is the [`crate::services::email_rate_limiter::RateLimitDecision`]
 /// label (`"recipient"` or `"domain"`); the `"allowed"` decision does not

@@ -1043,13 +1043,16 @@ impl ArtifactService {
             };
             let mut entry = AuditEntry::new(AuditAction::ArtifactUploaded, ResourceType::Artifact)
                 .resource(artifact.id)
-                .details(serde_json::json!({
-                    "repository_id": artifact.repository_id.to_string(),
-                    "path": artifact.path,
-                    "name": artifact.name,
-                    "version": artifact.version,
-                    "size_bytes": artifact.size_bytes,
-                }));
+                .resource_name(artifact.path.clone())
+                .details_typed(crate::services::audit_export::details::ArtifactDetails {
+                    repository_id: artifact.repository_id,
+                    path: artifact.path.clone(),
+                    name: artifact.name.clone(),
+                    version: artifact.version.clone(),
+                    size_bytes: u64::try_from(artifact.size_bytes).ok(),
+                    digest: Some(format!("sha256:{}", artifact.checksum_sha256)),
+                    uploaded_by: artifact.uploaded_by,
+                });
             if let Some(uid) = uploaded_by {
                 entry = entry.user(uid);
             }
@@ -1376,12 +1379,16 @@ impl ArtifactService {
             let mut entry =
                 AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
                     .resource(artifact_id)
-                    .details(serde_json::json!({
-                        "repository_id": artifact_info.repository_id.to_string(),
-                        "path": artifact_info.path,
-                        "name": artifact_info.name,
-                        "version": artifact_info.version,
-                    }));
+                    .resource_name(artifact_info.path.clone())
+                    .details_typed(crate::services::audit_export::details::ArtifactDetails {
+                        repository_id: artifact_info.repository_id,
+                        path: artifact_info.path.clone(),
+                        name: artifact_info.name.clone(),
+                        version: artifact_info.version.clone(),
+                        size_bytes: u64::try_from(artifact_info.size_bytes).ok(),
+                        digest: Some(format!("sha256:{}", artifact_info.checksum_sha256)),
+                        uploaded_by: artifact_info.uploaded_by,
+                    });
             if let Some(uid) = user_id {
                 entry = entry.user(uid);
             }
@@ -1710,13 +1717,16 @@ impl ArtifactService {
             // original uploader is recorded in `details` for context.
             let entry = AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact)
                 .resource(artifact.id)
-                .details(serde_json::json!({
-                    "repository_id": artifact.repository_id.to_string(),
-                    "path": artifact.path,
-                    "name": artifact.name,
-                    "version": artifact.version,
-                    "uploaded_by": artifact.uploaded_by.map(|u| u.to_string()),
-                }));
+                .resource_name(artifact.path.clone())
+                .details_typed(crate::services::audit_export::details::ArtifactDetails {
+                    repository_id: artifact.repository_id,
+                    path: artifact.path.clone(),
+                    name: artifact.name.clone(),
+                    version: artifact.version.clone(),
+                    size_bytes: u64::try_from(artifact.size_bytes).ok(),
+                    digest: Some(format!("sha256:{}", artifact.checksum_sha256)),
+                    uploaded_by: artifact.uploaded_by,
+                });
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
 
