@@ -4006,22 +4006,83 @@ mod tests {
         out
     }
 
+    /// Read a compose file relative to the repo root, panicking with the path
+    /// on failure so a missing/renamed file fails loudly instead of silently
+    /// passing an empty-string check. Test-only.
+    fn read_compose(repo_root: &std::path::Path, file_name: &str) -> String {
+        let compose_path = repo_root.join(file_name);
+        std::fs::read_to_string(&compose_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", compose_path.display()))
+    }
+
+    /// List every top-level `docker-compose*.yml` file at the repo root. Used
+    /// so the regression guard below automatically covers any compose file
+    /// added in future, instead of a hardcoded list that can silently miss
+    /// one the way `docker-compose.local-dev.yml` was missed after #2126.
+    /// Test-only.
+    fn discover_compose_files(repo_root: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(repo_root)
+            .expect("read repo root")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("docker-compose") && name.ends_with(".yml"))
+            .collect();
+        files.sort();
+        files
+    }
+
     /// Regression guard for #2084: the hardened runtime image (#2059) ships no
     /// `/bin/sh`, so no compose service that runs that image may be launched
     /// through a shell. On `main` the `backend` service used
     /// `entrypoint: ["/bin/sh","-c", <wait-for-DT-key>]` and `dtrack-init` ran
     /// the backend image via `/bin/sh`; both broke `docker compose up` with
     /// `exec: "/bin/sh": no such file or directory`.
+    ///
+    /// #2126 fixed this in `docker-compose.yml` only. `docker-compose.local-
+    /// dev.yml` carried an independent copy of the `dtrack-init` service that
+    /// pulled the same hardened `ghcr.io/.../artifact-keeper-backend` image
+    /// and drifted back into the identical broken pattern because nothing
+    /// checked it. Rather than hardcode that one other file, every
+    /// `docker-compose*.yml` at the repo root is scanned for a `dtrack-init`
+    /// service, so a future compose file can't reintroduce this silently.
+    ///
+    /// `docker-compose.yml`'s `backend` service additionally may never use a
+    /// shell entrypoint: unlike every other compose file's `backend`/`backend-
+    /// peer-*` services (which either build their own shell-bearing dev image
+    /// or run the hardened image with no entrypoint override), it is the only
+    /// one this repo has ever wrapped in `/bin/sh -c`.
     #[test]
     fn shipped_compose_does_not_run_hardened_image_through_a_shell() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("backend crate has a parent directory (repo root)");
-        let compose_path = repo_root.join("docker-compose.yml");
-        let compose = std::fs::read_to_string(&compose_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", compose_path.display()));
 
-        let backend = compose_service_block(&compose, "backend");
+        let compose_files = discover_compose_files(repo_root);
+        assert!(
+            compose_files.iter().any(|f| f == "docker-compose.yml")
+                && compose_files
+                    .iter()
+                    .any(|f| f == "docker-compose.local-dev.yml"),
+            "expected to discover both docker-compose.yml and \
+             docker-compose.local-dev.yml among the repo's compose files, \
+             found: {compose_files:?}"
+        );
+
+        for file_name in &compose_files {
+            let compose = read_compose(repo_root, file_name);
+            let dtrack_init = compose_service_block(&compose, "dtrack-init");
+            if dtrack_init.is_empty() {
+                continue;
+            }
+            assert!(
+                !dtrack_init.contains("artifact-keeper-backend"),
+                "dtrack-init in {file_name} must not run the shell-less backend \
+                 image (#2084). Offending block:\n{dtrack_init}"
+            );
+        }
+
+        let prod_compose = read_compose(repo_root, "docker-compose.yml");
+        let backend = compose_service_block(&prod_compose, "backend");
         assert!(
             !backend.is_empty(),
             "backend service not found in docker-compose.yml"
@@ -4030,19 +4091,6 @@ mod tests {
             !backend.contains("/bin/sh") && !backend.contains("/bin/bash"),
             "backend service must not use a shell entrypoint; the runtime image \
              has no shell (#2059/#2084). Offending block:\n{backend}"
-        );
-
-        // dtrack-init may legitimately use a shell, but not on the shell-less
-        // backend image — it must run a shell-bearing image instead.
-        let dtrack_init = compose_service_block(&compose, "dtrack-init");
-        assert!(
-            !dtrack_init.is_empty(),
-            "dtrack-init service not found in docker-compose.yml"
-        );
-        assert!(
-            !dtrack_init.contains("artifact-keeper-backend"),
-            "dtrack-init must not run the shell-less backend image (#2084). \
-             Offending block:\n{dtrack_init}"
         );
     }
 }
