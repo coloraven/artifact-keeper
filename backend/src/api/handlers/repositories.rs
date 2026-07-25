@@ -769,6 +769,16 @@ pub struct UpdateRepositoryRequest {
     #[serde(default, deserialize_with = "deserialize_double_option")]
     #[schema(value_type = Option<DebianConfigPatch>)]
     pub debian: Option<Option<DebianConfigPatch>>,
+    /// Enable curation-rule enforcement on this repository's proxy paths.
+    pub curation_enabled: Option<bool>,
+    /// Default curation action when no rule matches: allow or review.
+    /// "block" is rejected (DB CHECK, migration 071); use block rules for
+    /// specific packages instead.
+    ///
+    /// The allowed set is spelled out in the schema so a generated SDK presents it
+    /// rather than an unconstrained string.
+    #[schema(value_type = String, example = "allow")]
+    pub curation_default_action: Option<String>,
 }
 
 /// Deserialize a nullable optional field into `Option<Option<T>>` so a handler
@@ -869,6 +879,15 @@ pub struct RepositoryResponse {
     /// Omitted for non-Debian-remote repositories or when no filter is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debian: Option<DebianRepositoryConfig>,
+    /// Whether curation rules are enforced for this repository (#2912).
+    ///
+    /// Echoed back because this flag now *blocks downloads* on the PyPI proxy
+    /// paths, and a security control that cannot be read back is the same class of
+    /// problem as one that is stored but not enforced. Stored on the repositories
+    /// row, so unlike `quarantine_enabled` this needs no separate lookup.
+    pub curation_enabled: bool,
+    /// Stance applied when no curation rule matches: `allow` or `review`.
+    pub curation_default_action: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -918,6 +937,8 @@ fn repo_to_response(
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
         debian: None,
+        curation_enabled: repo.curation_enabled,
+        curation_default_action: repo.curation_default_action,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -3081,6 +3102,20 @@ pub async fn update_repository(
         validate_trusted_gpg_key(gpg_key)?;
     }
 
+    // Validate curation_default_action when provided (#2912).
+    // Only "allow" and "review" are accepted: the `repositories.curation_default_action`
+    // column has a DB CHECK constraint (migration 071_curation.sql) that does not
+    // include "block". Do not widen this list without also widening that constraint.
+    if let Some(ref action) = payload.curation_default_action {
+        if !["allow", "review"].contains(&action.as_str()) {
+            return Err(AppError::Validation(
+                "curation_default_action must be one of: allow, review (default action \
+                 block is not supported; use block rules for specific packages instead)"
+                    .to_string(),
+            ));
+        }
+    }
+
     let service = state.create_repository_service();
 
     // Get existing repo by key and check repo access
@@ -3135,6 +3170,9 @@ pub async fn update_repository(
                 // Keyless-sync unverified-ingest opt-in (#2569): omit = unchanged,
                 // Some(false) = fail-closed default, Some(true) = unverified.
                 curation_allow_unverified: payload.curation_allow_unverified,
+                // Curation-rule enforcement (#2912): omit = unchanged.
+                curation_enabled: payload.curation_enabled,
+                curation_default_action: payload.curation_default_action,
             },
         )
         .await?;
@@ -10646,6 +10684,8 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             debian: None,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -11859,6 +11899,8 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             debian: None,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -14561,6 +14603,51 @@ mod tests {
             "Local repo MUST surface as 400 BadRequest, not silent 200 \
              (#1539); got status {} with body: {}",
             status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    /// `curation_default_action: "block"` must 400 (#2912): the
+    /// `repositories.curation_default_action` column has a DB CHECK
+    /// constraint (migration 071_curation.sql) that allows only "allow" and
+    /// "review", never "block". The handler must reject it before the
+    /// request ever reaches the database, and the error must point the
+    /// caller at curation rules (block a specific package) instead of a
+    /// blanket default action.
+    #[tokio::test]
+    async fn test_update_repository_rejects_block_default_action() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), fx.state.clone(), auth);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}", fx.repo_key))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"curation_default_action":"block"}"#))
+            .expect("build PATCH request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "curation_default_action=\"block\" must 400; got {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("block rules"),
+            "400 body must point the caller at curation rules; got: {}",
             String::from_utf8_lossy(&body),
         );
     }
@@ -18790,6 +18877,8 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             debian: None,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
