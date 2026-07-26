@@ -2707,12 +2707,15 @@ async fn npm_local_fetch(
         };
 
     Ok(proxy_helpers::StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body,
         content_type: Some(artifact.content_type.clone()),
         content_length: Some(artifact.size_bytes as u64),
         // Local artifact resolved: surface its id so a virtual npm-member
         // download is recorded exactly once at the streaming resolver (#2260).
         artifact_id: Some(artifact.id),
+        etag: None,
     })
 }
 

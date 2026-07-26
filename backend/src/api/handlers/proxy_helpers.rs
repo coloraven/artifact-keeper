@@ -663,6 +663,34 @@ pub async fn proxy_fetch_capped_budgeted(
     Ok((content, content_type, permit))
 }
 
+/// As [`proxy_fetch_capped_budgeted`], but also reports the upstream
+/// `Content-Encoding` for handlers that forward the buffered bytes to the client
+/// and must declare the coding — see
+/// [`proxy_fetch_capped_with_cache_key_and_accept_encoded`].
+pub async fn proxy_fetch_capped_budgeted_with_encoding(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>, Option<String>, OwnedSemaphorePermit), Response> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let (content, content_type, content_encoding) =
+        proxy_fetch_capped_with_cache_key_and_accept_encoded(
+            proxy_service,
+            repo_id,
+            repo_key,
+            upstream_url,
+            path,
+            path,
+            None,
+            max,
+        )
+        .await?;
+    Ok((content, content_type, content_encoding, permit))
+}
+
 /// Budget-reserving sibling of [`proxy_fetch_capped_with_cache_key_and_accept`]
 /// (#2684). See [`proxy_fetch_capped_budgeted`] for the reservation semantics;
 /// used by the PyPI simple-index proxy, which negotiates the PEP 691 JSON
@@ -897,6 +925,31 @@ pub(crate) fn build_streaming_response_with_disposition(
     if let Some(len) = result.content_length {
         builder = builder.header("content-length", len);
     }
+    if let Some(ref etag) = result.etag {
+        builder = builder.header("etag", etag);
+    }
+    // The proxy no longer decodes upstream bodies (see
+    // `http_client::base_client_builder`), so a content-coded body must be
+    // declared as such or the client silently writes compressed bytes to disk.
+    // `content_length` above is the coded length, which is what the client needs
+    // to read the transfer.
+    if let Some(ref encoding) = result.content_encoding {
+        builder = builder.header("content-encoding", encoding);
+    }
+    // Upstream's `X-Repo-Commit`, forwarded with the bytes it describes.
+    // `huggingface_hub` requires it on a resolve and names the snapshot directory
+    // from it, so it must be the commit these bytes came from — which is why it
+    // travels through the cache sidecar rather than being looked up separately.
+    // `HeaderValue` parsing rejects CR/LF, so an upstream cannot inject a header
+    // here; a malformed value is dropped rather than failing the download.
+    if let Some(ref sha) = result.commit_sha {
+        if let Ok(value) = axum::http::HeaderValue::from_str(sha) {
+            builder = builder.header(
+                crate::services::proxy_service::UPSTREAM_COMMIT_HEADER,
+                value,
+            );
+        }
+    }
     if let Some(fname) = filename {
         builder = builder.header("content-disposition", content_disposition_attachment(fname));
     }
@@ -1089,11 +1142,13 @@ pub async fn proxy_check_cache(
     repo_key: &str,
     path: &str,
 ) -> Option<(Bytes, Option<String>)> {
+    // Callers here parse the cached body rather than forwarding it, so the
+    // upstream coding is not part of this helper's contract.
     match proxy_service
         .get_cached_artifact_by_path(repo_key, path)
         .await
     {
-        Ok(result) => result,
+        Ok(result) => result.map(|(content, content_type, _encoding)| (content, content_type)),
         Err(e) => {
             tracing::debug!(
                 "Cache lookup failed for {}/{}, treating as miss: {}",
@@ -1329,6 +1384,37 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept(
     accept: Option<&str>,
     max: usize,
 ) -> Result<(Bytes, Option<String>), Response> {
+    let (content, content_type, _encoding) = proxy_fetch_capped_with_cache_key_and_accept_encoded(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        cache_path,
+        accept,
+        max,
+    )
+    .await?;
+    Ok((content, content_type))
+}
+
+/// As [`proxy_fetch_capped_with_cache_key_and_accept`], but also reports the
+/// upstream `Content-Encoding` so a handler that forwards the buffered bytes can
+/// declare the coding. Needed because the shared HTTP client no longer lets
+/// reqwest decode upstream bodies, so a buffered metadata document may arrive
+/// content coded (object stores return a stored coding regardless of
+/// `Accept-Encoding`).
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_cache_key_and_accept_encoded(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -2265,7 +2351,7 @@ where
             // (warm path never fans out) while a held entry is skipped rather
             // than served raw. A fresh hit is transformed into the response.
             match proxy.cached_metadata_if_servable(member, path).await {
-                Ok(Some((bytes, _ct))) => match transform(bytes, member.key.clone()).await {
+                Ok(Some((bytes, _ct, _enc))) => match transform(bytes, member.key.clone()).await {
                     Ok(response) => (MemberCacheClass::DefiniteHit, Some(response)),
                     // The cached bytes failed to transform (e.g. corrupt cached
                     // metadata). Don't treat the member as a definite miss —
@@ -2718,12 +2804,15 @@ async fn read_local_stream(
         Err(e) => return Err(map_storage_err(e)),
     };
     Ok(StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body,
         content_type: Some(artifact.content_type.clone()),
         content_length: Some(artifact.size_bytes as u64),
         // Local artifact row resolved: surface its id so the virtual-member
         // streaming resolver can record the download exactly once (#2260).
         artifact_id: Some(artifact.id),
+        etag: None,
     })
 }
 
@@ -5351,10 +5440,13 @@ mod tests {
 
     fn empty_stream_result() -> StreamingFetchResult {
         StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: Box::pin(futures::stream::empty()),
             content_type: None,
             content_length: Some(0),
             artifact_id: None,
+            etag: None,
         }
     }
 
@@ -8939,10 +9031,13 @@ mod tests {
     #[test]
     fn test_build_streaming_response_uses_upstream_content_type_when_set() {
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: Some("application/java-archive".to_string()),
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream")
             .expect("response build must succeed");
@@ -8959,10 +9054,13 @@ mod tests {
     #[test]
     fn test_build_streaming_response_falls_back_to_default_when_upstream_omits() {
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response =
             build_streaming_response(result, "text/xml").expect("response build must succeed");
@@ -8981,10 +9079,13 @@ mod tests {
     #[test]
     fn test_build_streaming_response_sets_content_length_when_upstream_advertises_it() {
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(
@@ -9004,10 +9105,13 @@ mod tests {
         // Chunked-transfer-encoding case: upstream omits Content-Length,
         // outbound response also omits it so axum falls back to TE: chunked.
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert!(
@@ -9021,10 +9125,13 @@ mod tests {
     #[test]
     fn test_build_streaming_response_status_is_200() {
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -9037,10 +9144,13 @@ mod tests {
         // string as-is, not lowercase / normalize / sniff.
         let weird = "application/vnd.android.package-archive";
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, weird).unwrap();
         assert_eq!(
@@ -9058,10 +9168,13 @@ mod tests {
         // underlying builder: upstream content-type wins, content-length is set
         // when known, and a filename produces a Content-Disposition.
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: Some("application/zip".to_string()),
             content_length: Some(1234),
             artifact_id: None,
+            etag: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
             .expect("stream_fetch_result must build a response");
@@ -9086,10 +9199,13 @@ mod tests {
         // No upstream content-type, no length, no filename: default type is
         // used and neither content-length nor content-disposition is emitted.
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", None)
             .expect("stream_fetch_result must build a response");
@@ -9579,6 +9695,8 @@ mod tests {
         async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
             if key.ends_with("__cache_meta__.json") {
                 let meta = crate::services::proxy_service::CacheMetadata {
+                    upstream_commit_sha: None,
+                    content_encoding: None,
                     cached_at: Utc::now(),
                     upstream_etag: None,
                     storage_etag: None,
@@ -9765,6 +9883,8 @@ mod tests {
         async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
             if key.ends_with("__cache_meta__.json") {
                 let meta = crate::services::proxy_service::CacheMetadata {
+                    upstream_commit_sha: None,
+                    content_encoding: None,
                     cached_at: Utc::now(),
                     upstream_etag: None,
                     storage_etag: None,

@@ -414,12 +414,15 @@ async fn maven_local_fetch_snapshot(
 
     let ct = content_type_for_path(path).to_string();
     Ok(proxy_helpers::StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body: stream,
         content_type: Some(ct),
         content_length: None,
         // Local snapshot artifact resolved: surface its id so a virtual
         // maven-snapshot member download is recorded exactly once (#2260).
         artifact_id: Some(resolved.id),
+        etag: None,
     })
 }
 
