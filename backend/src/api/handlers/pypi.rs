@@ -883,6 +883,13 @@ async fn simple_project(
 
             let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
             let mut remote_response: Option<(Bytes, Option<String>)> = None;
+            // #2967 R4: true when the surfaced remote_response came from a
+            // SUPPRESSED member and has already been reduced to its
+            // ownership-filtered form by `case_a_filter_remote_body`. Such a body
+            // must never be re-run through `rewrite_upstream_urls` (which applies
+            // no ownership filter); the render path below splices locals straight
+            // into the filtered document instead.
+            let mut remote_case_a = false;
 
             // First pass: collect distributions from every local (hosted /
             // staging) member. We must know whether a local member owns the
@@ -926,13 +933,10 @@ async fn simple_project(
             // Ownership / dependency-confusion guard (#1600), superseding the
             // name-only suppression from #1738. When a local member owns this
             // PEP 503 name and no operator `tracks` declaration permits merging,
-            // the virtual serves ONLY that member's distributions for the name
-            // — in both the simple index and the download — rather than
+            // the virtual isolates the name to that member — rather than
             // unioning the remote's versions for it. Unioning an unrelated
             // public package that merely shares the name is a supply-chain hole
-            // (`pip` prefers the higher public version) AND makes the index
-            // inconsistent with the download path, which is also tracks-aware
-            // and 404s for any version only the remote has. Local precedence is
+            // (`pip` prefers the higher public version). Local precedence is
             // the PEP 708-aligned default for a locally-owned name; a `tracks`
             // declaration re-enables the union (#1582).
             //
@@ -942,23 +946,46 @@ async fn simple_project(
             // at equal or higher priority than the owning local was explicitly
             // ranked above the internal package by the operator, so its
             // versions still surface.
-            // Second pass: fetch a remote index only from non-suppressed
-            // remote members.
+            //
+            // #2937: the suppression is distribution-granular, not name-coarse.
+            // For a suppressed Remote member the virtual still UNIONS Case-A
+            // distributions — platform/ABI-distinct wheels of a version the
+            // owning local already provides (local ships linux 2.0, remote ships
+            // windows 2.0) — while continuing to suppress Case-B distributions
+            // (a version only the remote has, or a same-platform rebuild). The
+            // profile is derived from the local owner's filenames collected in
+            // the first pass, so the download path (which rebuilds the same
+            // profile) admits the identical set and the two stay symmetric.
+            let owned_profile = if owning_local_min_priority.is_some() {
+                OwnedWheelProfile::from_filenames(
+                    local_artifacts
+                        .iter()
+                        .map(|a| a.path.rsplit('/').next().unwrap_or(a.path.as_str())),
+                )
+            } else {
+                OwnedWheelProfile::default()
+            };
+
+            // Second pass: fetch a remote index from every remote member, but
+            // narrow a suppressed member's contribution to its Case-A unions.
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
                 }
-                if let Some(local_min) = owning_local_min_priority {
-                    // A member missing from the priority map cannot outrank the
-                    // owning local: treat it as lowest priority (fail closed).
-                    let member_priority = member_priorities
-                        .get(&member.id)
-                        .copied()
-                        .unwrap_or(i32::MAX);
-                    if local_min < member_priority {
-                        continue;
+                // Suppressed (owning local outranks this remote): keep only its
+                // Case-A distributions rather than dropping it whole (#2937). A
+                // member missing from the priority map cannot outrank the owning
+                // local: treat it as lowest priority (fail closed → suppressed).
+                let case_a_only = match owning_local_min_priority {
+                    Some(local_min) => {
+                        let member_priority = member_priorities
+                            .get(&member.id)
+                            .copied()
+                            .unwrap_or(i32::MAX);
+                        local_min < member_priority
                     }
-                }
+                    None => false,
+                };
                 // Only take the first remote response; multiple remote
                 // members in one virtual is rare, and merging two upstream
                 // /simple/<pkg>/ listings deterministically is out of scope
@@ -1050,6 +1077,22 @@ async fn simple_project(
                         } else {
                             content
                         };
+                        // #2937: a suppressed Remote member contributes only its
+                        // Case-A distributions (platform/ABI-distinct wheels of a
+                        // version the owning local already provides); Case-B
+                        // entries (remote-only versions, same-platform rebuilds)
+                        // are dropped here, mirroring the download gate below.
+                        let content = if case_a_only {
+                            remote_case_a = true;
+                            case_a_filter_remote_body(
+                                &content,
+                                &owned_profile,
+                                &repo_key,
+                                &normalized,
+                            )
+                        } else {
+                            content
+                        };
                         remote_response = Some((content, content_type));
                     }
                     Err(_e) => {
@@ -1089,6 +1132,69 @@ async fn simple_project(
                 }
                 (_, Some((content, content_type))) => {
                     let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+
+                    // #2967 R4: a SUPPRESSED member's body has already been reduced
+                    // to its ownership-filtered form — a rebuilt AK-pathed PEP 503
+                    // index or a fail-closed PEP 691 listing — by
+                    // `case_a_filter_remote_body`. It must NEVER reach the in-place
+                    // `rewrite_upstream_urls` rewriter (no ownership filter; its
+                    // `[^>]*?` can't cross a `>`, so an anchor whose `href` follows a
+                    // `>` inside an attribute would be left off-site → dependency
+                    // confusion). Classify by the FILTERED body's own bytes (never the
+                    // upstream's possibly-mislabeled Content-Type) and splice locals
+                    // straight in.
+                    if remote_case_a {
+                        return match sniff_simple_index(&content) {
+                            SniffedSimpleIndex::Json => {
+                                let merged = merge_local_into_remote_simple_json(
+                                    &content,
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                )
+                                .unwrap_or_else(|| empty_pep691_listing(&normalized));
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    PEP691_JSON_CONTENT_TYPE,
+                                    &headers,
+                                ))
+                            }
+                            SniffedSimpleIndex::Html => {
+                                // The rebuild is already AK-pathed; splice locals
+                                // WITHOUT rewrite_upstream_urls.
+                                let merged = merge_local_into_remote_simple_html(
+                                    &String::from_utf8_lossy(&content),
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                );
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    "text/html; charset=utf-8",
+                                    &headers,
+                                ))
+                            }
+                            // Fail closed: filter emitted nothing usable → empty
+                            // listing, never raw upstream bytes.
+                            SniffedSimpleIndex::Binary => {
+                                let merged = merge_local_into_remote_simple_json(
+                                    empty_pep691_listing(&normalized).as_bytes(),
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                )
+                                .unwrap_or_else(|| empty_pep691_listing(&normalized));
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    PEP691_JSON_CONTENT_TYPE,
+                                    &headers,
+                                ))
+                            }
+                        };
+                    }
 
                     // JSON client + JSON upstream: rewrite the upstream download
                     // URLs and splice in local entries, preserving PEP 700
@@ -1854,6 +1960,20 @@ async fn serve_file(
                     Default::default()
                 };
 
+                // #2937: the owning local's per-version wheel-tag profile, so a
+                // suppressed Remote member can still serve a Case-A distribution
+                // (a platform/ABI-distinct wheel of a version the owner already
+                // provides) while a Case-B one (a remote-only version, or a
+                // same-platform rebuild) stays suppressed. Built from the same
+                // local-owner query the simple index uses, keeping the two paths
+                // symmetric: every distribution the index lists is downloadable
+                // and every one it hides 404s here.
+                let owned_profile = if owning_local_min_priority.is_some() {
+                    pypi_owned_wheel_profile(&state.db, &members, &normalized_project).await
+                } else {
+                    OwnedWheelProfile::default()
+                };
+
                 for member in &members {
                     // #2066: enforce THIS member's download age gate before any
                     // of its bytes can be served — including from a local
@@ -1932,7 +2052,7 @@ async fn serve_file(
                     // member already owns. A member missing from the priority
                     // map cannot outrank the owning local: it is treated as
                     // lowest priority (fail closed, suppressed).
-                    let remote_suppressed = match owning_local_min_priority {
+                    let mut remote_suppressed = match owning_local_min_priority {
                         Some(local_min) => {
                             local_min
                                 < member_priorities
@@ -1942,6 +2062,16 @@ async fn serve_file(
                         }
                         None => false,
                     };
+                    // #2937: a suppressed Remote member may still serve a Case-A
+                    // distribution — a platform/ABI-distinct wheel of a version
+                    // the owning local already provides — so the requested file
+                    // resolves iff the simple index would have listed it. A
+                    // Case-B request (a remote-only version, or a same-platform
+                    // rebuild of an owned version) stays suppressed and 404s,
+                    // preserving the #1600 dependency-confusion boundary.
+                    if remote_suppressed && owned_profile.admits(filename) {
+                        remote_suppressed = false;
+                    }
                     if member.repo_type == RepositoryType::Remote && !remote_suppressed {
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
@@ -2869,10 +2999,24 @@ fn html_escape(s: &str) -> String {
 // Static regexes (compiled once, reused across requests)
 // ---------------------------------------------------------------------------
 
-static HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r##"<a\s+[^>]*?href="([^"#]+)"##).unwrap());
+// #2967: quote-agnostic + case-insensitive so a single-quoted / uppercase
+// `HREF` upstream anchor cannot slip an un-rewritten off-site href past the
+// proxy render (defense-in-depth behind the Case-A HTML REBUILD). The URL lands
+// in group 1 (double-quoted), 2 (single-quoted), or 3 (unquoted).
+static HREF_RE: Lazy<Regex> = Lazy::new(|| {
+    // Like the historical pattern, the URL is captured up to the first `#` (the
+    // fragment is dropped) and the closing quote is NOT required — a `#sha256=`
+    // fragment sits between the URL and the closing quote. The value lands in
+    // group 1 (double-quoted), 2 (single-quoted), or 3 (unquoted).
+    Regex::new(r##"(?is)<a\s+[^>]*?\bhref\s*=\s*(?:"([^"#]*)|'([^'#]*)|([^\s>#]+))"##).unwrap()
+});
 
-static REWRITE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"<a\s+([^>]*?)href="([^"]+)"([^>]*)>"#).unwrap());
+// URL lands in group 2 (double-quoted), 3 (single-quoted), or 4 (unquoted);
+// group 1 = attributes before `href`, group 5 = attributes after.
+static REWRITE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<a\s+([^>]*?)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))([^>]*)>"#)
+        .unwrap()
+});
 
 static METADATA_ATTR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"\s*data-(?:dist-info-metadata|core-metadata)="[^"]*""#).unwrap());
@@ -2915,7 +3059,12 @@ fn find_upstream_url_for_file(
     index_url: Option<&str>,
 ) -> Option<String> {
     for caps in HREF_RE.captures_iter(index_html) {
-        let href = &caps[1];
+        let href = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .or_else(|| caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
         let href_filename = href.rsplit('/').next().unwrap_or("");
         if href_filename != filename {
             continue;
@@ -3026,8 +3175,15 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     REWRITE_RE
         .replace_all(html, |caps: &regex::Captures| {
             let before_href = &caps[1];
-            let full_url = &caps[2];
-            let after_href = &caps[3];
+            // The href value is in whichever quote-alternation group matched
+            // (double / single / unquoted); `after` is the trailing group.
+            let full_url = caps
+                .get(2)
+                .or_else(|| caps.get(3))
+                .or_else(|| caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            let after_href = caps.get(5).map(|m| m.as_str()).unwrap_or("");
 
             // Split off the fragment (#sha256=...) if present
             let (url_path, fragment) = match full_url.find('#') {
@@ -3229,6 +3385,319 @@ fn merge_local_into_remote_simple_json(
     }
 
     serde_json::to_string(&doc).ok()
+}
+
+// ---------------------------------------------------------------------------
+// #2937: distribution-granular ownership union for virtual PyPI
+// ---------------------------------------------------------------------------
+//
+// The #1600 dependency-confusion guard suppresses a Remote member for a name a
+// higher-priority local member owns, so a public `fastapi==0.119.1` can never
+// shadow an internal `fastapi`. That suppression was name-level coarse and broke
+// two legitimate topologies (#2748):
+//
+//   * Case A (safe to union): the remote holds a platform/ABI-distinct wheel of a
+//     version the local ALREADY owns (local ships the linux `pydantic_core==2.0`
+//     wheel, remote ships the windows wheel of the SAME 2.0). Same trusted
+//     package, different build target — no confusion, so union it.
+//   * Case B (must stay gated): a version present ONLY in the remote for a
+//     locally-owned name (local owns `fastapi==0.119.0`, remote has `0.118.0`).
+//     That is the confusion vector — keep it suppressed unless a `tracks`/opt-in
+//     declaration re-enables the union (handled upstream via
+//     `pypi_virtual_isolates_name` returning `None`).
+//
+// Security invariant (do NOT regress #1600): a Case-A union is admitted ONLY when
+// it is a wheel of a version the local owner already provides AND its
+// compatibility tag is one the owner does not already ship. It can therefore only
+// ADD a build target the owner lacks (windows when the owner only has linux); it
+// can never introduce a version the owner lacks, nor a competing same-platform
+// rebuild of an owned version. The index and download paths make the identical
+// decision so a distribution advertised in the index is downloadable and a
+// suppressed one 404s on both.
+
+/// Per-version record of the wheel compatibility tags a virtual's local owner
+/// already provides for a PEP 503 name, used to admit Case-A remote unions
+/// (#2937).
+#[derive(Debug, Default)]
+struct OwnedWheelProfile {
+    /// owned version -> set of local wheel compat tags (`{py}-{abi}-{platform}`)
+    /// for that version. A version present with an empty tag set is owned only
+    /// via a source distribution, so any remote wheel tag for it is distinct.
+    per_version: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl OwnedWheelProfile {
+    /// Build the profile from the owning local member(s)' distribution
+    /// filenames. Every recognized version is registered as owned (wheels and
+    /// sdists alike); only wheels contribute a compat tag.
+    fn from_filenames<'a>(filenames: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut per_version: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for filename in filenames {
+            let Some(version) = version_from_pypi_filename(filename) else {
+                continue;
+            };
+            let entry = per_version.entry(version).or_default();
+            if let Some(tag) = wheel_compat_tag(filename) {
+                entry.insert(tag);
+            }
+        }
+        Self { per_version }
+    }
+
+    /// Case-A test for one remote distribution filename: it must be a
+    /// PLATFORM-SPECIFIC wheel, of a version the owner already provides, whose
+    /// (case-normalized) compat tag the owner does NOT already ship. Rejected as
+    /// Case B (stay suppressed): sdists, universal `*-none-any` wheels
+    /// (installable everywhere — not a distinct build target, and a vector for a
+    /// lower-priority remote to inject arbitrary code), unowned versions, and
+    /// same-platform rebuilds (including a case-variant of a tag the local
+    /// already ships). Fails closed (rejects) when the shape is unrecognized.
+    fn admits(&self, filename: &str) -> bool {
+        let Some(tag) = wheel_compat_tag(filename) else {
+            return false;
+        };
+        // Exclude universal (pure-python) wheels: platform tag `any`. Case A
+        // only adds a genuinely platform-specific target the owner lacks.
+        if tag.rsplit('-').next() == Some("any") {
+            return false;
+        }
+        let Some(version) = version_from_pypi_filename(filename) else {
+            return false;
+        };
+        match self.per_version.get(&version) {
+            // `tag` and the stored tags are both lowercased by `wheel_compat_tag`,
+            // so a case-variant of the local's own tag compares equal (Case B).
+            Some(local_tags) => !local_tags.contains(&tag),
+            None => false,
+        }
+    }
+}
+
+/// Parse the `{python}-{abi}-{platform}` compatibility tag of a wheel filename
+/// per the binary-distribution spec
+/// (`{distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl`): the
+/// last three `-`-separated fields of the stem, LOWERCASED so the Case-A
+/// comparison is case-insensitive (wheel tags are case-insensitive; a
+/// case-variant must not read as a distinct platform). Returns `None` for
+/// non-wheels (an sdist has no platform tag) or malformed names.
+fn wheel_compat_tag(filename: &str) -> Option<String> {
+    let stem = filename.strip_suffix(".whl")?;
+    let parts: Vec<&str> = stem.split('-').collect();
+    // name, version, [build], python, abi, platform => at least five fields.
+    if parts.len() < 5 {
+        return None;
+    }
+    Some(parts[parts.len() - 3..].join("-").to_ascii_lowercase())
+}
+
+/// Narrow a suppressed Remote member's contribution to Case-A distributions
+/// (#2937): return a body containing only the entries `owned.admits` accepts.
+///
+/// SECURITY (#2967 R4). The routing decision is made on the SNIFFED body, never
+/// the upstream `Content-Type`. A hostile / quirky upstream can label an HTML
+/// body `application/json` (or vice-versa); trusting the header let a mislabeled
+/// HTML index skip the ownership filter and fall through to the in-place
+/// `rewrite_upstream_urls` rewriter, delivering a raw off-site href to `pip`
+/// (dependency confusion for a locally-owned name). Sniffing the actual bytes
+/// picks the correct filter regardless of the header. Any body that is neither
+/// recognizable PEP 691 JSON nor PEP 503 HTML fails closed to an EMPTY PEP 691
+/// listing — never the raw upstream bytes.
+fn case_a_filter_remote_body(
+    content: &[u8],
+    owned: &OwnedWheelProfile,
+    repo_key: &str,
+    normalized: &str,
+) -> Bytes {
+    let body = String::from_utf8_lossy(content);
+    let filtered = match sniff_simple_index(content) {
+        SniffedSimpleIndex::Json => filter_remote_case_a_json(&body, owned, normalized),
+        SniffedSimpleIndex::Html => filter_remote_case_a_html(&body, owned, repo_key, normalized),
+        SniffedSimpleIndex::Binary => empty_pep691_listing(normalized),
+    };
+    Bytes::from(filtered)
+}
+
+/// An empty PEP 691 simple-index listing for `normalized` — the fail-closed body
+/// for a locally-owned name whose suppressed Remote member returned a body that
+/// could not be ownership-filtered (#2967 R4). Mirrors the PEP 691 shape the
+/// merge path expects (`meta`/`name`/`versions`/`files`) so the local splice
+/// still runs, and guarantees no raw upstream byte is ever surfaced.
+fn empty_pep691_listing(normalized: &str) -> String {
+    serde_json::json!({
+        "meta": {"api-version": "1.0"},
+        "name": normalized,
+        "versions": [],
+        "files": [],
+    })
+    .to_string()
+}
+
+/// Drop every file from a Remote member's PEP 691 JSON simple index that is not
+/// a Case-A union candidate, and re-advertise `versions` from the survivors so
+/// the listing never names a version no surviving file backs (#2937).
+///
+/// SECURITY (#2967 R4): FAILS CLOSED. A body that is not valid PEP 691 JSON (or
+/// carries no `files` array) yields an EMPTY listing — NEVER the verbatim input.
+/// Returning the raw body here was the bypass: an HTML index mislabeled
+/// `application/json` was echoed back unfiltered and then rewritten in place,
+/// leaking an off-site href for a locally-owned name.
+fn filter_remote_case_a_json(json: &str, owned: &OwnedWheelProfile, normalized: &str) -> String {
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(json) else {
+        return empty_pep691_listing(normalized);
+    };
+    let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
+        return empty_pep691_listing(normalized);
+    };
+    files.retain(|f| {
+        f.get("filename")
+            .and_then(|n| n.as_str())
+            .map(|n| owned.admits(n))
+            .unwrap_or(false)
+    });
+    // Rebuild `versions` from the surviving files so the index cannot advertise
+    // a version only the remote has for a locally-owned name.
+    let versions: std::collections::BTreeSet<String> = doc
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f.get("filename").and_then(|n| n.as_str()))
+                .filter_map(version_from_pypi_filename)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert(
+            "versions".to_owned(),
+            serde_json::Value::Array(
+                versions
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::to_string(&doc).unwrap_or_else(|_| empty_pep691_listing(normalized))
+}
+
+/// HTML sibling of [`filter_remote_case_a_json`] (#2937): reduce a suppressed
+/// Remote member's PEP 503 HTML simple index to its Case-A union candidates by
+/// REBUILDING a fresh index from parsed anchors — never by editing the raw
+/// upstream in place.
+///
+/// SECURITY. A span-replacing filter is fundamentally leaky: an UNCLOSED or
+/// malformed anchor (no `</a>`, `</a >`, `</ a>`, …) is not a matched span, so
+/// it passes through untouched, and combined with a quote/case gap in any later
+/// URL rewriter it delivers a raw off-site href to the client (#2967 R3, the
+/// #1600 class). This function instead scans anchor START-tags only (`<a ...>`
+/// with NO required `</a>`, so unclosed/malformed anchors are covered); extracts
+/// the `href` quote-agnostically and case-insensitively (double, single, or
+/// unquoted; minimal-entity-decoded; query/fragment stripped) and derives the
+/// file identity from its URL basename — never the anchor text; admits Case-A
+/// wheels of that basename; and emits a FRESH minimal PEP 503 document
+/// containing ONLY Artifact-Keeper-pathed anchors for the survivors.
+///
+/// No raw upstream anchor (closed or not, any quote style or letter case) ever
+/// reaches the client, and every emitted href is an AK path the download gate
+/// keys on — so the index stays symmetric with the download route.
+fn filter_remote_case_a_html(
+    html: &str,
+    owned: &OwnedWheelProfile,
+    repo_key: &str,
+    normalized: &str,
+) -> String {
+    static ANCHOR_START: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<a\b[^>]*>").unwrap());
+    static HREF_ATTR: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap());
+
+    let mut survivors = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for tag in ANCHOR_START.find_iter(html) {
+        let Some(href_caps) = HREF_ATTR.captures(tag.as_str()) else {
+            continue;
+        };
+        let href_raw = href_caps
+            .get(1)
+            .or_else(|| href_caps.get(2))
+            .or_else(|| href_caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        let href = decode_html_entities_minimal(href_raw);
+        // File identity = URL basename (never the anchor text). Keep the upstream
+        // sha256 fragment so pip can verify the bytes AK proxies; strip the
+        // fragment and any query before taking the basename.
+        let fragment = match href.find('#') {
+            Some(pos) => &href[pos..],
+            None => "",
+        };
+        let url_part = href.split('#').next().unwrap_or(&href);
+        let url_no_query = url_part.split('?').next().unwrap_or(url_part);
+        let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
+        if filename.is_empty() || !owned.admits(filename) {
+            continue;
+        }
+        if !seen.insert(filename.to_string()) {
+            continue;
+        }
+        // AK path ONLY — no upstream host survives. filename + fragment are
+        // escaped so neither can break out of the attribute.
+        survivors.push_str(&format!(
+            "<a href=\"/pypi/{}/simple/{}/{}{}\">{}</a><br/>\n",
+            repo_key,
+            normalized,
+            html_escape(filename),
+            html_escape(fragment),
+            html_escape(filename),
+        ));
+    }
+
+    // Fresh minimal PEP 503 document: only AK-pathed survivor anchors. The local
+    // splice (`merge_local_into_remote_simple_html`) inserts before `</body>`
+    // and `tracks` metas before `</head>`, so both markers are present.
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta name=\"pypi:repository-version\" content=\"1.0\"/>\n</head>\n<body>\n{survivors}</body>\n</html>\n"
+    )
+}
+
+/// Build the owning local member(s)' [`OwnedWheelProfile`] for a normalized PEP
+/// 503 name by querying every local/staging member of the virtual repo for the
+/// distribution filenames it holds (#2937). Shares the source of truth with the
+/// simple-index first pass so the index and download paths admit the identical
+/// set of Case-A unions. Fails closed to an empty profile (suppress everything)
+/// on DB error.
+async fn pypi_owned_wheel_profile(
+    db: &PgPool,
+    members: &[crate::models::repository::Repository],
+    normalized: &str,
+) -> OwnedWheelProfile {
+    let local_ids: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| matches!(m.repo_type, RepositoryType::Local | RepositoryType::Staging))
+        .map(|m| m.id)
+        .collect();
+    if local_ids.is_empty() {
+        return OwnedWheelProfile::default();
+    }
+    let rows = sqlx::query!(
+        r#"
+        SELECT a.path
+        FROM artifacts a
+        WHERE a.repository_id = ANY($1)
+          AND a.is_deleted = false
+          AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2
+        "#,
+        &local_ids,
+        normalized
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    OwnedWheelProfile::from_filenames(
+        rows.iter()
+            .map(|r| r.path.rsplit('/').next().unwrap_or(r.path.as_str())),
+    )
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -4173,6 +4642,314 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(meta_tracks, vec!["https://pypi.org/simple/pkg/"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2937: distribution-granular ownership union (Case A) vs suppression
+    // (Case B) for a locally-owned virtual PyPI name.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wheel_compat_tag_parses_platform_triple() {
+        assert_eq!(
+            wheel_compat_tag("pydantic_core-2.0-cp39-cp39-manylinux_2_17_x86_64.whl").as_deref(),
+            Some("cp39-cp39-manylinux_2_17_x86_64")
+        );
+        assert_eq!(
+            wheel_compat_tag("pydantic_core-2.0-cp39-cp39-win_amd64.whl").as_deref(),
+            Some("cp39-cp39-win_amd64")
+        );
+        // Optional build tag is tolerated: the last three fields are the tag.
+        assert_eq!(
+            wheel_compat_tag("pkg-1.0-1-py3-none-any.whl").as_deref(),
+            Some("py3-none-any")
+        );
+        // Sdists and malformed names have no platform tag.
+        assert_eq!(wheel_compat_tag("pydantic_core-2.0.tar.gz"), None);
+        assert_eq!(wheel_compat_tag("weird.whl"), None);
+    }
+
+    fn linux_owner_profile() -> OwnedWheelProfile {
+        // Local owner ships only the linux wheel of 2.0 (Case-A backdrop).
+        OwnedWheelProfile::from_filenames(["pydantic_core-2.0-cp39-cp39-manylinux_2_17_x86_64.whl"])
+    }
+
+    #[test]
+    fn test_owned_profile_admits_case_a_rejects_case_b() {
+        let owned = linux_owner_profile();
+        // Case A: windows wheel of the version the local ALREADY owns -> union.
+        assert!(owned.admits("pydantic_core-2.0-cp39-cp39-win_amd64.whl"));
+        // Case B: a version only the remote has -> stay suppressed.
+        assert!(!owned.admits("pydantic_core-1.9-cp39-cp39-win_amd64.whl"));
+        // Same-platform rebuild of an owned version -> confusion vector, reject.
+        assert!(!owned.admits("pydantic_core-2.0-cp39-cp39-manylinux_2_17_x86_64.whl"));
+        // An sdist of an owned version is NOT platform-distinct -> reject.
+        assert!(!owned.admits("pydantic_core-2.0.tar.gz"));
+    }
+
+    #[test]
+    fn test_owned_profile_sdist_only_owner_admits_any_platform_wheel() {
+        // Owner holds only an sdist of 2.0 (no compat tags): any remote wheel of
+        // 2.0 is platform-distinct, but a remote-only version stays suppressed.
+        let owned = OwnedWheelProfile::from_filenames(["pydantic_core-2.0.tar.gz"]);
+        assert!(owned.admits("pydantic_core-2.0-cp39-cp39-win_amd64.whl"));
+        assert!(!owned.admits("pydantic_core-3.0-cp39-cp39-win_amd64.whl"));
+    }
+
+    #[test]
+    fn test_filter_remote_case_a_json_keeps_owned_platform_wheel_drops_other_version() {
+        let owned = linux_owner_profile();
+        // Remote advertises: a windows wheel of the owned 2.0 (Case A, keep) and
+        // a whole other version 1.9 (Case B, drop).
+        let remote = r#"{
+            "meta": {"api-version": "1.1"},
+            "name": "pydantic-core",
+            "versions": ["1.9", "2.0"],
+            "files": [
+                {"filename": "pydantic_core-2.0-cp39-cp39-win_amd64.whl",
+                 "url": "https://files/pydantic_core-2.0-cp39-cp39-win_amd64.whl",
+                 "hashes": {"sha256": "w"}},
+                {"filename": "pydantic_core-1.9-cp39-cp39-win_amd64.whl",
+                 "url": "https://files/pydantic_core-1.9-cp39-cp39-win_amd64.whl",
+                 "hashes": {"sha256": "o"}}
+            ]
+        }"#;
+        let out = filter_remote_case_a_json(remote, &owned, "pydantic-core");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let files = doc["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "only the Case-A windows wheel survives");
+        assert_eq!(
+            files[0]["filename"],
+            "pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+        );
+        // versions[] is rebuilt from survivors: the remote-only 1.9 is gone.
+        let versions: Vec<&str> = doc["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["2.0"],
+            "remote-only version must not surface"
+        );
+    }
+
+    #[test]
+    fn test_filter_remote_case_a_html_keeps_owned_platform_wheel_drops_other_version() {
+        let owned = linux_owner_profile();
+        let remote = concat!(
+            "<!DOCTYPE html><html><head></head><body>\n",
+            "<a href=\"https://files/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "<a href=\"https://files/pydantic_core-1.9-cp39-cp39-win_amd64.whl\">pydantic_core-1.9-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "</body></html>\n"
+        );
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        // Case-A survivor is re-emitted as an AK path (no offsite host), fragment preserved.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa"
+            ),
+            "Case-A wheel re-emitted as an AK path: {out}"
+        );
+        assert!(
+            !out.contains("https://files"),
+            "no offsite href survives: {out}"
+        );
+        assert!(
+            !out.contains("pydantic_core-1.9-cp39-cp39-win_amd64.whl"),
+            "Case-B remote-only version dropped: {out}"
+        );
+    }
+
+    // HIGH regression (#2967 red-team): a hostile upstream whose anchor TEXT is
+    // an admitted owned-version wheel but whose HREF (single-quoted / uppercase /
+    // text != href) points off-site at a remote-only version must NOT leak that
+    // off-site URL nor surface the remote-only version. Membership is decided on
+    // the href basename and every survivor is re-emitted as an AK path.
+    #[test]
+    fn test_filter_remote_case_a_html_href_based_defeats_text_spoof() {
+        let owned = linux_owner_profile();
+        let remote = concat!(
+            "<body>\n",
+            // text = admitted owned wheel, href (single-quoted) = remote-only 1.9 off-site.
+            "<a href='http://evil/files/pydantic_core-1.9-cp39-cp39-win_amd64.whl#sha256=bad'>pydantic_core-2.0-cp99-cp99-win_amd64.whl</a><br/>\n",
+            // uppercase HREF, double-quoted, also a remote-only version off-site.
+            "<A HREF=\"http://evil/files/pydantic_core-7.7-cp39-cp39-win_amd64.whl\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</A><br/>\n",
+            // a genuine Case-A anchor (href basename is the owned-version windows wheel).
+            "<a href=\"http://mirror/pydantic_core-2.0-cp39-cp39-win_amd64.whl\">whatever</a><br/>\n",
+            "</body>\n"
+        );
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        // No off-site host, in any form.
+        assert!(
+            !out.contains("evil"),
+            "off-site href must not survive: {out}"
+        );
+        assert!(
+            !out.contains("mirror"),
+            "off-site href must not survive: {out}"
+        );
+        assert!(!out.contains("http://"), "no absolute URL survives: {out}");
+        // Remote-only versions (from the spoofed hrefs) must not surface at all.
+        assert!(
+            !out.contains("1.9"),
+            "remote-only 1.9 must not surface: {out}"
+        );
+        assert!(
+            !out.contains("7.7"),
+            "remote-only 7.7 must not surface: {out}"
+        );
+        // The genuine Case-A wheel (decided on its href basename) IS re-emitted as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "genuine Case-A wheel re-emitted as AK path: {out}"
+        );
+    }
+
+    // HIGH regression R3 (#2967 round 3): a span-replace filter left UNCLOSED and
+    // MALFORMED anchors untouched. The REBUILD covers every anchor shape —
+    // unclosed (no `</a>`), `</a >` / `</ a>`, uppercase, single/double-quoted,
+    // and UNQUOTED — all pointing off-site at remote-only versions must be
+    // dropped, and only genuine Case-A wheels survive as AK paths.
+    #[test]
+    fn test_filter_remote_case_a_html_rebuild_covers_unclosed_and_all_quote_shapes() {
+        let owned = linux_owner_profile();
+        let remote = concat!(
+            "<body>\n",
+            // 1) UNCLOSED single-quoted anchor, off-site remote-only 1.9.
+            "<a href='http://evil/pydantic_core-1.9-cp39-cp39-win_amd64.whl'>\n",
+            // 2) UNCLOSED uppercase double-quoted anchor, off-site remote-only 9.9.
+            "<A HREF=\"http://evil/pydantic_core-9.9-cp39-cp39-win_amd64.whl\">\n",
+            // 3) malformed close `</a >`, off-site remote-only 8.8.
+            "<a href=\"http://evil/pydantic_core-8.8-cp39-cp39-win_amd64.whl\">x</a >\n",
+            // 4) malformed close `</ a>`, off-site remote-only 6.6.
+            "<a href=\"http://evil/pydantic_core-6.6-cp39-cp39-win_amd64.whl\">y</ a>\n",
+            // 5) UNQUOTED off-site remote-only 5.5.
+            "<a href=http://evil/pydantic_core-5.5-cp39-cp39-win_amd64.whl>z</a>\n",
+            // 6) genuine Case-A: unquoted href basename is the owned windows wheel.
+            "<a href=http://mirror/pydantic_core-2.0-cp39-cp39-win_amd64.whl>ok</a>\n",
+            "</body>\n"
+        );
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        assert!(!out.contains("http://"), "no absolute URL survives: {out}");
+        assert!(!out.contains("evil"), "no off-site host survives: {out}");
+        assert!(!out.contains("mirror"), "no off-site host survives: {out}");
+        for v in ["1.9", "9.9", "8.8", "6.6", "5.5"] {
+            assert!(!out.contains(v), "remote-only {v} must not surface: {out}");
+        }
+        // Only the genuine Case-A wheel survives, as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "genuine Case-A wheel re-emitted as AK path: {out}"
+        );
+    }
+
+    // Defense-in-depth (#2967): rewrite_upstream_urls now rewrites single-quoted
+    // and uppercase-`HREF` upstream anchors too, so no off-site href survives the
+    // proxy render even outside the suppressed-member rebuild path.
+    #[test]
+    fn test_rewrite_upstream_urls_handles_single_quote_and_uppercase() {
+        let html = concat!(
+            "<a href='https://files.pythonhosted.org/x/pkg-1.0.whl#sha256=aa'>pkg-1.0.whl</a>\n",
+            "<A HREF=\"https://files.pythonhosted.org/y/pkg-2.0.whl\">pkg-2.0.whl</A>\n",
+            "<a href=https://files.pythonhosted.org/z/pkg-3.0.whl>pkg-3.0.whl</a>\n"
+        );
+        let out = rewrite_upstream_urls(html, "repo", "pkg");
+        assert!(
+            !out.contains("files.pythonhosted.org"),
+            "offsite host rewritten: {out}"
+        );
+        assert!(
+            out.contains("/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=aa"),
+            "{out}"
+        );
+        assert!(out.contains("/pypi/repo/simple/pkg/pkg-2.0.whl"), "{out}");
+        assert!(out.contains("/pypi/repo/simple/pkg/pkg-3.0.whl"), "{out}");
+    }
+
+    #[test]
+    fn test_case_a_filter_remote_body_dispatch_sniffs_and_fails_closed() {
+        let owned = linux_owner_profile();
+        let json = r#"{"meta":{"api-version":"1.1"},"name":"p","versions":["2.0"],
+            "files":[{"filename":"pydantic_core-2.0-cp39-cp39-win_amd64.whl","url":"u","hashes":{"sha256":"w"}}]}"#;
+        // Genuine PEP 691 JSON is sniffed to JSON and filtered.
+        let out = case_a_filter_remote_body(json.as_bytes(), &owned, "virt", "p");
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["files"].as_array().unwrap().len(), 1);
+        // Unparseable body -> empty PEP 691 listing (fail closed, never leak raw
+        // remote bytes).
+        let out = case_a_filter_remote_body(b"\x00\x01binary", &owned, "virt", "p");
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(doc["files"].as_array().unwrap().is_empty());
+        assert_eq!(doc["name"], "p");
+    }
+
+    // #2967 R4 (CRITICAL bypass): an HTML index MISLABELED
+    // `Content-Type: application/json`. The old code trusted `ct.contains("json")`
+    // and echoed the HTML body verbatim (`return json.to_string()`), which the
+    // render fallthrough then sniffed as HTML and served through the in-place
+    // `rewrite_upstream_urls` rewriter with NO ownership filter — leaking an
+    // off-site href for a locally-owned name. The dispatch now SNIFFS the body,
+    // routes the HTML through the ownership rebuild, and emits ONLY AK paths.
+    #[test]
+    fn test_case_a_filter_remote_body_mislabeled_json_html_body_is_ownership_filtered() {
+        let owned = linux_owner_profile(); // owns pydantic_core 2.0 linux
+        let html_labeled_json = concat!(
+            "<!DOCTYPE html><html><body>\n",
+            // Genuine Case-A: owned version 2.0, distinct win platform, href back to
+            // the mirror. Must UNION as an AK path.
+            "<a href=\"http://mirror/files/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</a><br/>\n",
+            // Off-site, remote-only Case-B (9.9) with a `>` INSIDE a prior `title`
+            // attribute — the exact anchor the in-place rewriter leaked verbatim
+            // (its `[^>]*?` stops before `href`). Must be dropped entirely.
+            "<a title=\"x>y\" href=\"https://evil.example/pydantic_core-9.9-cp39-cp39-win_amd64.whl#sha256=cc\">pydantic_core-9.9-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "</body></html>\n"
+        );
+        let out = case_a_filter_remote_body(
+            html_labeled_json.as_bytes(),
+            &owned,
+            "virt",
+            "pydantic-core",
+        );
+        let out = String::from_utf8_lossy(&out);
+        // No off-site host survives, in any form.
+        assert!(!out.contains("evil.example"), "off-site href leaked: {out}");
+        assert!(!out.contains("mirror"), "off-site href leaked: {out}");
+        assert!(!out.contains("http://"), "absolute URL survived: {out}");
+        assert!(!out.contains("https://"), "absolute URL survived: {out}");
+        // Case-B remote-only version must not surface.
+        assert!(
+            !out.contains("9.9"),
+            "remote-only Case-B version leaked: {out}"
+        );
+        // The genuine Case-A wheel IS re-emitted as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "Case-A wheel not re-emitted as AK path: {out}"
+        );
+    }
+
+    // MEDIUM regression (#2967 red-team): admits() must reject a universal
+    // `*-none-any` wheel (installable everywhere, not a distinct build target)
+    // and a case-variant of a tag the local already ships (same platform).
+    #[test]
+    fn test_owned_profile_admits_tightened_universal_and_case_variant() {
+        let owned = linux_owner_profile(); // local ships cp39-cp39-manylinux_2_17_x86_64
+                                           // Universal pure-python wheel of the owned version -> NOT a platform build.
+        assert!(!owned.admits("pydantic_core-2.0-py3-none-any.whl"));
+        assert!(!owned.admits("pydantic_core-2.0-py2.py3-none-any.whl"));
+        // Case-variant of the local's own tag -> same platform, Case B.
+        assert!(!owned.admits("pydantic_core-2.0-cp39-cp39-MANYLINUX_2_17_X86_64.whl"));
+        // A genuinely new platform-specific target of the owned version is still Case A.
+        assert!(owned.admits("pydantic_core-2.0-cp39-cp39-win_amd64.whl"));
     }
 
     #[test]
