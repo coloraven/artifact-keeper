@@ -442,6 +442,8 @@ pub fn router() -> Router<SharedState> {
         )
         // Deduplicated storage accounting (logical/physical/unique/shared) (#2056)
         .route("/:key/storage", get(get_repository_storage))
+        // Per-prefix (folder tree) storage rollup (#2601)
+        .route("/:key/storage/tree", get(get_repository_storage_tree))
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
         // npm scope policy for Remote members of npm virtual repositories (#2327)
@@ -3025,6 +3027,235 @@ pub async fn get_repository_storage(
     };
 
     Ok(Json(response))
+}
+
+/// Query parameters for the per-prefix storage tree (#2601).
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct StorageTreeQuery {
+    /// Folder prefix to root the listing at (`''`/absent = repository root).
+    /// Leading/trailing slashes are ignored.
+    pub prefix: Option<String>,
+    /// How many tree levels below `prefix` to return (default 1 = immediate
+    /// children, clamped to 1..=5).
+    pub depth: Option<i32>,
+    /// Maximum number of descendant nodes returned (default 200, clamped to
+    /// 1..=1000). `truncated` is set when the limit cut the listing.
+    pub limit: Option<i64>,
+}
+
+/// Levels below the requested prefix a single tree call may return.
+const STORAGE_TREE_MAX_QUERY_DEPTH: i32 = 5;
+/// Hard cap on descendant nodes per tree call (million-artifact guard, #2516).
+const STORAGE_TREE_MAX_LIMIT: i64 = 1000;
+const STORAGE_TREE_DEFAULT_LIMIT: i64 = 200;
+
+/// Clamp the requested levels-below-prefix to 1..=[`STORAGE_TREE_MAX_QUERY_DEPTH`].
+fn clamp_tree_depth(depth: Option<i32>) -> i32 {
+    depth.unwrap_or(1).clamp(1, STORAGE_TREE_MAX_QUERY_DEPTH)
+}
+
+/// Clamp the requested node limit to 1..=[`STORAGE_TREE_MAX_LIMIT`].
+fn clamp_tree_limit(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(STORAGE_TREE_DEFAULT_LIMIT)
+        .clamp(1, STORAGE_TREE_MAX_LIMIT)
+}
+
+/// One folder node in the per-prefix storage rollup (#2601).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StorageTreeNode {
+    /// Canonical prefix (no leading/trailing `/`; `''` = repository root).
+    pub prefix: String,
+    /// Number of path segments in `prefix` (0 = root).
+    pub depth: i32,
+    /// Sum over every artifact/proxy-cache reference under this prefix.
+    pub logical_bytes: i64,
+    /// Deduplicated within this repository: each distinct physical object
+    /// under the prefix counted once. Because an object shared by two sibling
+    /// subtrees counts once in each but once at their common ancestor, the sum
+    /// of children's `physical_bytes` can exceed the parent's — the difference
+    /// is the cross-subtree dedup saving.
+    pub physical_bytes: i64,
+    /// References (artifact/proxy-cache rows) under this prefix.
+    pub file_count: i64,
+    /// Distinct physical objects under this prefix.
+    pub blob_count: i64,
+}
+
+/// Per-prefix (folder tree) storage rollup response (#2601).
+///
+/// All figures are read from the materialized `repository_path_storage_stats`
+/// cache (refreshed on the storage-stats schedule + post-GC) — a tree call is
+/// an index scan over pre-aggregated rows, never a walk of the artifact table.
+///
+/// Every figure is within-repository only (references this repo holds), so
+/// unlike the repo-level endpoint's cross-tenant-derivable dedup breakdown
+/// (#2560) nothing here needs an admin restriction beyond repo visibility.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepositoryStorageTreeResponse {
+    pub repository_key: String,
+    /// The node the listing is rooted at (zeros when the prefix has no
+    /// materialized data — unknown folder or refresher not yet run).
+    pub node: StorageTreeNode,
+    /// Descendant folder nodes, up to `depth` levels below `node`, largest
+    /// `logical_bytes` first.
+    pub children: Vec<StorageTreeNode>,
+    /// True when `limit` cut the descendant listing.
+    pub truncated: bool,
+    /// Bytes referenced by this repository that carry no logical path and so
+    /// cannot be placed in the tree (today: OCI layer blobs; the blob→image
+    /// edge lives only in manifest content). Root-level figure; present only
+    /// when the request is rooted at `''`. `node.logical_bytes +
+    /// unattributed_bytes` reconciles with the repo-level logical total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unattributed_bytes: Option<i64>,
+    /// Folder levels below the root that are individually materialized;
+    /// deeper files roll up into their ancestor at this depth.
+    pub max_materialized_depth: i32,
+    /// When the rollup was last recomputed. `null` before the first refresh.
+    pub computed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Get the per-prefix (folder tree) storage rollup for a repository (#2601).
+///
+/// Returns the requested prefix's own rollup plus its descendant folder nodes
+/// (default: immediate children) from the materialized per-prefix cache. Same
+/// visibility rules as `get_repository`: public repos and repo members pass;
+/// everyone else gets an existence-hiding 404.
+#[utoipa::path(
+    get,
+    path = "/{key}/storage/tree",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        StorageTreeQuery,
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Per-prefix storage rollup", body = RepositoryStorageTreeResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_repository_storage_tree(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<StorageTreeQuery>,
+) -> Result<Json<RepositoryStorageTreeResponse>> {
+    use crate::services::storage_stats_service::{
+        normalize_prefix, prefix_depth, MAX_MATERIALIZED_PATH_DEPTH,
+    };
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_visible(&repo, &auth, &service).await?;
+
+    let prefix = normalize_prefix(query.prefix.as_deref().unwrap_or(""));
+    let root_depth = prefix_depth(&prefix);
+    let levels = clamp_tree_depth(query.depth);
+    let limit = clamp_tree_limit(query.limit);
+
+    // The rooted node's own rollup (with the root-only unattributed figure).
+    let node_row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)>(
+        r#"
+        SELECT logical_bytes, physical_bytes, file_count, blob_count,
+               unattributed_bytes, computed_at
+          FROM repository_path_storage_stats
+         WHERE repository_id = $1 AND prefix = $2
+        "#,
+    )
+    .bind(repo.id)
+    .bind(&prefix)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Descendants: depth-bounded range under the prefix. Fetch limit+1 to
+    // detect truncation without a second COUNT pass.
+    let like_pattern = if prefix.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{}/%",
+            crate::api::handlers::escape_like_literal(&prefix)
+        ))
+    };
+    let child_rows = sqlx::query_as::<_, (String, i32, i64, i64, i64, i64)>(
+        r#"
+        SELECT prefix, depth, logical_bytes, physical_bytes, file_count, blob_count
+          FROM repository_path_storage_stats
+         WHERE repository_id = $1
+           AND depth > $2 AND depth <= $3
+           AND ($4::text IS NULL OR prefix LIKE $4)
+         ORDER BY logical_bytes DESC, prefix ASC
+         LIMIT $5
+        "#,
+    )
+    .bind(repo.id)
+    .bind(root_depth)
+    .bind(root_depth.saturating_add(levels))
+    .bind(&like_pattern)
+    .bind(limit + 1)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let truncated = child_rows.len() as i64 > limit;
+    let children: Vec<StorageTreeNode> = child_rows
+        .into_iter()
+        .take(limit as usize)
+        .map(
+            |(prefix, depth, logical_bytes, physical_bytes, file_count, blob_count)| {
+                StorageTreeNode {
+                    prefix,
+                    depth,
+                    logical_bytes,
+                    physical_bytes,
+                    file_count,
+                    blob_count,
+                }
+            },
+        )
+        .collect();
+
+    let (node, unattributed_bytes, computed_at) = match node_row {
+        Some((logical, physical, files, blobs, unattributed, at)) => (
+            StorageTreeNode {
+                prefix: prefix.clone(),
+                depth: root_depth,
+                logical_bytes: logical,
+                physical_bytes: physical,
+                file_count: files,
+                blob_count: blobs,
+            },
+            (root_depth == 0).then_some(unattributed),
+            Some(at),
+        ),
+        // Unknown prefix or refresher not yet run: zeros, no freshness marker.
+        None => (
+            StorageTreeNode {
+                prefix: prefix.clone(),
+                depth: root_depth,
+                logical_bytes: 0,
+                physical_bytes: 0,
+                file_count: 0,
+                blob_count: 0,
+            },
+            (root_depth == 0).then_some(0),
+            None,
+        ),
+    };
+
+    Ok(Json(RepositoryStorageTreeResponse {
+        repository_key: repo.key,
+        node,
+        children,
+        truncated,
+        unattributed_bytes,
+        max_materialized_depth: MAX_MATERIALIZED_PATH_DEPTH,
+        computed_at,
+    }))
 }
 
 /// Update repository
@@ -8698,6 +8929,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         create_repository,
         get_repository,
         get_repository_storage,
+        get_repository_storage_tree,
         update_repository,
         delete_repository,
         set_cache_ttl,
@@ -8731,6 +8963,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryResponse,
         RepositoryListResponse,
         RepositoryStorageStatsResponse,
+        StorageTreeQuery,
+        StorageTreeNode,
+        RepositoryStorageTreeResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
         SetNpmScopePolicyRequest,
@@ -8923,6 +9158,397 @@ mod tests {
         assert_eq!(json["logical_bytes"], 54033);
         assert_eq!(json["blob_count"], 4);
         assert_eq!(json["dedup_scope"], "instance");
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-prefix storage tree (#2601): query clamps + response serde.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn storage_tree_depth_clamps_to_bounds() {
+        assert_eq!(clamp_tree_depth(None), 1, "default is immediate children");
+        assert_eq!(clamp_tree_depth(Some(0)), 1);
+        assert_eq!(clamp_tree_depth(Some(-3)), 1);
+        assert_eq!(clamp_tree_depth(Some(3)), 3);
+        assert_eq!(clamp_tree_depth(Some(999)), STORAGE_TREE_MAX_QUERY_DEPTH);
+    }
+
+    #[test]
+    fn storage_tree_limit_clamps_to_bounds() {
+        assert_eq!(clamp_tree_limit(None), STORAGE_TREE_DEFAULT_LIMIT);
+        assert_eq!(clamp_tree_limit(Some(0)), 1);
+        assert_eq!(clamp_tree_limit(Some(-5)), 1);
+        assert_eq!(clamp_tree_limit(Some(50)), 50);
+        assert_eq!(clamp_tree_limit(Some(1_000_000)), STORAGE_TREE_MAX_LIMIT);
+    }
+
+    #[test]
+    fn storage_tree_response_omits_unattributed_off_root() {
+        // `unattributed_bytes` is a root-only figure: present (even when 0) at
+        // the root, absent entirely when the listing is rooted at a subfolder.
+        let node = |prefix: &str, depth: i32| StorageTreeNode {
+            prefix: prefix.into(),
+            depth,
+            logical_bytes: 100,
+            physical_bytes: 80,
+            file_count: 2,
+            blob_count: 1,
+        };
+        let root = RepositoryStorageTreeResponse {
+            repository_key: "demo".into(),
+            node: node("", 0),
+            children: vec![node("a", 1)],
+            truncated: false,
+            unattributed_bytes: Some(0),
+            max_materialized_depth:
+                crate::services::storage_stats_service::MAX_MATERIALIZED_PATH_DEPTH,
+            computed_at: None,
+        };
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["unattributed_bytes"], 0);
+        assert_eq!(json["children"][0]["prefix"], "a");
+
+        let sub = RepositoryStorageTreeResponse {
+            repository_key: "demo".into(),
+            node: node("a", 1),
+            children: vec![],
+            truncated: true,
+            unattributed_bytes: None,
+            max_materialized_depth:
+                crate::services::storage_stats_service::MAX_MATERIALIZED_PATH_DEPTH,
+            computed_at: None,
+        };
+        let json = serde_json::to_value(&sub).unwrap();
+        assert!(
+            json.get("unattributed_bytes").is_none(),
+            "root-only figure must be absent off-root, not null"
+        );
+        assert_eq!(json["truncated"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-prefix storage tree (#2601): DB-backed handler matrix. Each test
+    // seeds its own uniquely-keyed repository, rebuilds the materialized
+    // rollup, and drives `get_repository_storage_tree` directly. Skips
+    // cleanly with no DATABASE_URL (the `tdh::try_pool()` convention).
+    // -----------------------------------------------------------------------
+
+    /// Seed one path-bearing artifact row with a unique CAS storage key.
+    async fn seed_tree_artifact(pool: &sqlx::PgPool, repo_id: Uuid, path: &str, size: i64) {
+        sqlx::query(
+            "INSERT INTO artifacts \
+                 (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                  content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, $3, $4, repeat('b', 64), \
+                     'application/octet-stream', $5, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(path)
+        .bind(size)
+        .bind(format!("cas/tree/{}", Uuid::new_v4()))
+        .execute(pool)
+        .await
+        .expect("seed tree artifact");
+    }
+
+    /// Rebuild the materialized per-prefix rollup the handler reads.
+    async fn rebuild_tree_stats(pool: &sqlx::PgPool) {
+        crate::api::handlers::test_db_helpers::recompute_storage_stats_with_retry(pool, false)
+            .await;
+    }
+
+    /// Drive the tree handler directly, as the router would.
+    async fn call_tree(
+        state: &SharedState,
+        auth: Option<AuthExtension>,
+        key: &str,
+        prefix: Option<&str>,
+        depth: Option<i32>,
+        limit: Option<i64>,
+    ) -> Result<RepositoryStorageTreeResponse> {
+        get_repository_storage_tree(
+            State(state.clone()),
+            Extension(auth),
+            Path(key.to_string()),
+            Query(StorageTreeQuery {
+                prefix: prefix.map(str::to_string),
+                depth,
+                limit,
+            }),
+        )
+        .await
+        .map(|json| json.0)
+    }
+
+    /// Root + subfolder rollups reconcile with the seeded reality; the
+    /// root-only `unattributed_bytes` figure and prefix normalization behave;
+    /// an unknown prefix yields zeros with no freshness marker.
+    #[tokio::test]
+    async fn storage_tree_rollup_reconciles_with_seeded_reality_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        seed_tree_artifact(&pool, repo_id, "libs/app/a.jar", 100).await;
+        seed_tree_artifact(&pool, repo_id, "libs/app/b.jar", 50).await;
+        seed_tree_artifact(&pool, repo_id, "libs/core/c.jar", 25).await;
+        seed_tree_artifact(&pool, repo_id, "top.txt", 10).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let member = tdh::make_auth(user_id, &username);
+
+        // Root listing: totals reconcile, immediate children only (depth
+        // default 1), unattributed present (0 — no OCI layers) at root only.
+        let root = call_tree(&state, Some(member.clone()), &key, None, None, None)
+            .await
+            .expect("root tree");
+        assert_eq!(root.repository_key, key);
+        assert_eq!(root.node.prefix, "");
+        assert_eq!(root.node.depth, 0);
+        assert_eq!(root.node.logical_bytes, 185);
+        assert_eq!(root.node.file_count, 4);
+        assert_eq!(root.unattributed_bytes, Some(0));
+        assert!(
+            root.computed_at.is_some(),
+            "refreshed rollup carries a timestamp"
+        );
+        assert!(!root.truncated);
+        let names: Vec<&str> = root.children.iter().map(|c| c.prefix.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["libs"],
+            "depth=1 returns immediate children only"
+        );
+
+        // Two levels: descendants ordered by logical_bytes DESC.
+        let two = call_tree(&state, Some(member.clone()), &key, None, Some(2), None)
+            .await
+            .expect("depth-2 tree");
+        let names: Vec<&str> = two.children.iter().map(|c| c.prefix.as_str()).collect();
+        assert_eq!(names, vec!["libs", "libs/app", "libs/core"]);
+        assert_eq!(two.children[1].logical_bytes, 150);
+
+        // Subfolder rooting (with slashes to exercise normalization): the
+        // node is the subtree rollup and `unattributed_bytes` is absent.
+        let libs = call_tree(
+            &state,
+            Some(member.clone()),
+            &key,
+            Some("/libs/"),
+            None,
+            None,
+        )
+        .await
+        .expect("libs tree");
+        assert_eq!(libs.node.prefix, "libs");
+        assert_eq!(libs.node.depth, 1);
+        assert_eq!(libs.node.logical_bytes, 175);
+        assert_eq!(libs.node.file_count, 3);
+        assert_eq!(libs.unattributed_bytes, None, "root-only figure off-root");
+        let names: Vec<&str> = libs.children.iter().map(|c| c.prefix.as_str()).collect();
+        assert_eq!(names, vec!["libs/app", "libs/core"]);
+
+        // Unknown prefix: zeros, no freshness marker, nothing leaked.
+        let unknown = call_tree(&state, Some(member), &key, Some("nope"), None, None)
+            .await
+            .expect("unknown prefix");
+        assert_eq!(unknown.node.logical_bytes, 0);
+        assert_eq!(unknown.node.file_count, 0);
+        assert!(unknown.computed_at.is_none());
+        assert!(unknown.children.is_empty());
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// Soft-deleted artifacts drop out of the tree after delete + recompute
+    /// (the rebuild prunes their prefix rows rather than serving stale data).
+    #[tokio::test]
+    async fn storage_tree_soft_deleted_artifacts_drop_after_recompute_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        seed_tree_artifact(&pool, repo_id, "old/tree/file.bin", 100).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let member = tdh::make_auth(user_id, &username);
+
+        let before = call_tree(&state, Some(member.clone()), &key, None, Some(2), None)
+            .await
+            .expect("tree before delete");
+        assert_eq!(before.node.logical_bytes, 100);
+        assert!(before.children.iter().any(|c| c.prefix == "old/tree"));
+
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("soft-delete artifacts");
+        rebuild_tree_stats(&pool).await;
+
+        let after = call_tree(&state, Some(member), &key, None, Some(2), None)
+            .await
+            .expect("tree after delete");
+        assert_eq!(after.node.logical_bytes, 0, "deleted bytes must not linger");
+        assert!(after.children.is_empty(), "pruned prefixes must disappear");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// LIKE metacharacters in the requested prefix are escaped: `a_b` must
+    /// not wildcard-match a sibling `axb` subtree, and `%`/`../` prefixes
+    /// return only in-scope (i.e. zero) rows instead of acting as wildcards.
+    #[tokio::test]
+    async fn storage_tree_prefix_like_wildcards_are_escaped_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        seed_tree_artifact(&pool, repo_id, "a_b/sub/one.bin", 100).await;
+        seed_tree_artifact(&pool, repo_id, "axb/sub/two.bin", 40).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let member = tdh::make_auth(user_id, &username);
+
+        // Unescaped, LIKE 'a_b/%' would also match axb/sub. It must not.
+        let tree = call_tree(
+            &state,
+            Some(member.clone()),
+            &key,
+            Some("a_b"),
+            Some(2),
+            None,
+        )
+        .await
+        .expect("a_b tree");
+        assert_eq!(tree.node.logical_bytes, 100, "a_b subtree only");
+        let names: Vec<&str> = tree.children.iter().map(|c| c.prefix.as_str()).collect();
+        assert_eq!(names, vec!["a_b/sub"], "the `_` must match literally");
+
+        // A bare `%` prefix must not become a match-everything wildcard.
+        let pct = call_tree(&state, Some(member.clone()), &key, Some("%"), Some(5), None)
+            .await
+            .expect("% prefix");
+        assert_eq!(pct.node.logical_bytes, 0);
+        assert!(
+            pct.children.is_empty(),
+            "`%` must not wildcard-list the tree"
+        );
+
+        // Path-traversal-shaped prefixes are just unknown literal folders.
+        let dots = call_tree(&state, Some(member), &key, Some("../"), Some(5), None)
+            .await
+            .expect("../ prefix");
+        assert_eq!(dots.node.logical_bytes, 0);
+        assert!(dots.children.is_empty());
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// Out-of-range `depth` / `limit` are clamped at the query boundary:
+    /// depth 999 stops at 5 levels below the root and limit 0 returns one
+    /// node with `truncated` set.
+    #[tokio::test]
+    async fn storage_tree_depth_and_limit_are_clamped_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        // d1/…/d8/f.bin materializes prefix nodes at depths 1..=8.
+        let deep: Vec<String> = (1..=8).map(|i| format!("d{i}")).collect();
+        seed_tree_artifact(&pool, repo_id, &format!("{}/f.bin", deep.join("/")), 10).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let member = tdh::make_auth(user_id, &username);
+
+        let deep_req = call_tree(&state, Some(member.clone()), &key, None, Some(999), None)
+            .await
+            .expect("depth-clamped tree");
+        assert_eq!(
+            deep_req.children.len(),
+            STORAGE_TREE_MAX_QUERY_DEPTH as usize,
+            "depth clamps to {STORAGE_TREE_MAX_QUERY_DEPTH} levels below the root"
+        );
+        assert!(deep_req
+            .children
+            .iter()
+            .all(|c| c.depth <= STORAGE_TREE_MAX_QUERY_DEPTH));
+
+        let tight = call_tree(&state, Some(member), &key, None, Some(3), Some(0))
+            .await
+            .expect("limit-clamped tree");
+        assert_eq!(tight.children.len(), 1, "limit 0 clamps up to 1");
+        assert!(tight.truncated, "the cut listing must be flagged");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// Visibility matrix: anonymous and non-member callers get an
+    /// existence-hiding 404 on a private repo's tree; a granted member sees
+    /// it; flipping the repo public admits anonymous reads.
+    #[tokio::test]
+    async fn storage_tree_hidden_from_anonymous_and_nonmembers_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (member_id, member_name) = tdh::create_user(&pool).await;
+        let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, member_id).await;
+        seed_tree_artifact(&pool, repo_id, "private/secret.bin", 100).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        let anon = call_tree(&state, None, &key, None, None, None).await;
+        assert!(
+            matches!(anon, Err(AppError::NotFound(_))),
+            "anonymous must get an existence-hiding 404: {anon:?}"
+        );
+
+        let outsider = tdh::make_auth(outsider_id, &outsider_name);
+        let denied = call_tree(&state, Some(outsider), &key, None, None, None).await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must get an existence-hiding 404: {denied:?}"
+        );
+
+        let member = tdh::make_auth(member_id, &member_name);
+        let seen = call_tree(&state, Some(member), &key, None, None, None)
+            .await
+            .expect("member sees the tree");
+        assert_eq!(seen.node.logical_bytes, 100);
+
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("flip public");
+        let public = call_tree(&state, None, &key, None, None, None)
+            .await
+            .expect("public repo tree is anonymously readable");
+        assert_eq!(public.node.logical_bytes, 100);
+
+        tdh::cleanup(&pool, repo_id, member_id).await;
+        tdh::cleanup_user(&pool, outsider_id).await;
     }
 
     #[test]
