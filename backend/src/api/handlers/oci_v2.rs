@@ -1773,6 +1773,24 @@ pub(crate) fn classify_manifest(body: &[u8]) -> ManifestClass {
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
         return ManifestClass::Malformed;
     };
+    // "Is a runnable image" WINS over a co-present `manifests` array (#3003
+    // round 2). A body carrying a real image config + real rootfs layers AND a
+    // (possibly empty) `manifests` array is what a runtime runs as an IMAGE,
+    // so it must be classified as one:
+    //
+    //   * security — the inline proxy scan gate keys on this class, and the
+    //     manifests-array-first order let a real image be waved through as an
+    //     "index" and served unscanned;
+    //   * GC correctness — the same body previously recorded
+    //     `oci_manifest_refs` for its (often empty) children and NO
+    //     `manifest_blob_refs`, i.e. exactly the ref-less live tag that pins
+    //     the blob-GC readiness gate deployment-wide (#1409 C1).
+    //
+    // Only a PURE index — a `manifests` array with no image config of its own
+    // — stays `Index`.
+    if crate::services::scanner_service::oci_manifest_is_runnable_image(body) {
+        return ManifestClass::Image;
+    }
     if json.get("manifests").and_then(|m| m.as_array()).is_some() {
         return ManifestClass::Index;
     }
@@ -4406,6 +4424,45 @@ async fn handle_get_blob(
     // Look up by the canonical digest so an upper-case pull still resolves a
     // blob stored under its canonical lowercase digest.
     let lookup_digest = canonical_blob_lookup_digest(digest);
+
+    // #3003 round 2 (HIGH-3): a blob belonging to an image we already scanned
+    // and found VULNERABLE must not serve. Blocking the manifest alone left
+    // the image reconstructable: the client is refused the manifest, but every
+    // config/layer blob it names is content-addressed and was still served
+    // 200 by digest. Checked before the storage read and before any upstream
+    // fetch. Scanner-scoped pulls are exempt for the same reason the manifest
+    // gate exempts them.
+    if !oci_pull_is_scan_scoped(&claims) {
+        match blob_belongs_to_vulnerable_image(state, repo.id, &lookup_digest).await {
+            Ok(true) => {
+                tracing::warn!(
+                    repo = %repo.key, digest = %lookup_digest,
+                    "blocking blob pull: blob belongs to an image with a vulnerable scan verdict"
+                );
+                return oci_error(
+                    StatusCode::FORBIDDEN,
+                    "DENIED",
+                    "blob belongs to an image blocked by scan policy: vulnerabilities found",
+                );
+            }
+            Ok(false) => {}
+            // Fail CLOSED on a control-plane error: we cannot show this blob is
+            // safe to serve, and this is the same posture the manifest gate
+            // takes for an unreadable verdict store.
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo.key, digest = %lookup_digest, error = %e,
+                    "blob scan-verdict lookup failed; withholding rather than serving"
+                );
+                return oci_error(
+                    StatusCode::LOCKED,
+                    "DENIED",
+                    "blob scan status is unavailable; retry shortly",
+                );
+            }
+        }
+    }
+
     let blob = sqlx::query!(
         "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
         repo.id,
@@ -6794,6 +6851,466 @@ async fn record_oci_manifest_download(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inline scan-and-block for OCI proxy pulls (#3003 PR-2)
+//
+// Mirrors the proxy-PyPI/npm gate (#2954/#2970/#2976 + #3004): a Remote
+// repository with scan-on-proxy enabled must not serve a vulnerable image.
+// The MANIFEST GET is the block point — the single seam every `docker pull`
+// resolves first (blobs are content-addressed and carry no image identity) —
+// and the unit of scan is the WHOLE IMAGE, once, keyed on the manifest's
+// content digest in `proxy_scan_results`. Only runnable single-image
+// manifests are gated: an index/manifest list passes through and the
+// platform child manifest the client resolves next re-enters this same gate.
+//
+// Cold-proxy timing: `docker pull` fetches the manifest BEFORE the layer
+// blobs, so at gate time the image's blobs are not yet local. The gate
+// EAGER-FETCHES the config + layer blobs from upstream into local storage
+// (bounded by the shared byte cap) so Grype scans a local `oci-dir:`
+// reassembly — never a `registry:` pull back through our own serve path
+// (which would re-enter this handler). A scanner-scoped pull token
+// (`scan_pull_repo`, #2093) is exempt from the gate so the residual
+// registry-mode fallback can never deadlock against it.
+// ---------------------------------------------------------------------------
+
+/// Pure gate decision: does this served manifest body enter the inline proxy
+/// scan gate?
+///
+/// Exactly the consumer-faithful question — "would a container runtime RUN
+/// these bytes as an image?" — delegated to
+/// [`crate::services::scanner_service::oci_manifest_is_runnable_image`]
+/// (image config + at least one real rootfs layer). Deliberately NOT routed
+/// through `classify_manifest`'s enum or through a "does it look like an
+/// index / a signature" test: those describe the SHAPE of the document, and
+/// the shape is attacker-controlled. What must be scanned is whatever the
+/// client can actually run.
+///
+/// Consequences, each pinned by a test:
+/// * a pure index / manifest list passes (no rootfs of its own; the client's
+///   follow-up platform-child GET is gated at the child's own digest);
+/// * a real image carrying a cosmetic `"manifests": []` is **gated** — the
+///   array does not make it an index (#3003 round 2, HIGH-1);
+/// * a real image carrying a decoy `vnd.dev.cosign…` / `…+wasm` / `spdx`
+///   layer next to its real `tar+gzip` layer is **gated** — a decoy
+///   descriptor is not an exemption (#3003 round 2, HIGH-2);
+/// * genuine non-image OCI payloads (Helm charts, cosign signatures, SBOM /
+///   attestation, WASM) pass — no image config and/or no rootfs layer, so
+///   there is nothing a CVE engine could meaningfully grade;
+/// * a malformed body passes (not a consumable image; the cache path already
+///   refuses to create a live tag for one).
+pub(crate) fn oci_manifest_requires_proxy_scan(body: &[u8]) -> bool {
+    crate::services::scanner_service::oci_manifest_is_runnable_image(body)
+}
+
+/// Is this blob a config/layer of an image THIS repository already scanned and
+/// found vulnerable? (#3003 round 2, HIGH-3.)
+///
+/// Derived, not stored. There is no separate blocklist table to drift or to
+/// migrate: the answer is a join over the two things the manifest gate already
+/// persists —
+///   * `manifest_blob_refs` — the config + layer edges of every image the gate
+///     staged (`stage_proxy_image_blobs` records them explicitly), and
+///   * `proxy_scan_results` — the digest-keyed verdict for that manifest.
+///
+/// Deriving it has the properties a stored list would have to be hand-written
+/// to get right: a re-scan that flips a verdict back to `clean` (a fixed CVE
+/// DB, a #2976 freshness re-scan) un-blocks the blobs immediately, and a
+/// verdict recorded for an image nobody has staged blocks nothing.
+///
+/// Two scoping properties, both deliberate:
+///
+/// * **Per repository, via the refs.** Only manifests THIS repository is known
+///   to reference can block its blobs. A layer digest that also appears in
+///   another repository under a different, clean image keeps serving there.
+///   Note the verdict store itself is content-addressed and therefore global
+///   by design (#2954): the *same* manifest digest proxied into two
+///   repositories is the same image, so it is correctly blocked in both.
+/// * **ANY, not ALL.** Within a repository, a layer shared between a
+///   vulnerable image and a clean one is blocked. That over-blocks the clean
+///   image's pull, which is the fail-closed direction and is the right trade —
+///   the alternative ("serve if *some* referencing image scanned clean") would
+///   let a crafted clean sibling manifest unlock a known-vulnerable layer.
+async fn blob_belongs_to_vulnerable_image(
+    state: &SharedState,
+    repo_id: Uuid,
+    blob_digest: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM manifest_blob_refs mbr
+            JOIN proxy_scan_results psr
+              ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
+             AND psr.scan_type = $3
+             AND psr.verdict = 'vulnerable'
+            WHERE mbr.repository_id = $1
+              AND mbr.blob_digest = $2
+        )
+        "#,
+    )
+    .bind(repo_id)
+    .bind(blob_digest)
+    .bind(proxy_helpers::PROXY_SCAN_TYPE)
+    .fetch_one(&state.db)
+    .await
+}
+
+/// True when the authenticated claims are a scanner-scoped pull token
+/// (#2093). Exempt from the inline scan gate: the scanner's own image pull
+/// must never recurse into a scan of itself. `enforce_scan_pull_scope`
+/// has already pinned such a token to exactly this repository.
+fn oci_pull_is_scan_scoped(claims: &Option<crate::services::auth_service::Claims>) -> bool {
+    claims.as_ref().is_some_and(|c| c.scan_pull_repo.is_some())
+}
+
+/// Synthetic [`Artifact`](crate::models::artifact::Artifact) describing the
+/// image manifest being served, for scanner applicability + workspace naming.
+/// The path shape (`v2/<image>/manifests/<reference>`) is what
+/// `parse_oci_manifest_path` / `is_oci_image_artifact` key on; the checksum
+/// is the bare-hex content digest WE computed over the served bytes.
+fn oci_manifest_synthetic_artifact(
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest_hex: &str,
+    body_len: i64,
+    content_type: &str,
+) -> crate::models::artifact::Artifact {
+    let now = chrono::Utc::now();
+    crate::models::artifact::Artifact {
+        id: Uuid::new_v4(),
+        repository_id: repo_id,
+        path: format!("v2/{}/manifests/{}", image, reference),
+        name: format!("{}:{}", image, reference),
+        version: None,
+        size_bytes: body_len,
+        checksum_sha256: digest_hex.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: content_type.to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Map the shared gate's deny response onto the OCI error body shape docker
+/// clients surface. Status is preserved: 403 = cached/inline vulnerable
+/// verdict, 423 = inconclusive under fail-closed (scan pending/failed —
+/// retry; never unscanned bytes).
+fn oci_scan_deny_response(status: StatusCode, image_ref: &str) -> Response {
+    if status == StatusCode::FORBIDDEN {
+        oci_error(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            &format!(
+                "pull of {} blocked by scan policy: vulnerabilities found",
+                image_ref
+            ),
+        )
+    } else {
+        oci_error(
+            StatusCode::LOCKED,
+            "DENIED",
+            &format!(
+                "pull of {} withheld: image scan pending or inconclusive; retry shortly",
+                image_ref
+            ),
+        )
+    }
+}
+
+/// Stage the config + layer blobs an image manifest references into LOCAL
+/// storage so the inline scan reassembles the image from bytes in hand
+/// (Grype `oci-dir:` mode) instead of falling back to a `registry:` pull
+/// through our own serve path.
+///
+/// Every failure is a HARD error (→ inconclusive → 423 under fail-closed):
+/// an unverifiable digest algorithm, a declared size over the scan byte cap,
+/// an upstream fetch failure, a digest mismatch on fetched bytes, or a
+/// storage/DB write failure must never degrade into "scanned clean".
+///
+/// Side effect: staged blobs land under the same `oci-blobs/<digest>` keys +
+/// `oci_blobs` rows a pushed blob uses, so the client's follow-up blob GETs
+/// are served warm and locally (the eager fetch fronts the same bytes the
+/// pull was about to transfer anyway), and blob GC sees them referenced via
+/// `manifest_blob_refs`.
+async fn stage_proxy_image_blobs(
+    state: &SharedState,
+    ctx: &proxy_helpers::OciImageScanCtx,
+    manifest_digest: &str,
+    manifest_body: &[u8],
+) -> crate::error::Result<()> {
+    use crate::error::AppError;
+
+    let refs = extract_blob_refs(manifest_body);
+    if refs.is_empty() {
+        return Err(AppError::Internal(
+            "OCI inline scan: image manifest references no config/layer blobs".to_string(),
+        ));
+    }
+
+    // Cheap pre-check on the DECLARED image size before any fetch; the
+    // per-fetch cap below enforces the same bound on actual bytes.
+    let declared_total = manifest_total_size(manifest_body);
+    let cap = crate::services::scanner_service::PROXY_SCAN_MAX_BYTES;
+    if declared_total > cap as i64 {
+        return Err(AppError::BadGateway(format!(
+            "OCI inline scan: declared image size {} exceeded the scan byte limit {}",
+            declared_total, cap
+        )));
+    }
+
+    // Idempotent: the proxy manifest-cache path normally records these edges
+    // (`persist_tag_and_refs`); re-record here so a partially-failed cache
+    // cannot strand the layout reassembly without refs.
+    record_manifest_blob_refs(&state.db, ctx.repo_id, manifest_digest, manifest_body)
+        .await
+        .map_err(|e| {
+            AppError::Database(format!(
+                "OCI inline scan: failed to record manifest blob refs: {}",
+                e
+            ))
+        })?;
+
+    let storage = state.storage_for_repo(&ctx.location)?;
+    let mut remaining = cap;
+    for blob in refs {
+        // Already local (pushed, previously staged, or cached)? Skip.
+        //
+        // `EXISTS` (bool), not `SELECT 1`: a bare `1` is INT4 in Postgres and
+        // decoding it as `i64` errors — which, on this fail-closed path, turned
+        // every RE-scan of an already-staged image into a permanent 423.
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM oci_blobs WHERE repository_id = $1 AND digest = $2)",
+        )
+        .bind(ctx.repo_id)
+        .bind(&blob.digest)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| {
+            AppError::Database(format!("OCI inline scan: oci_blobs lookup failed: {}", e))
+        })?;
+        if exists {
+            continue;
+        }
+
+        // Only sha256 digests are verifiable against our own hash of the
+        // fetched bytes; an unverifiable blob cannot be staged safely.
+        if !blob.digest.starts_with("sha256:") {
+            return Err(AppError::Internal(format!(
+                "OCI inline scan: unsupported blob digest algorithm: {}",
+                blob.digest
+            )));
+        }
+
+        let (Some(upstream_url), Some(proxy)) =
+            (ctx.upstream_url.as_deref(), state.proxy_service.as_ref())
+        else {
+            return Err(AppError::Internal(
+                "OCI inline scan: no upstream/proxy service to stage image blobs from".to_string(),
+            ));
+        };
+        let image = normalize_docker_image(&ctx.image, upstream_url);
+        let upstream_path = upstream_blob_path(&image, &blob.digest);
+        let (bytes, _ct) = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            ctx.repo_id,
+            &ctx.repo_key,
+            upstream_url,
+            &upstream_path,
+            remaining,
+        )
+        .await
+        .map_err(|_| {
+            AppError::BadGateway(format!(
+                "OCI inline scan: failed to stage blob {} (upstream fetch failed or scan byte limit exceeded)",
+                blob.digest
+            ))
+        })?;
+        remaining = remaining.saturating_sub(bytes.len());
+
+        // Content-address verification: never store bytes the upstream sent
+        // under a digest they do not hash to.
+        if compute_sha256(&bytes) != blob.digest {
+            return Err(AppError::BadGateway(format!(
+                "OCI inline scan: upstream blob bytes do not match digest {}",
+                blob.digest
+            )));
+        }
+
+        let key = blob_storage_key(&blob.digest);
+        storage.put(&key, bytes.clone()).await.map_err(|e| {
+            crate::error::AppError::Storage(format!(
+                "OCI inline scan: failed to store staged blob {}: {}",
+                blob.digest, e
+            ))
+        })?;
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+        )
+        .bind(ctx.repo_id)
+        .bind(&blob.digest)
+        .bind(bytes.len() as i64)
+        .bind(&key)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            AppError::Database(format!(
+                "OCI inline scan: failed to record staged blob {}: {}",
+                blob.digest, e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Stage-then-scan for an OCI image manifest under the inline proxy gate
+/// (#3003 PR-2). Called by `proxy_helpers::proxy_scan_and_record` for
+/// [`proxy_helpers::ProxyScanMode::OciImage`], inside the inline budget.
+///
+/// The [`crate::services::scanner_service::ScanTarget`] carries the full
+/// repository context (db + storage + manifest body) so Grype reassembles
+/// the just-staged blobs into a local `oci-dir:` layout, and sets
+/// `require_nonempty_catalog`: an engine that ran but cataloged nothing for
+/// the image is INCONCLUSIVE, never clean.
+pub(crate) async fn oci_stage_and_scan_image(
+    state: &SharedState,
+    ctx: &proxy_helpers::OciImageScanCtx,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+) -> crate::error::Result<crate::services::scanner_service::ProxyScanVerdict> {
+    let scanner = state.scanner_service.as_ref().ok_or_else(|| {
+        crate::error::AppError::Internal("no scanner service configured".to_string())
+    })?;
+    let manifest_digest = format!("sha256:{}", synthetic.checksum_sha256);
+    stage_proxy_image_blobs(state, ctx, &manifest_digest, bytes).await?;
+
+    let storage = state.storage_for_repo(&ctx.location)?;
+    let target = crate::services::scanner_service::ScanTarget {
+        artifact: synthetic,
+        repository_key: &ctx.repo_key,
+        repository_type: &ctx.repo_type,
+        db: Some(&state.db),
+        storage: Some(storage.as_ref()),
+        manifest_body: Some(bytes),
+        expected_component: None,
+        require_nonempty_catalog: true,
+    };
+    scanner.scan_content_target(&target, bytes).await
+}
+
+/// The digest-keyed verdict gate for a proxy-served OCI image manifest.
+/// Returns `Ok(pending)` when the manifest may be served (`pending` selects
+/// the loud `X-AK-Scan: pending` header on the fail-open
+/// serve-before-verdict path), or `Err(response)` with the fully-built OCI
+/// error (403 vulnerable / 423 inconclusive-fail-closed).
+async fn gate_oci_proxy_manifest_scan(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+    manifest_body: &Bytes,
+    manifest_content_type: &str,
+) -> Result<bool, Response> {
+    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+        .proxy_scan_action(repo.id)
+        .await
+        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+
+    // The verdict key is the CONTENT digest computed over the bytes being
+    // served — the same digest `docker pull` pins — never anything the
+    // upstream index advertised.
+    let digest_hex = proxy_helpers::sha256_hex(manifest_body);
+    let image_ref = format!("{}:{}", repo.image, reference);
+    let synthetic = oci_manifest_synthetic_artifact(
+        repo.id,
+        &repo.image,
+        reference,
+        &digest_hex,
+        manifest_body.len() as i64,
+        manifest_content_type,
+    );
+    let ctx = proxy_helpers::OciImageScanCtx {
+        repo_id: repo.id,
+        repo_key: repo.key.clone(),
+        repo_type: repo.repo_type.clone(),
+        location: repo.location.clone(),
+        image: repo.image.clone(),
+        upstream_url: repo.upstream_url.clone(),
+    };
+    match proxy_helpers::gate_proxy_scan_serve(
+        state,
+        repo.id,
+        &image_ref,
+        &digest_hex,
+        synthetic,
+        manifest_body,
+        action,
+        // Content-addressing IS the identity for an image manifest; the
+        // "engine actually graded this image" requirement is carried by
+        // `require_nonempty_catalog` on the ScanTarget instead.
+        proxy_helpers::ProxyScanIdentity::NotApplicable,
+        proxy_helpers::ProxyScanMode::OciImage(ctx),
+    )
+    .await
+    {
+        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => Ok(pending),
+        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => {
+            Err(oci_scan_deny_response(resp.status(), &image_ref))
+        }
+    }
+}
+
+/// Run the #3003 PR-2 inline scan gate for a Remote-repo manifest serve when
+/// it applies. `Ok(false)` = serve normally, `Ok(true)` = serve with the
+/// loud pending header, `Err(response)` = blocked/withheld.
+///
+/// Applies ONLY to Remote (proxy) repositories: hosted content is already
+/// blocked on pull by scan-on-upload + quarantine
+/// (`oci_manifest_quarantine_block`), and double-gating it would change
+/// hosted serve behavior. Scanner-scoped pull tokens are exempt (see
+/// [`oci_pull_is_scan_scoped`]).
+async fn maybe_gate_remote_manifest_scan(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    claims: &Option<crate::services::auth_service::Claims>,
+    reference: &str,
+    manifest_body: &Bytes,
+    manifest_content_type: &str,
+) -> Result<bool, Response> {
+    if repo.repo_type != RepositoryType::Remote || oci_pull_is_scan_scoped(claims) {
+        return Ok(false);
+    }
+    if !crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+        .is_proxy_scan_enabled(repo.id)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    if !oci_manifest_requires_proxy_scan(manifest_body) {
+        return Ok(false);
+    }
+    gate_oci_proxy_manifest_scan(state, repo, reference, manifest_body, manifest_content_type).await
+}
+
+/// Attach the loud fail-open `X-AK-Scan: pending` header to a manifest
+/// response served before a verdict exists.
+fn with_scan_pending_header(mut resp: Response, pending: bool) -> Response {
+    if pending {
+        resp.headers_mut()
+            .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+    }
+    resp
+}
+
 async fn handle_get_manifest(
     state: &SharedState,
     headers: &HeaderMap,
@@ -6920,6 +7437,26 @@ async fn handle_get_manifest(
                 return blocked;
             }
 
+            // #3003 PR-2: inline scan gate for PROXY-CACHED content served
+            // from local storage. A Remote repo caches the manifest on the
+            // first pull, so every warm pull lands here — without this gate
+            // a fail-open first pull would serve the (now known-vulnerable)
+            // image forever from cache. Hosted repos skip it (quarantine
+            // above is their block), as do scanner-scoped pulls.
+            let scan_pending = match maybe_gate_remote_manifest_scan(
+                state,
+                &repo,
+                &claims,
+                reference,
+                &data,
+                &content_type,
+            )
+            .await
+            {
+                Ok(pending) => pending,
+                Err(resp) => return resp,
+            };
+
             tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: served from local storage (tag row or content-addressable digest)");
             // #2260: count a Docker/OCI pull exactly ONCE, here on the local
             // manifest GET — NOT per blob. A `docker pull` fetches one manifest
@@ -6930,7 +7467,10 @@ async fn handle_get_manifest(
             // is a separate handler and is never counted. Remote/virtual
             // pass-through manifests resolve no local row and stay unrecorded.
             record_oci_manifest_download(state, repo.id, &manifest_digest, ctx).await;
-            return build_local_manifest_response(&manifest_digest, &content_type, data, true);
+            return with_scan_pending_header(
+                build_local_manifest_response(&manifest_digest, &content_type, data, true),
+                scan_pending,
+            );
         }
         if let Some(manifest_digest) = tag_row_digest {
             let manifest_key = manifest_storage_key(&manifest_digest);
@@ -6980,12 +7520,34 @@ async fn handle_get_manifest(
             ct.as_deref(),
         )
         .await;
-        return build_oci_proxy_response(
+        // #3003 PR-2: inline scan gate on the COLD proxy pull, after the
+        // manifest is cached (so `manifest_blob_refs` exist for the layout
+        // reassembly) and before a byte of it is served. An index passes
+        // through here unscanned; the platform-child manifest GET the client
+        // issues next re-enters this gate and is scanned at its own digest.
+        let scan_pending = match maybe_gate_remote_manifest_scan(
+            state,
+            &repo,
+            &claims,
+            reference,
             &content,
-            ct,
-            &digest,
-            "application/vnd.oci.image.manifest.v1+json",
-            true,
+            ct.as_deref()
+                .unwrap_or("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        {
+            Ok(pending) => pending,
+            Err(resp) => return resp,
+        };
+        return with_scan_pending_header(
+            build_oci_proxy_response(
+                &content,
+                ct,
+                &digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                true,
+            ),
+            scan_pending,
         );
     }
 
@@ -23273,5 +23835,1464 @@ mod token_refresh_grant_tests {
             StatusCode::UNAUTHORIZED,
             "an already-consumed web refresh token must not be revived via /v2/token"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3003 PR-2: inline scan-and-block on OCI proxy manifest pulls.
+//
+// End-to-end handler tests over a real DB + wiremock upstream, mirroring the
+// npm/pypi proxy_scan_block_tests so Docker/OCI demonstrably inherits the
+// same shared gate (#2954 fail-closed, #2976 freshness). Skip cleanly when
+// DATABASE_URL is unset.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod proxy_scan_block_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::sha256_hex;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::handlers::test_db_helpers::enable_proxy_scan;
+    use crate::services::proxy_scan_service::ProxyScanService;
+    use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const IMAGE_MANIFEST_MT: &str = "application/vnd.oci.image.manifest.v1+json";
+    const INDEX_MT: &str = "application/vnd.oci.image.index.v1+json";
+
+    /// A runnable single-platform image manifest whose config/layer digests
+    /// match `config_bytes`/`layer_bytes`, so blob staging can verify what a
+    /// wiremock upstream serves.
+    fn image_manifest(config_bytes: &[u8], layer_bytes: &[u8]) -> (Bytes, String, String) {
+        let config_digest = compute_sha256(config_bytes);
+        let layer_digest = compute_sha256(layer_bytes);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MT,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer_bytes.len(),
+            }],
+        });
+        (
+            Bytes::from(serde_json::to_vec(&manifest).unwrap()),
+            config_digest,
+            layer_digest,
+        )
+    }
+
+    fn index_manifest() -> Bytes {
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": INDEX_MT,
+            "manifests": [{
+                "mediaType": IMAGE_MANIFEST_MT,
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 100,
+                "platform": {"os": "linux", "architecture": "amd64"},
+            }],
+        });
+        Bytes::from(serde_json::to_vec(&index).unwrap())
+    }
+
+    async fn mount_upstream_manifest(
+        upstream: &wiremock::MockServer,
+        image: &str,
+        reference: &str,
+        body: &Bytes,
+        content_type: &str,
+        expected_fetches: Option<u64>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mut mock = Mock::given(method("GET"))
+            .and(path(format!("/v2/{image}/manifests/{reference}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("Content-Type", content_type),
+            );
+        if let Some(n) = expected_fetches {
+            mock = mock.expect(n);
+        }
+        mock.mount(upstream).await;
+    }
+
+    async fn mount_upstream_blob(
+        upstream: &wiremock::MockServer,
+        image: &str,
+        digest: &str,
+        body: &[u8],
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{image}/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(upstream)
+            .await;
+    }
+
+    /// Make the fixture repo a public Docker proxy of the wiremock upstream.
+    async fn wire_public_remote(fx: &tdh::Fixture, upstream: &wiremock::MockServer) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("wire upstream + public");
+    }
+
+    async fn cleanup_proxy_scan_row(pool: &sqlx::PgPool, digest: &str) {
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+    }
+
+    /// Anonymous manifest GET through the real router.
+    async fn pull_manifest(state: &SharedState, repo_key: &str, reference: &str) -> Response {
+        let app = tdh::router_anon(router(), state.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{repo_key}/app/manifests/{reference}"))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.expect("oneshot")
+    }
+
+    // ── Pure decision helpers ──────────────────────────────────────────────
+
+    /// Only a runnable single-image manifest enters the gate: an index and
+    /// non-image OCI payloads (Helm, cosign) pass through, as does a
+    /// malformed body (not a consumable image).
+    #[test]
+    fn test_oci_manifest_requires_proxy_scan_truth_table() {
+        let (image, _, _) = image_manifest(b"cfg", b"layer");
+        assert!(oci_manifest_requires_proxy_scan(&image));
+        assert!(!oci_manifest_requires_proxy_scan(&index_manifest()));
+        // Helm OCI chart: config mediaType is not a container image config.
+        let helm = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.cncf.helm.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [{"mediaType": "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+        });
+        assert!(!oci_manifest_requires_proxy_scan(
+            &serde_json::to_vec(&helm).unwrap()
+        ));
+        // cosign signature: image config mediaType but signature layers.
+        let cosign = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [{"mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+        });
+        assert!(!oci_manifest_requires_proxy_scan(
+            &serde_json::to_vec(&cosign).unwrap()
+        ));
+        assert!(!oci_manifest_requires_proxy_scan(b"not json"));
+    }
+
+    /// A runnable image manifest carrying a REAL rootfs layer, mutated by the
+    /// shape under test. The payload is always something a runtime would
+    /// unpack and run — only the decoration changes.
+    fn runnable_image_with(extra: serde_json::Value) -> Vec<u8> {
+        let mut m = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MT,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+        });
+        let obj = m.as_object_mut().unwrap();
+        for (k, v) in extra.as_object().unwrap() {
+            if k == "layers" {
+                // Append the decoy layer(s) alongside the real one.
+                obj.get_mut("layers")
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(v.as_array().unwrap().clone());
+            } else {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::to_vec(&m).unwrap()
+    }
+
+    /// #3003 round 2, HIGH-1: a runnable image that ALSO carries a `manifests`
+    /// array is still a runnable image. The first cut classified
+    /// `manifests`-first, so bolting a cosmetic `"manifests": []` onto a real
+    /// vulnerable image routed it down the index branch and served it 200
+    /// UNSCANNED. The array is decoration; what runs is the config + layers.
+    #[test]
+    fn test_gate_covers_image_with_cosmetic_manifests_array() {
+        for array in [
+            serde_json::json!([]),
+            // Also the non-empty form, pointing at an unrelated child.
+            serde_json::json!([{
+                "mediaType": IMAGE_MANIFEST_MT,
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 100,
+                "platform": {"os": "linux", "architecture": "amd64"},
+            }]),
+        ] {
+            let body = runnable_image_with(serde_json::json!({ "manifests": array }));
+            assert!(
+                oci_manifest_requires_proxy_scan(&body),
+                "an image + a `manifests` array must still be GATED (HIGH-1)"
+            );
+            // ...and it must classify as an Image so its config/layer edges are
+            // recorded in `manifest_blob_refs` (both the scan layout and the
+            // blob gate below depend on those rows; recording an empty child
+            // set instead is also the #1409 C1 ref-less-live-tag GC hole).
+            assert!(
+                matches!(classify_manifest(&body), ManifestClass::Image),
+                "image-and-index must classify as Image, not Index"
+            );
+        }
+    }
+
+    /// #3003 round 2, HIGH-2: a decoy non-image layer is not an exemption.
+    /// The first cut skipped the gate if ANY layer carried a non-image marker,
+    /// so adding one dummy cosign/wasm/SBOM descriptor next to the real
+    /// `tar+gzip` layer served the vulnerable image 200 UNSCANNED. The runtime
+    /// still unpacks the real layer, so the scan must still run.
+    #[test]
+    fn test_gate_covers_image_with_decoy_non_image_layer() {
+        for decoy in [
+            "application/vnd.dev.cosign.simplesigning.v1+json",
+            "application/wasm",
+            "application/spdx+json",
+            "application/vnd.in-toto+json",
+            "application/vnd.cyclonedx+json",
+            "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+        ] {
+            let body = runnable_image_with(serde_json::json!({
+                "layers": [{"mediaType": decoy,
+                            "digest": format!("sha256:{}", "d".repeat(64)), "size": 3}]
+            }));
+            assert!(
+                oci_manifest_requires_proxy_scan(&body),
+                "a decoy `{decoy}` layer must NOT exempt a real image from the gate (HIGH-2)"
+            );
+        }
+    }
+
+    /// Both bypass shapes at once, for completeness: decoy layer AND a
+    /// cosmetic manifests array on the same runnable image.
+    #[test]
+    fn test_gate_covers_image_with_both_bypass_shapes() {
+        let body = runnable_image_with(serde_json::json!({
+            "manifests": [],
+            "layers": [{"mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                        "digest": format!("sha256:{}", "d".repeat(64)), "size": 3}]
+        }));
+        assert!(oci_manifest_requires_proxy_scan(&body));
+    }
+
+    /// The other direction — the gate must stay OFF for things that are not
+    /// runnable images, or a proxy of a signature/SBOM/chart repository would
+    /// start 423-ing legitimate artifacts under fail-closed.
+    #[test]
+    fn test_gate_leaves_non_runnable_artifacts_alone() {
+        // A PURE index: `manifests` entries, no image config of its own. Must
+        // pass so the client's platform-child GET is what gets gated.
+        let pure_index = index_manifest();
+        assert!(!oci_manifest_requires_proxy_scan(&pure_index));
+        assert!(matches!(
+            classify_manifest(&pure_index),
+            ManifestClass::Index
+        ));
+
+        // A REAL cosign signature: image config, but no rootfs layer at all.
+        let cosign = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [{"mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+        });
+        assert!(!oci_manifest_requires_proxy_scan(
+            &serde_json::to_vec(&cosign).unwrap()
+        ));
+
+        // A REAL Helm chart: helm config + a tar payload that is NOT a rootfs.
+        let helm = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.cncf.helm.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [{"mediaType": "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+        });
+        assert!(!oci_manifest_requires_proxy_scan(
+            &serde_json::to_vec(&helm).unwrap()
+        ));
+
+        // A REAL SBOM/attestation artifact.
+        let sbom = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 2},
+            "layers": [{"mediaType": "application/spdx+json",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+        });
+        assert!(!oci_manifest_requires_proxy_scan(
+            &serde_json::to_vec(&sbom).unwrap()
+        ));
+
+        // An image config with NO layers: nothing to unpack, nothing to grade.
+        let no_layers = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [],
+        });
+        assert!(!oci_manifest_requires_proxy_scan(
+            &serde_json::to_vec(&no_layers).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_oci_scan_deny_response_statuses() {
+        assert_eq!(
+            oci_scan_deny_response(StatusCode::FORBIDDEN, "app:latest").status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            oci_scan_deny_response(StatusCode::LOCKED, "app:latest").status(),
+            StatusCode::LOCKED
+        );
+    }
+
+    #[test]
+    fn test_oci_manifest_synthetic_artifact_shape() {
+        let repo_id = Uuid::new_v4();
+        let a = oci_manifest_synthetic_artifact(
+            repo_id,
+            "library/debian",
+            "buster",
+            "ab12",
+            42,
+            IMAGE_MANIFEST_MT,
+        );
+        assert_eq!(a.repository_id, repo_id);
+        assert_eq!(a.path, "v2/library/debian/manifests/buster");
+        assert_eq!(a.name, "library/debian:buster");
+        assert_eq!(a.checksum_sha256, "ab12");
+        assert_eq!(a.size_bytes, 42);
+        assert_eq!(a.content_type, IMAGE_MANIFEST_MT);
+        assert!(a.storage_key.is_empty());
+        // The scanner-side path predicates the OCI scan routing keys on.
+        assert!(crate::services::scanner_service::is_oci_image_artifact(&a));
+        assert!(crate::services::scanner_service::parse_oci_manifest_path(&a.path).is_some());
+    }
+
+    // ── The block: cached vulnerable verdict ──────────────────────────────
+
+    /// A fresh cached VULNERABLE verdict for the manifest digest blocks the
+    /// pull with 403 — and a SECOND pull is blocked from the LOCAL cache
+    /// branch with no upstream re-fetch (wiremock `expect(1)` verifies on
+    /// drop), proving the verdict is keyed per manifest digest and reused
+    /// across the cold and warm serve paths.
+    #[tokio::test]
+    async fn test_get_manifest_blocks_cached_vulnerable_digest() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(b"vuln-cfg", b"vuln-layer");
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            Some(1),
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let cold = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let cold_status = cold.status();
+        let warm = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let warm_status = warm.status();
+        let warm_body = axum::body::to_bytes(warm.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            cold_status,
+            StatusCode::FORBIDDEN,
+            "cold pull of a digest with a cached vulnerable verdict must be 403"
+        );
+        assert_eq!(
+            warm_status,
+            StatusCode::FORBIDDEN,
+            "warm (locally-cached) pull must consult the same verdict and block"
+        );
+        let body_text = String::from_utf8_lossy(&warm_body);
+        assert!(
+            body_text.contains("DENIED"),
+            "docker clients surface the OCI error code; got {body_text}"
+        );
+        // wiremock expect(1) verifies on drop: the block happened without a
+        // second upstream fetch.
+    }
+
+    // ── Clean serve + freshness ────────────────────────────────────────────
+
+    /// A fresh cached CLEAN verdict whose scanner version matches the LIVE
+    /// engine serves 200 with the Docker-Content-Digest header — the gate
+    /// must not turn clean pulls into blocks or re-scans.
+    #[tokio::test]
+    async fn test_get_manifest_serves_cached_clean_digest() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(b"clean-cfg", b"clean-layer");
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        // Live engine version MATCHES the stored provenance: the verdict is
+        // reusable. (A rescan would hard-error and 423, so a 200 here proves
+        // the cached verdict was reused.)
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            storage_path.as_str(),
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-1.0.0-test"),
+                rescan: MockCveRescan::Error,
+            })],
+        );
+
+        let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let status = resp.status();
+        let dcd = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "cached-clean pull must serve");
+        assert_eq!(
+            dcd.as_deref(),
+            Some(format!("sha256:{digest}").as_str()),
+            "manifest serve must carry Docker-Content-Digest"
+        );
+        assert_eq!(&body[..], &manifest[..], "served bytes must be unmodified");
+    }
+
+    /// #2976: a cached CLEAN verdict + an UNKNOWN live scanner version under
+    /// fail_closed must re-scan — and with no scanner able to run, withhold
+    /// with 423. Never a stale-clean 200.
+    #[tokio::test]
+    async fn test_get_manifest_fail_closed_unknown_live_version_is_423() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(b"stale-cfg", b"stale-layer");
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.9.0-old"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed stale clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        // NO scanner service on the state: the live version probe is None and
+        // the forced re-scan is inconclusive.
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let status = resp.status();
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::LOCKED,
+            "cached-clean + unknown live scanner version under fail_closed must 423, not serve stale-clean"
+        );
+    }
+
+    // ── Fail-closed / fail-open posture ────────────────────────────────────
+
+    /// Fail-closed + inconclusive scan (no scanner service) must 423 — OCI
+    /// inherits the #2954 fail-closed contract through the shared gate.
+    #[tokio::test]
+    async fn test_get_manifest_fail_closed_inconclusive_is_423() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(b"inc-cfg", b"inc-layer");
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let status = resp.status();
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::LOCKED,
+            "fail-closed + inconclusive must never serve manifest bytes"
+        );
+    }
+
+    /// Fail-open first pull serves LOUDLY: 200 with `X-AK-Scan: pending`.
+    #[tokio::test]
+    async fn test_get_manifest_fail_open_serves_pending() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(b"open-cfg", b"open-layer");
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let status = resp.status();
+        let scan = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "fail_open first pull must serve");
+        assert_eq!(
+            scan.as_deref(),
+            Some("pending"),
+            "a served-before-verdict manifest must be loudly marked pending"
+        );
+    }
+
+    /// A multi-arch INDEX passes the gate unscanned even under fail_closed
+    /// with no scanner: the platform child manifest the client resolves next
+    /// is what gets gated (at its own digest).
+    #[tokio::test]
+    async fn test_get_manifest_index_passes_ungated() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let index = index_manifest();
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "latest", &index, INDEX_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let status = resp.status();
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an image index must pass through unscanned (children are gated)"
+        );
+    }
+
+    // ── Inline scan end-to-end: staging + scan + block ─────────────────────
+
+    /// THE cold-proxy end-to-end: no cached verdict, fail_closed, a live
+    /// (mock) CVE engine that flags the image. The gate stages the config +
+    /// layer blobs from upstream (content-address-verified, recorded in
+    /// oci_blobs), scans inline, persists the vulnerable verdict, and blocks
+    /// with 403 before a byte of the manifest is served.
+    #[tokio::test]
+    async fn test_get_manifest_inline_scan_blocks_vulnerable_image() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config_bytes = b"vulnerable image config";
+        let layer_bytes = b"vulnerable layer bytes";
+        let (manifest, config_digest, layer_digest) = image_manifest(config_bytes, layer_bytes);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        mount_upstream_blob(&upstream, "app", &config_digest, config_bytes).await;
+        mount_upstream_blob(&upstream, "app", &layer_digest, layer_bytes).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            storage_path.as_str(),
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-1.0.0-test"),
+                rescan: MockCveRescan::Vulnerable,
+            })],
+        );
+
+        let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let status = resp.status();
+
+        // The eager fetch staged both blobs locally (content-verified).
+        let staged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = ANY($2)",
+        )
+        .bind(fx.repo_id)
+        .bind(vec![config_digest.clone(), layer_digest.clone()])
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count staged blobs");
+
+        // The vulnerable verdict was persisted digest-keyed for reuse.
+        let verdict: Option<String> = sqlx::query_scalar(
+            "SELECT verdict FROM proxy_scan_results WHERE checksum_sha256 = $1 AND scan_type = 'grype'",
+        )
+        .bind(&digest)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("verdict lookup");
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an inline scan that flags the image must block the pull with 403"
+        );
+        assert_eq!(staged, 2, "config + layer blobs must be staged locally");
+        assert_eq!(
+            verdict.as_deref(),
+            Some("vulnerable"),
+            "the inline verdict must be persisted for the next pull"
+        );
+    }
+
+    // ── Scanner-scoped pull exemption + staging hard-failures ─────────────
+
+    fn scan_scoped_claims(repo_key: &str) -> crate::services::auth_service::Claims {
+        crate::services::auth_service::Claims {
+            sub: Uuid::new_v4(),
+            username: "_ak_scanner".to_string(),
+            email: "scanner@artifact-keeper.internal".to_string(),
+            is_admin: false,
+            allowed_repo_ids: None,
+            iat: 0,
+            iat_ms: None,
+            exp: i64::MAX,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: Some(repo_key.to_string()),
+            scopes: None,
+        }
+    }
+
+    fn remote_repo_info(fx: &tdh::Fixture, upstream_url: &str) -> OciRepoInfo {
+        OciRepoInfo {
+            id: fx.repo_id,
+            key: fx.repo_key.clone(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            },
+            repo_type: "remote".to_string(),
+            upstream_url: Some(upstream_url.to_string()),
+            is_public: true,
+            image: "app".to_string(),
+        }
+    }
+
+    /// A scanner-scoped pull token is EXEMPT from the gate (no recursion:
+    /// the scanner's own pull of the image it is grading must not re-enter
+    /// the scan), while the same pull without the scope is withheld.
+    #[tokio::test]
+    async fn test_scan_scoped_pull_token_is_exempt_from_gate() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let (manifest, _, _) = image_manifest(b"scoped-cfg", b"scoped-layer");
+        let repo = remote_repo_info(&fx, "https://upstream.example.test");
+
+        // No scanner service: an applied gate can only be inconclusive (423).
+        let scoped = Some(scan_scoped_claims(&fx.repo_key));
+        let exempt = maybe_gate_remote_manifest_scan(
+            &fx.state,
+            &repo,
+            &scoped,
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+        )
+        .await;
+        let unscoped = maybe_gate_remote_manifest_scan(
+            &fx.state,
+            &repo,
+            &None,
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &sha256_hex(&manifest)).await;
+        fx.teardown().await;
+
+        assert!(
+            matches!(exempt, Ok(false)),
+            "a scan-scoped pull must bypass the gate entirely"
+        );
+        match unscoped {
+            Ok(_) => panic!("the same pull without the scan scope must be withheld"),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
+        }
+    }
+
+    /// Blob staging is fail-closed on its own hard failures: a declared image
+    /// size over the scan byte cap and an upstream that serves bytes not
+    /// matching the manifest's digest both error (→ 423 upstream), never
+    /// degrade into a clean-looking scan.
+    #[tokio::test]
+    async fn test_stage_proxy_image_blobs_hard_failures() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let ctx_for = |upstream_url: &str| crate::api::handlers::proxy_helpers::OciImageScanCtx {
+            repo_id: fx.repo_id,
+            repo_key: fx.repo_key.clone(),
+            repo_type: "remote".to_string(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            },
+            image: "app".to_string(),
+            upstream_url: Some(upstream_url.to_string()),
+        };
+
+        // 1) Declared size over the cap: rejected before any fetch.
+        let oversized = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MT,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)),
+                        "size": crate::services::scanner_service::PROXY_SCAN_MAX_BYTES as i64 + 1},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 1}],
+        });
+        let oversized_body = serde_json::to_vec(&oversized).unwrap();
+        let over = stage_proxy_image_blobs(
+            &fx.state,
+            &ctx_for("https://upstream.example.test"),
+            &compute_sha256(&oversized_body),
+            &oversized_body,
+        )
+        .await;
+
+        // 2) Upstream serves bytes that do not hash to the declared digest.
+        let (manifest, config_digest, layer_digest) = image_manifest(b"real-cfg", b"real-layer");
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_blob(&upstream, "app", &config_digest, b"poisoned bytes").await;
+        mount_upstream_blob(&upstream, "app", &layer_digest, b"real-layer").await;
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state_with_proxy =
+            tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mismatch = stage_proxy_image_blobs(
+            &state_with_proxy,
+            &ctx_for(&upstream.uri()),
+            &compute_sha256(&manifest),
+            &manifest,
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert!(over.is_err(), "declared-over-cap image must hard-error");
+        assert!(
+            mismatch.is_err(),
+            "digest-mismatched upstream blob bytes must hard-error, never be staged"
+        );
+    }
+
+    /// Staging must be IDEMPOTENT: re-scanning an image whose blobs are
+    /// already local must SKIP them and succeed, not hard-error.
+    ///
+    /// Regression: the already-local probe was `SELECT 1` decoded as `i64`,
+    /// but a bare `1` is INT4 in Postgres, so the decode failed the moment an
+    /// `oci_blobs` row existed. On this fail-closed path that turned every
+    /// re-scan of an already-staged image into a permanent 423 — including
+    /// the recovery re-pull after a transient CVE-engine outage, which must
+    /// re-scan and reach a real verdict.
+    #[tokio::test]
+    async fn test_stage_proxy_image_blobs_is_idempotent_when_already_local() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config_bytes = b"idempotent config";
+        let layer_bytes = b"idempotent layer";
+        let (manifest, config_digest, layer_digest) = image_manifest(config_bytes, layer_bytes);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_blob(&upstream, "app", &config_digest, config_bytes).await;
+        mount_upstream_blob(&upstream, "app", &layer_digest, layer_bytes).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let ctx = crate::api::handlers::proxy_helpers::OciImageScanCtx {
+            repo_id: fx.repo_id,
+            repo_key: fx.repo_key.clone(),
+            repo_type: "remote".to_string(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            },
+            image: "app".to_string(),
+            upstream_url: Some(upstream.uri()),
+        };
+        let digest = compute_sha256(&manifest);
+
+        let first = stage_proxy_image_blobs(&state, &ctx, &digest, &manifest).await;
+        // Second pass: both blobs now have oci_blobs rows, so the "already
+        // local" probe is the code under test.
+        let second = stage_proxy_image_blobs(&state, &ctx, &digest, &manifest).await;
+        let staged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = ANY($2)",
+        )
+        .bind(fx.repo_id)
+        .bind(vec![config_digest.clone(), layer_digest.clone()])
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count staged blobs");
+
+        fx.teardown().await;
+
+        assert!(first.is_ok(), "first staging pass must succeed: {first:?}");
+        assert!(
+            second.is_ok(),
+            "re-staging an already-local image must succeed (idempotent), got {second:?}"
+        );
+        assert_eq!(
+            staged, 2,
+            "no duplicate rows; both blobs staged exactly once"
+        );
+    }
+
+    // ── #3003 round 2: the three red-team bypasses, end-to-end ────────────
+
+    /// Build a runnable image manifest carrying `extra` decoration, whose
+    /// config/layer digests match the given bytes so blob staging can verify
+    /// what the upstream serves.
+    fn bypass_manifest(
+        config_bytes: &[u8],
+        layer_bytes: &[u8],
+        extra: serde_json::Value,
+    ) -> (Bytes, String, String) {
+        let config_digest = compute_sha256(config_bytes);
+        let layer_digest = compute_sha256(layer_bytes);
+        let mut m = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MT,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer_bytes.len(),
+            }],
+        });
+        {
+            let obj = m.as_object_mut().unwrap();
+            for (k, v) in extra.as_object().unwrap() {
+                if k == "layers" {
+                    obj.get_mut("layers")
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(v.as_array().unwrap().clone());
+                } else {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        (
+            Bytes::from(serde_json::to_vec(&m).unwrap()),
+            config_digest,
+            layer_digest,
+        )
+    }
+
+    /// HIGH-1 / HIGH-2 end-to-end: each crafted shape carries a REAL runnable
+    /// image, so a 200 here means a consumer just pulled an unscanned image.
+    /// With no scanner service on the state the inline scan is inconclusive,
+    /// so the only fail-closed-correct answers are 423 (withheld) or 403
+    /// (blocked) — never 200.
+    #[tokio::test]
+    async fn test_get_manifest_bypass_shapes_are_not_served_unscanned() {
+        let shapes: Vec<(&str, serde_json::Value)> = vec![
+            // HIGH-1: cosmetic empty manifests array -> classified Index.
+            (
+                "empty-manifests-array",
+                serde_json::json!({"manifests": []}),
+            ),
+            // HIGH-1 variant: non-empty array pointing at an unrelated child.
+            (
+                "populated-manifests-array",
+                serde_json::json!({"manifests": [{
+                    "mediaType": IMAGE_MANIFEST_MT,
+                    "digest": format!("sha256:{}", "c".repeat(64)),
+                    "size": 100,
+                    "platform": {"os": "linux", "architecture": "amd64"},
+                }]}),
+            ),
+            // HIGH-2: one decoy non-image layer next to the real rootfs layer.
+            (
+                "cosign-decoy-layer",
+                serde_json::json!({"layers": [{
+                    "mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                    "digest": format!("sha256:{}", "d".repeat(64)), "size": 3,
+                }]}),
+            ),
+            (
+                "wasm-decoy-layer",
+                serde_json::json!({"layers": [{
+                    "mediaType": "application/wasm",
+                    "digest": format!("sha256:{}", "e".repeat(64)), "size": 3,
+                }]}),
+            ),
+            // Both at once.
+            (
+                "both-shapes",
+                serde_json::json!({
+                    "manifests": [],
+                    "layers": [{
+                        "mediaType": "application/spdx+json",
+                        "digest": format!("sha256:{}", "f".repeat(64)), "size": 3,
+                    }],
+                }),
+            ),
+        ];
+
+        for (label, extra) in shapes {
+            let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+                return;
+            };
+            let (manifest, _, _) = bypass_manifest(b"bypass-cfg", b"bypass-layer", extra);
+            let digest = sha256_hex(&manifest);
+
+            let upstream = wiremock::MockServer::start().await;
+            mount_upstream_manifest(
+                &upstream,
+                "app",
+                "latest",
+                &manifest,
+                IMAGE_MANIFEST_MT,
+                None,
+            )
+            .await;
+            wire_public_remote(&fx, &upstream).await;
+            enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+            let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+            let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+            let status = resp.status();
+
+            cleanup_proxy_scan_row(&fx.pool, &digest).await;
+            fx.teardown().await;
+
+            assert!(
+                status == StatusCode::LOCKED || status == StatusCode::FORBIDDEN,
+                "{label}: a runnable image dressed up to dodge the gate must be \
+                 withheld under fail_closed, got {status} (200 = served UNSCANNED)"
+            );
+        }
+    }
+
+    /// Control for the shapes above: a genuine non-image OCI artifact (a real
+    /// cosign signature — image config but NO rootfs layer) must still pass
+    /// ungated under fail_closed. Closing the bypasses must not start
+    /// withholding signatures, SBOMs and charts.
+    #[tokio::test]
+    async fn test_get_manifest_real_signature_artifact_still_passes() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let sig = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MT,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [{"mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+        });
+        let body = Bytes::from(serde_json::to_vec(&sig).unwrap());
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "sig", &body, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let resp = pull_manifest(&state, &fx.repo_key, "sig").await;
+        let status = resp.status();
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a real cosign signature has no rootfs layer and must pass ungated"
+        );
+    }
+
+    // ── HIGH-3: the blob path ─────────────────────────────────────────────
+
+    /// HIGH-3 end-to-end: blocking the manifest is not enough. Every blob a
+    /// vulnerable image names is content-addressed, so before this fix the
+    /// client took the 403 on the manifest and then fetched the config and
+    /// layer blobs 200 by digest and reconstructed the image. A blob belonging
+    /// to an image with a vulnerable verdict must be refused; a blob belonging
+    /// to a clean image in the same repo must still serve.
+    #[tokio::test]
+    async fn test_get_blob_blocked_for_vulnerable_image_but_not_clean_one() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+
+        let (vuln_manifest, vuln_config, vuln_layer) = image_manifest(b"bad-cfg", b"bad-layer");
+        let (clean_manifest, clean_config, clean_layer) =
+            image_manifest(b"good-cfg", b"good-layer");
+        let vuln_digest = compute_sha256(&vuln_manifest);
+        let clean_digest = compute_sha256(&clean_manifest);
+
+        // Record the config/layer edges for BOTH images, exactly as the gate's
+        // blob staging does.
+        for (mdigest, body) in [
+            (&vuln_digest, &vuln_manifest),
+            (&clean_digest, &clean_manifest),
+        ] {
+            record_manifest_blob_refs(&fx.pool, fx.repo_id, mdigest, body)
+                .await
+                .expect("record blob refs");
+        }
+        // ...and put the blobs in local storage so a serve would otherwise 200.
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [
+            (&vuln_config, b"bad-cfg".to_vec()),
+            (&vuln_layer, b"bad-layer".to_vec()),
+            (&clean_config, b"good-cfg".to_vec()),
+            (&clean_layer, b"good-layer".to_vec()),
+        ] {
+            let key = blob_storage_key(d);
+            storage
+                .put(&key, Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+
+        // Only the first image is vulnerable.
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                vuln_digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "vulnerable",
+                4,
+                1,
+                3,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                clean_digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let get_blob = |d: String| {
+            let state = fx.state.clone();
+            let key = fx.repo_key.clone();
+            async move {
+                let app = tdh::router_anon(router(), state);
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{key}/app/blobs/{d}"))
+                    .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.expect("oneshot").status()
+            }
+        };
+
+        let vuln_cfg_status = get_blob(vuln_config.clone()).await;
+        let vuln_layer_status = get_blob(vuln_layer.clone()).await;
+        let clean_cfg_status = get_blob(clean_config.clone()).await;
+        let clean_layer_status = get_blob(clean_layer.clone()).await;
+
+        for d in [&vuln_digest, &clean_digest] {
+            cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            vuln_cfg_status,
+            StatusCode::FORBIDDEN,
+            "the CONFIG blob of a vulnerable image must not serve (HIGH-3)"
+        );
+        assert_eq!(
+            vuln_layer_status,
+            StatusCode::FORBIDDEN,
+            "the LAYER blob of a vulnerable image must not serve (HIGH-3)"
+        );
+        assert_eq!(
+            clean_cfg_status,
+            StatusCode::OK,
+            "a clean image's config blob must still serve (no over-block)"
+        );
+        assert_eq!(
+            clean_layer_status,
+            StatusCode::OK,
+            "a clean image's layer blob must still serve (no over-block)"
+        );
+    }
+
+    /// Scoping, stated precisely.
+    ///
+    /// The verdict store is content-addressed and therefore global by design
+    /// (#2954): the SAME manifest digest proxied into two repositories is the
+    /// same image, so it is correctly blocked in both. What IS per-repository
+    /// is the reference set: a layer digest that another repo happens to share
+    /// via a DIFFERENT, clean image keeps serving there. This pins both halves
+    /// so neither can silently flip into an over-block or a leak.
+    #[tokio::test]
+    async fn test_blob_block_scoping_shared_digest_vs_shared_layer() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let Some(other) = tdh::Fixture::setup("remote", "docker").await else {
+            fx.teardown().await;
+            return;
+        };
+
+        // A vulnerable image in repo A, whose LAYER is also used by a
+        // different, clean image in repo B.
+        let shared_layer_bytes = b"a layer two different images share";
+        let (vuln_manifest, _vc, shared_layer) = image_manifest(b"vuln-cfg", shared_layer_bytes);
+        let (clean_manifest, _cc, shared_layer_again) =
+            image_manifest(b"clean-cfg", shared_layer_bytes);
+        assert_eq!(
+            shared_layer, shared_layer_again,
+            "fixture must actually share the layer digest"
+        );
+        let vuln_digest = compute_sha256(&vuln_manifest);
+        let clean_digest = compute_sha256(&clean_manifest);
+
+        record_manifest_blob_refs(&fx.pool, fx.repo_id, &vuln_digest, &vuln_manifest)
+            .await
+            .expect("refs repo a");
+        record_manifest_blob_refs(&other.pool, other.repo_id, &clean_digest, &clean_manifest)
+            .await
+            .expect("refs repo b");
+        // The same vulnerable manifest is ALSO proxied into repo B.
+        record_manifest_blob_refs(&other.pool, other.repo_id, &vuln_digest, &vuln_manifest)
+            .await
+            .expect("same image into repo b");
+
+        let pss = ProxyScanService::new(fx.pool.clone());
+        pss.record_verdict(
+            vuln_digest.strip_prefix("sha256:").unwrap(),
+            "grype",
+            "vulnerable",
+            1,
+            1,
+            0,
+            0,
+            0,
+            Some("critical"),
+            Some("grype-1.0.0-test"),
+            Some(fx.repo_id),
+        )
+        .await
+        .expect("seed vulnerable verdict");
+        pss.record_verdict(
+            clean_digest.strip_prefix("sha256:").unwrap(),
+            "grype",
+            "clean",
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-1.0.0-test"),
+            Some(other.repo_id),
+        )
+        .await
+        .expect("seed clean verdict");
+
+        let blocked_in_a = blob_belongs_to_vulnerable_image(&fx.state, fx.repo_id, &shared_layer)
+            .await
+            .expect("lookup a");
+        // Repo B references the SAME vulnerable manifest, so the shared layer
+        // is blocked there too — same bytes, same image, same verdict.
+        let blocked_in_b_with_same_image =
+            blob_belongs_to_vulnerable_image(&other.state, other.repo_id, &shared_layer)
+                .await
+                .expect("lookup b");
+
+        // Now drop repo B's reference to the vulnerable image. Its only
+        // remaining reference to the shared layer is via the CLEAN image, so
+        // the layer must serve again in B while staying blocked in A.
+        sqlx::query(
+            "DELETE FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(other.repo_id)
+        .bind(&vuln_digest)
+        .execute(&other.pool)
+        .await
+        .expect("drop repo b reference");
+        let blocked_in_b_clean_only =
+            blob_belongs_to_vulnerable_image(&other.state, other.repo_id, &shared_layer)
+                .await
+                .expect("lookup b again");
+        let still_blocked_in_a =
+            blob_belongs_to_vulnerable_image(&fx.state, fx.repo_id, &shared_layer)
+                .await
+                .expect("lookup a again");
+
+        for d in [&vuln_digest, &clean_digest] {
+            cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
+        }
+        other.teardown().await;
+        fx.teardown().await;
+
+        assert!(
+            blocked_in_a,
+            "the layer of a vulnerable image must be blocked in its own repo"
+        );
+        assert!(
+            blocked_in_b_with_same_image,
+            "the SAME vulnerable image proxied elsewhere is still that image: \
+             the content-addressed verdict must apply there too"
+        );
+        assert!(
+            !blocked_in_b_clean_only,
+            "a repo that only references the shared layer via a CLEAN image must \
+             keep serving it — the blocklist is derived from THIS repo's refs"
+        );
+        assert!(
+            still_blocked_in_a,
+            "repo A is unaffected by what repo B references"
+        );
+    }
+
+    /// A blob with no scan history at all is served normally — the gate only
+    /// blocks what it has positively graded vulnerable.
+    #[tokio::test]
+    async fn test_blob_with_no_scan_history_is_not_blocked() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let unknown = format!("sha256:{}", "9".repeat(64));
+        let blocked = blob_belongs_to_vulnerable_image(&fx.state, fx.repo_id, &unknown)
+            .await
+            .expect("lookup");
+        fx.teardown().await;
+        assert!(!blocked, "an unscanned blob must not be blocked");
     }
 }

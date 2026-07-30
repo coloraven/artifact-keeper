@@ -425,6 +425,55 @@ struct LayoutManifest {
     media_type: String,
 }
 
+/// The `mediaType` to stamp on the `oci-dir:` layout descriptor for a manifest
+/// body, derived from the BODY rather than from an upstream-supplied header
+/// (#3003 round 2).
+///
+/// Grype refuses to parse a layout whose descriptor mediaType is not a
+/// manifest type (`unable to parse OCI directory as an image: unexpected media
+/// type ... application/octet-stream`). The header is exactly the wrong source
+/// for it: it is attacker/misconfiguration-controlled, and a proxy upstream
+/// that answers a manifest GET with `application/octet-stream` would make
+/// EVERY image scan fail to parse. Under `fail_closed` that is an availability
+/// break (every pull 423s); under `fail_open` it is a security bypass — every
+/// scan is inconclusive, so every image serves unscanned with `X-AK-Scan:
+/// pending`, forever.
+///
+/// Order of preference:
+///   1. the `mediaType` the manifest declares about ITSELF (authoritative, and
+///      the value the digest is computed over, so it cannot be tampered with
+///      independently of the content);
+///   2. the supplied header, but only when it already looks like a manifest
+///      media type;
+///   3. the canonical OCI image manifest type.
+fn manifest_media_type_from_body(body: &[u8], header: &str) -> String {
+    let declared = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("mediaType")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .filter(|s| is_manifest_media_type(s));
+    declared.unwrap_or_else(|| {
+        if is_manifest_media_type(header) {
+            header.to_string()
+        } else {
+            crate::formats::oci::media_types::OCI_MANIFEST.to_string()
+        }
+    })
+}
+
+/// Does this look like an OCI/Docker *manifest* media type (as opposed to a
+/// generic binary type an upstream may have guessed)?
+fn is_manifest_media_type(media_type: &str) -> bool {
+    let mt = media_type.trim().to_ascii_lowercase();
+    (mt.contains("vnd.oci.image.manifest")
+        || mt.contains("vnd.oci.image.index")
+        || mt.contains("vnd.docker.distribution.manifest"))
+        && mt.contains("json")
+}
+
 fn artifact_digest(checksum_sha256: &str) -> String {
     let trimmed = checksum_sha256.trim();
     if trimmed.starts_with("sha256:") {
@@ -759,22 +808,30 @@ impl GrypeScanner {
 
         let grype_target = format!("oci-dir:{}", layout_dir.to_string_lossy());
         info!("Grype OCI local layout scan target: {}", grype_target);
-        // Local OCI layout: no registry pull, so no registry-auth env.
-        let result = match self.run_grype_target(&grype_target, &[]).await {
-            Ok(report) => {
+        // Keep the BOM out of the layout tree: grype scans the whole dir.
+        let bom_path = layout_dir.with_extension("grype-bom.json");
+        // Local OCI layout: no registry pull, so no registry-auth env. The
+        // catalog side channel (#3003 PR-2) rides the same single invocation
+        // so the inline OCI proxy gate can tell "clean" from "graded nothing".
+        let result = match self
+            .run_grype_with_catalog(&grype_target, &bom_path, &[])
+            .await
+        {
+            Ok((report, cataloged)) => {
                 let findings = Self::convert_findings(&report);
                 let packages = Self::convert_packages(&report);
                 info!(
-                    "Grype OCI local layout scan complete for {}: {} vulnerabilities, {} components",
+                    "Grype OCI local layout scan complete for {}: {} vulnerabilities, {} components, {} cataloged",
                     artifact.name,
                     findings.len(),
-                    packages.len()
+                    packages.len(),
+                    cataloged.as_ref().map_or(0, |c| c.len()),
                 );
                 Ok(ScanOutput {
                     findings,
                     packages,
                     scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
-                    cataloged: None,
+                    cataloged,
                 })
             }
             Err(e) => Err(fail_scan(
@@ -834,8 +891,8 @@ impl GrypeScanner {
             | ScanReferenceResolution::UnresolvableIndex(_) => {
                 return Ok(Some(LayoutManifest {
                     digest: artifact_manifest_digest,
+                    media_type: manifest_media_type_from_body(content, &artifact.content_type),
                     body: content.clone(),
-                    media_type: artifact.content_type.clone(),
                 }));
             }
         };
@@ -868,15 +925,9 @@ impl GrypeScanner {
 
         // Prefer the child manifest's own declared mediaType; fall back to the
         // generic OCI image manifest type so the oci-dir descriptor is valid.
-        let media_type = serde_json::from_slice::<serde_json::Value>(&child_body)
-            .ok()
-            .and_then(|v| {
-                v.get("mediaType")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+        // Single-sourced with the passthrough branch so neither can start
+        // trusting a header the upstream controls.
+        let media_type = manifest_media_type_from_body(&child_body, "");
 
         Ok(Some(LayoutManifest {
             digest: child_digest,
@@ -1019,11 +1070,25 @@ impl GrypeScanner {
         // Keep the BOM out of the scanned tree: writing it inside `workspace`
         // would make the next catalog include our own artifact.
         let bom_path = workspace.with_extension("grype-bom.json");
+        self.run_grype_with_catalog(&dir_arg, &bom_path, &[]).await
+    }
 
+    /// Target-agnostic core of [`run_grype_dir_with_catalog`], shared with the
+    /// `oci-dir:` layout scan (#3003 PR-2) so the OCI inline proxy gate gets
+    /// the same catalog signal the file formats do. One grype subprocess per
+    /// scan: the json report and the cyclonedx BOM come from the SAME
+    /// invocation (a second scan would double the inline budget on every
+    /// proxy pull).
+    async fn run_grype_with_catalog(
+        &self,
+        scan_arg: &str,
+        bom_path: &Path,
+        auth_env: &[(&'static str, String)],
+    ) -> Result<(GrypeReport, Option<Vec<CatalogedComponent>>)> {
         let mut command = tokio::process::Command::new("grype");
         command
             .args([
-                dir_arg.as_str(),
+                scan_arg,
                 "-o",
                 "json",
                 "-o",
@@ -1032,6 +1097,12 @@ impl GrypeScanner {
             .env("GRYPE_DB_AUTO_UPDATE", "false")
             .env("GRYPE_DB_VALIDATE_AGE", "false")
             .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
+        // Registry-auth env for a scoped private-repo pull (#2093). Applied as
+        // child-process env only — never persisted or logged. Empty for local
+        // (dir-mode / oci-dir-mode) and anonymous registry scans.
+        for (key, value) in auth_env {
+            command.env(key, value);
+        }
         let output = command
             .output()
             .await
@@ -1634,8 +1705,8 @@ mod tests {
     fn test_catalog_invocation_is_single_run_dual_output() {
         let src = include_str!("grype_scanner.rs");
         let start = src
-            .find("async fn run_grype_dir_with_catalog")
-            .expect("run_grype_dir_with_catalog must exist");
+            .find("async fn run_grype_with_catalog")
+            .expect("run_grype_with_catalog must exist");
         let body = &src[start..start + 2000];
         assert!(
             body.contains("\"-o\",\n                \"json\",") || body.contains("\"json\","),
@@ -1650,6 +1721,81 @@ mod tests {
             1,
             "exactly one grype subprocess per scan"
         );
+    }
+
+    // ---- #3003 round 2: layout descriptor mediaType comes from the BODY ---
+
+    /// The `oci-dir:` descriptor mediaType must be derived from the manifest
+    /// body, never from an upstream-supplied header. Grype refuses to parse a
+    /// layout whose descriptor is not a manifest type, so a proxy upstream
+    /// answering with `application/octet-stream` would make every image scan
+    /// inconclusive: 423 for every pull under fail_closed, and — worse —
+    /// permanent "serve unscanned + X-AK-Scan: pending" under fail_open.
+    #[test]
+    fn test_layout_media_type_prefers_body_over_header() {
+        let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#;
+        // A junk header must NOT win over the body's own declaration.
+        assert_eq!(
+            manifest_media_type_from_body(body, "application/octet-stream"),
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        // Docker schema2 bodies keep their own variant.
+        let docker = br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}"#;
+        assert_eq!(
+            manifest_media_type_from_body(docker, ""),
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+    }
+
+    #[test]
+    fn test_layout_media_type_falls_back_sanely() {
+        // No declaration in the body: a PLAUSIBLE header is honoured...
+        let bare = br#"{"schemaVersion":2,"config":{},"layers":[]}"#;
+        assert_eq!(
+            manifest_media_type_from_body(
+                bare,
+                "application/vnd.docker.distribution.manifest.v2+json"
+            ),
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+        // ...but a junk header is replaced with the canonical OCI type rather
+        // than passed through to produce an unparseable layout.
+        for junk in [
+            "application/octet-stream",
+            "",
+            "text/html",
+            "application/json",
+        ] {
+            assert_eq!(
+                manifest_media_type_from_body(bare, junk),
+                "application/vnd.oci.image.manifest.v1+json",
+                "junk header {junk:?} must not reach the layout descriptor"
+            );
+        }
+        // A body declaring a junk mediaType is likewise not trusted.
+        let lying = br#"{"schemaVersion":2,"mediaType":"application/octet-stream"}"#;
+        assert_eq!(
+            manifest_media_type_from_body(lying, "application/octet-stream"),
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+    }
+
+    #[test]
+    fn test_is_manifest_media_type() {
+        assert!(is_manifest_media_type(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
+        assert!(is_manifest_media_type(
+            "application/vnd.oci.image.index.v1+json"
+        ));
+        assert!(is_manifest_media_type(
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        ));
+        assert!(!is_manifest_media_type("application/octet-stream"));
+        assert!(!is_manifest_media_type(
+            "application/vnd.oci.image.config.v1+json"
+        ));
+        assert!(!is_manifest_media_type(""));
     }
 
     // ---- #2093: registry-auth env builder --------------------------------
@@ -2010,6 +2156,7 @@ mod tests {
             storage: None,
             manifest_body: Some(helm_body),
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(
             !grype().is_applicable_for_target(&target),
@@ -2038,6 +2185,7 @@ mod tests {
             storage: None,
             manifest_body: Some(image_body),
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(grype().is_applicable_for_target(&target));
     }
@@ -2326,6 +2474,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         // The scan dispatch resolves a routable, repository-scoped ref.
@@ -2373,6 +2522,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(
             grype().is_applicable_for_target(&target),
@@ -2440,6 +2590,7 @@ mod tests {
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         let layout = scanner
@@ -2545,6 +2696,7 @@ mod tests {
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         let layout = scanner
@@ -2624,6 +2776,7 @@ mod tests {
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
@@ -2671,6 +2824,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
 
