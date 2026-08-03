@@ -233,6 +233,22 @@ pub(crate) fn version_from_pypi_filename(filename: &str) -> Option<String> {
     None
 }
 
+/// The distribution a request ultimately refers to, with any PEP 658
+/// `.metadata` suffix removed.
+///
+/// ALL trailing `.metadata` suffixes are stripped, not just one. The serve path
+/// resolves a metadata request back to a distribution the same way, and the
+/// curation gate must evaluate the distribution that will actually be served:
+/// when the two disagree, a request naming the same wheel through a different
+/// suffix shape (`…-1.0-py3-none-any.whl.metadata.metadata`) is version-parsed
+/// as `None` — which skips version-constrained rules — while still resolving to
+/// the blocked wheel, serving a blocked version's metadata. Both callers in
+/// `download_or_metadata` share one call to this function so they cannot drift
+/// apart again.
+fn pypi_distribution_filename(filename: &str) -> &str {
+    filename.trim_end_matches(".metadata")
+}
+
 /// Curation gate for PyPI proxy requests (#2912). Returns
 /// `Err(403 response)` when a block rule matches.
 ///
@@ -1534,13 +1550,47 @@ async fn download_or_metadata(
     // either branch below. The version is parsed from the distribution filename so
     // exact- and range-constrained rules apply on this path; an unrecognized
     // filename shape yields `None`, which matches on name only.
+    //
+    // `distribution` is resolved ONCE and reused by the metadata branch below:
+    // the gate must evaluate exactly the distribution the serve path resolves,
+    // or a suffix shape that parses to a different (or no) version slips past a
+    // version-constrained rule and is then served anyway.
     let normalized = normalize_pep503(&project);
-    let requested_version = version_from_pypi_filename(&filename);
+    let distribution = pypi_distribution_filename(&filename);
+    let requested_version = version_from_pypi_filename(distribution);
     enforce_pypi_curation(&state, &repo, &normalized, requested_version.as_deref()).await?;
 
-    // PEP 658: if filename ends with .metadata, serve extracted METADATA
+    // PEP 658: serve metadata from the remote upstream when possible. If the
+    // upstream advertises metadata but returns 404, fall back to extracting it
+    // from the wheel so clients do not see the hard failure that motivated
+    // stripping these attributes in the first place.
     if filename.ends_with(".metadata") {
-        let real_filename = filename.trim_end_matches(".metadata");
+        // PEP 658 names exactly one metadata resource per distribution,
+        // `<distribution>.metadata`; a stacked suffix names none. Refusing the
+        // shape outright keeps a request that is not a metadata request from
+        // resolving back to a distribution at all — defence in depth behind the
+        // shared `distribution` above, which is what actually gates curation.
+        if filename
+            .strip_suffix(".metadata")
+            .is_some_and(|rest| rest.ends_with(".metadata"))
+        {
+            return Err(AppError::NotFound(format!("File not found: {}", filename)).into_response());
+        }
+        let real_filename = distribution;
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
+                return serve_remote_metadata(
+                    &state,
+                    proxy,
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    &project,
+                    real_filename,
+                )
+                .await;
+            }
+        }
         return serve_metadata(
             &state,
             &state.db,
@@ -1562,6 +1612,93 @@ async fn download_or_metadata(
         &ctx,
     )
     .await
+}
+
+async fn serve_remote_metadata(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    project: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    let metadata_filename = format!("{}.metadata", filename);
+    let target = resolve_pypi_remote_fetch_target(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        &metadata_filename,
+        &index_path,
+    )
+    .await?;
+
+    let remote_repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        &target.fetch_base,
+        RepositoryFormat::Pypi,
+    );
+
+    match proxy
+        .fetch_upstream_direct_with_link(&remote_repo, &target.fetch_path)
+        .await
+    {
+        Ok((content, _content_type, _)) => {
+            // The content-type is fixed, never relayed from upstream: a PEP 658
+            // metadata resource is always the plain-text METADATA file, so a
+            // hostile or misconfigured upstream labelling it `text/html` must
+            // not get that type echoed back under this origin. Matches the
+            // wheel-extraction arm below.
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Body::from(content))
+                .unwrap())
+        }
+        Err(AppError::NotFound(_)) => {
+            let wheel_target = resolve_pypi_remote_fetch_target(
+                proxy,
+                repo_id,
+                repo_key,
+                upstream_url,
+                project,
+                filename,
+                &index_path,
+            )
+            .await?;
+            let wheel_repo = proxy_helpers::build_remote_repo_with_format(
+                repo_id,
+                repo_key,
+                &wheel_target.fetch_base,
+                RepositoryFormat::Pypi,
+            );
+            let (wheel, _) = proxy
+                .fetch_artifact_with_cache_path(
+                    &wheel_repo,
+                    &wheel_target.fetch_path,
+                    &wheel_target.cache_path,
+                )
+                .await
+                .map_err(|e| e.into_response())?;
+            let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+                extract_metadata_from_wheel(&wheel)
+            })
+            .map_err(|e| e.into_response())?
+            .ok_or_else(|| {
+                AppError::NotFound("Metadata not available".to_string()).into_response()
+            })?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Body::from(metadata))
+                .unwrap())
+        }
+        Err(error) => Err(error.into_response()),
+    }
 }
 
 fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
@@ -2543,7 +2680,8 @@ async fn resolve_pypi_remote_fetch_target(
     // index request, and the relative paths in the HTML are relative to
     // the final serving URL, not the originally requested URL.
     let full_index_url = effective_url;
-    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url));
+    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url))
+        .or_else(|| find_upstream_metadata_url(&index_html, filename, Some(&full_index_url)));
 
     let fallback = || {
         let (base, path) = pypi_upstream_url_and_path(
@@ -3360,9 +3498,6 @@ static REWRITE_RE: Lazy<Regex> = Lazy::new(|| {
         .unwrap()
 });
 
-static METADATA_ATTR_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\s*data-(?:dist-info-metadata|core-metadata)="[^"]*""#).unwrap());
-
 /// Split a URL into its base (scheme + host) and path components.
 ///
 /// For example, `https://files.pythonhosted.org/packages/ab/cd/file.whl` splits
@@ -3434,6 +3569,25 @@ fn find_upstream_url_for_file(
     None
 }
 
+/// Resolve a PEP 658 metadata filename from the corresponding wheel URL.
+/// PyPI advertises the metadata hash on the wheel anchor but usually does not
+/// include a separate `.whl.metadata` anchor in the Simple API page.
+fn find_upstream_metadata_url(
+    index_html: &str,
+    filename: &str,
+    index_url: Option<&str>,
+) -> Option<String> {
+    let wheel_filename = filename.strip_suffix(".metadata")?;
+    if !wheel_filename.ends_with(".whl") {
+        return None;
+    }
+
+    let wheel_url = find_upstream_url_for_file(index_html, wheel_filename, index_url)?;
+    let mut url = url::Url::parse(&wheel_url).ok()?;
+    url.set_path(&format!("{}.metadata", url.path()));
+    Some(url.into())
+}
+
 /// Rewrite download URLs in upstream PyPI simple index HTML to route through
 /// Artifact Keeper's proxy endpoint.
 ///
@@ -3449,11 +3603,9 @@ fn find_upstream_url_for_file(
 /// `/pypi/` are rewritten. Plain relative URLs and anchors are left unchanged.
 ///
 /// PEP 658 metadata attributes (`data-dist-info-metadata` and
-/// `data-core-metadata`) are stripped from rewritten links because the proxy
-/// cannot serve `.metadata` files for packages it has not stored locally.
-/// Keeping these attributes would cause pip to request a `.metadata` URL that
-/// returns 404, which pip treats as a hard error since the index promised the
-/// metadata was available.
+/// `data-core-metadata`) are preserved on rewritten links. The download path
+/// resolves `.metadata` filenames through the same upstream Simple API page,
+/// so removing these attributes would prevent installers from using PEP 658.
 /// Classification of a proxied PyPI simple-index body sniffed from its
 /// content, used when the upstream `Content-Type` is neither PEP 691 JSON nor
 /// PEP 503 HTML. See #2801: corporate outbound proxies / quirky mirrors
@@ -3546,16 +3698,7 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
                 repo_key, normalized, filename, fragment
             );
 
-            // Strip PEP 658 metadata attributes. The proxy does not cache or
-            // serve .metadata files, so advertising them causes pip to fail
-            // with a 404 when it tries to fetch the promised metadata.
-            let before_cleaned = METADATA_ATTR_RE.replace_all(before_href, "");
-            let after_cleaned = METADATA_ATTR_RE.replace_all(after_href, "");
-
-            format!(
-                "<a {}href=\"{}\"{}>",
-                before_cleaned, rewritten, after_cleaned
-            )
+            format!("<a {}href=\"{}\"{}>", before_href, rewritten, after_href)
         })
         .into_owned()
 }
@@ -3565,9 +3708,10 @@ const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 
 /// Rewrite the `files[].url` of a parsed PEP 691 JSON simple index to route
 /// downloads through Artifact Keeper's proxy, mirroring `rewrite_upstream_urls`
-/// for the HTML form, and strip the PEP 658/714 metadata signals the proxy
-/// cannot serve (`core-metadata`, `data-dist-info-metadata`). PEP 700
-/// `upload-time` and every other field are preserved untouched.
+/// for the HTML form. PEP 658/714 metadata signals (`core-metadata`,
+/// `data-dist-info-metadata`) are preserved so installers can request the
+/// corresponding `.metadata` file through the proxy. PEP 700 `upload-time`
+/// and every other field are preserved untouched.
 fn rewrite_simple_json_files(doc: &mut serde_json::Value, repo_key: &str, normalized: &str) {
     let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
         return;
@@ -3590,11 +3734,6 @@ fn rewrite_simple_json_files(doc: &mut serde_json::Value, repo_key: &str, normal
                 repo_key, normalized, filename
             )),
         );
-        // The proxy cannot serve `.metadata` for distributions it has not
-        // cached, so drop the PEP 658/714 metadata signals — the JSON analogue
-        // of the `data-*-metadata` stripping in `rewrite_upstream_urls`.
-        obj.remove("core-metadata");
-        obj.remove("data-dist-info-metadata");
     }
 }
 
@@ -4051,6 +4190,45 @@ mod tests {
     use super::*;
     use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn metadata_filename_uses_distribution_version_for_curation() {
+        let wheel = "demo-1.2.3-py3-none-any.whl";
+        let metadata = format!("{wheel}.metadata");
+        assert_eq!(
+            version_from_pypi_filename(wheel),
+            version_from_pypi_filename(pypi_distribution_filename(&metadata))
+        );
+        assert_eq!(version_from_pypi_filename(wheel).as_deref(), Some("1.2.3"));
+    }
+
+    /// A stacked `.metadata` suffix names the same distribution, so the
+    /// curation gate must parse the same version from it. Stripping only one
+    /// suffix yields `…whl.metadata`, whose version parses as `None` — and a
+    /// `None` version skips version-constrained rules, which is exactly the
+    /// bypass this resolver has to foreclose.
+    #[test]
+    fn stacked_metadata_suffix_resolves_to_the_same_distribution() {
+        let wheel = "demo-1.0-py3-none-any.whl";
+        for suffix in [
+            "",
+            ".metadata",
+            ".metadata.metadata",
+            ".metadata.metadata.metadata",
+        ] {
+            let requested = format!("{wheel}{suffix}");
+            assert_eq!(
+                pypi_distribution_filename(&requested),
+                wheel,
+                "'{requested}' must resolve to the distribution the serve path fetches"
+            );
+            assert_eq!(
+                version_from_pypi_filename(pypi_distribution_filename(&requested)).as_deref(),
+                Some("1.0"),
+                "'{requested}' must version-parse as 1.0 so `==1.0` rules apply"
+            );
+        }
+    }
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -4651,10 +4829,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_strips_data_dist_info_metadata() {
+    fn test_rewrite_preserves_data_dist_info_metadata() {
         // Real PyPI HTML includes data-dist-info-metadata on .whl links.
-        // The proxy cannot serve .metadata files, so these attributes must
-        // be stripped to prevent pip from requesting them and getting 404.
+        // The metadata URL is proxied through the same upstream Simple API,
+        // so its hash must remain attached to the rewritten wheel link.
         let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=8abb" data-requires-python="&gt;=2.7" data-dist-info-metadata="sha256=5507" data-core-metadata="sha256=5507">six-1.16.0-py2.py3-none-any.whl</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-proxy", "six");
         assert!(result.contains(
@@ -4662,13 +4840,12 @@ mod tests {
         ));
         // data-requires-python should be preserved
         assert!(result.contains(r#"data-requires-python="&gt;=2.7""#));
-        // PEP 658 metadata attributes must be stripped
-        assert!(!result.contains("data-dist-info-metadata"));
-        assert!(!result.contains("data-core-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=5507""#));
+        assert!(result.contains(r#"data-core-metadata="sha256=5507""#));
     }
 
     #[test]
-    fn test_rewrite_strips_metadata_attrs_from_real_pypi_html() {
+    fn test_rewrite_preserves_metadata_attrs_from_real_pypi_html() {
         // Simulates the actual HTML returned by pypi.org for the `six` package
         let html = r#"<!DOCTYPE html>
 <html>
@@ -4694,9 +4871,9 @@ mod tests {
         // data-requires-python should be preserved on both links
         assert!(result.contains("data-requires-python"));
 
-        // PEP 658 metadata attributes must be stripped from the .whl link
-        assert!(!result.contains("data-dist-info-metadata"));
-        assert!(!result.contains("data-core-metadata"));
+        // PEP 658 metadata hashes must be preserved on the .whl link
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=5620""#));
+        assert!(result.contains(r#"data-core-metadata="sha256=5620""#));
 
         // Structure should be preserved
         assert!(result.contains("<h1>Links for six</h1>"));
@@ -4707,7 +4884,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_rewrite_upstream_simple_json_rewrites_urls_preserves_upload_time_strips_metadata() {
+    fn test_rewrite_upstream_simple_json_rewrites_urls_preserves_metadata() {
         // Shape mirrors a real pypi.org PEP 691 JSON file object.
         let upstream = r#"{
             "meta": {"api-version": "1.1"},
@@ -4744,9 +4921,8 @@ mod tests {
         assert_eq!(file["hashes"]["sha256"], "deadbeef");
         assert_eq!(file["requires-python"], ">=3.7");
 
-        // PEP 658/714 metadata signals stripped — the proxy can't serve `.metadata`.
-        assert!(file.get("core-metadata").is_none());
-        assert!(file.get("data-dist-info-metadata").is_none());
+        assert_eq!(file["core-metadata"]["sha256"], "abc");
+        assert_eq!(file["data-dist-info-metadata"]["sha256"], "abc");
     }
 
     #[test]
@@ -5309,22 +5485,22 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_strips_metadata_attr_before_href() {
+    fn test_rewrite_preserves_metadata_attr_before_href() {
         // Edge case: metadata attribute appears before href
         let html = r#"<a data-dist-info-metadata="sha256=abc" href="https://example.com/pkg-1.0.whl#sha256=def">pkg-1.0.whl</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=def""#));
-        assert!(!result.contains("data-dist-info-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=abc""#));
     }
 
     #[test]
     fn test_rewrite_preserves_non_metadata_attrs() {
-        // Only PEP 658 attrs should be stripped; other data-* attrs remain
+        // PEP 658 and other data-* attrs should remain intact
         let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=abc" data-requires-python="&gt;=3.8" data-dist-info-metadata="sha256=def" data-gpg-sig="true">pkg-1.0.whl</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         assert!(result.contains("data-requires-python"));
         assert!(result.contains("data-gpg-sig"));
-        assert!(!result.contains("data-dist-info-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=def""#));
     }
 
     #[test]
@@ -5381,6 +5557,20 @@ mod tests {
             result,
             Some(
                 "https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_metadata_url_derives_from_wheel_url() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=abc" data-dist-info-metadata="sha256=metadata">six-1.16.0-py2.py3-none-any.whl</a>"#;
+        let result =
+            find_upstream_metadata_url(html, "six-1.16.0-py2.py3-none-any.whl.metadata", None);
+        assert_eq!(
+            result,
+            Some(
+                "https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl.metadata"
                     .to_string()
             )
         );
@@ -8790,6 +8980,347 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // PEP 658 remote `.metadata` serving (`serve_remote_metadata`). These live
+    // in-crate (not `backend/tests/`) so the coverage `--lib` run exercises
+    // the async handler body: upstream 200 → serve verbatim; upstream 404 →
+    // extract METADATA from the wheel instead of surfacing a hard failure.
+    // -----------------------------------------------------------------------
+
+    /// Serializes the `.metadata` tests' `AK_SSRF_ALLOW_PRIVATE_CIDRS`
+    /// mutation. Under nextest each test is its own process, but under plain
+    /// `cargo test` parallel threads share the environment, so the guard's
+    /// set/restore must not interleave.
+    static SSRF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SsrfEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl SsrfEnvGuard {
+        const KEY: &'static str = "AK_SSRF_ALLOW_PRIVATE_CIDRS";
+
+        fn set(value: String) -> Self {
+            let lock = SSRF_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var(Self::KEY).ok();
+            std::env::set_var(Self::KEY, value);
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SsrfEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(Self::KEY, value),
+                None => std::env::remove_var(Self::KEY),
+            }
+        }
+    }
+
+    /// Start a wiremock upstream on a **non-loopback** local address and
+    /// allowlist that address for SSRF. Required because the index-anchor URL
+    /// resolved by `resolve_pypi_remote_fetch_target` is run through
+    /// `validate_outbound_url`, which hard-blocks loopback (so a plain
+    /// `MockServer::start()` upstream would be rejected before the fetch).
+    async fn non_loopback_upstream() -> (wiremock::MockServer, SsrfEnvGuard) {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind probe socket");
+        probe.connect("8.8.8.8:80").expect("route probe");
+        let bind_ip = probe.local_addr().expect("probe local addr").ip();
+        let guard = SsrfEnvGuard::set(format!(
+            "{bind_ip}/{}",
+            if bind_ip.is_ipv4() { 32 } else { 128 }
+        ));
+        let listener = std::net::TcpListener::bind((bind_ip, 0)).expect("bind mock listener");
+        let upstream = wiremock::MockServer::builder()
+            .listener(listener)
+            .start()
+            .await;
+        (upstream, guard)
+    }
+
+    /// Simple-index HTML advertising PEP 658 metadata for `wheel`.
+    fn pep658_index_html(wheel: &str) -> String {
+        format!(
+            "<html><body><a href=\"/packages/{wheel}\" \
+             data-dist-info-metadata=\"sha256=deadbeef\">{wheel}</a></body></html>"
+        )
+    }
+
+    /// Minimal wheel (stored zip) whose only entry is
+    /// `{dist_info}.dist-info/METADATA`.
+    fn wheel_with_metadata(dist_info: &str, metadata: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(format!("{dist_info}.dist-info/METADATA"), options)
+            .expect("start METADATA entry");
+        zip.write_all(metadata).expect("write METADATA");
+        zip.finish().expect("finish wheel zip");
+        cursor.into_inner()
+    }
+
+    /// A remote index may advertise PEP 658 metadata even when the
+    /// corresponding `.whl.metadata` resource is unavailable upstream. The
+    /// proxy must not turn pip's metadata request into a hard 404: it falls
+    /// back to fetching the wheel and extracting METADATA from it
+    /// (the `Err(AppError::NotFound)` arm of `serve_remote_metadata`).
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_404_falls_back_to_wheel_metadata() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(wheel_with_metadata("demo-1.0", metadata)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upstream 404 on .whl.metadata must fall back to wheel extraction; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "served metadata must be the wheel's METADATA bytes"
+        );
+    }
+
+    /// The common real-world path: the upstream serves `.whl.metadata` with
+    /// 200 and the proxy returns that body (the `Ok` arm of
+    /// `serve_remote_metadata`). No wheel mock is mounted, so the test also
+    /// proves the fallback does not fire spuriously.
+    ///
+    /// The upstream deliberately labels the metadata `text/html`: a PEP 658
+    /// metadata resource is always the plain-text METADATA file, and relaying a
+    /// hostile upstream's content-type would let it choose how this origin
+    /// renders the response. The served type must be pinned to `text/plain`.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_200_served_directly() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(metadata),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )))
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upstream 200 on .whl.metadata must be served; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "upstream metadata must be served verbatim"
+        );
+        assert_eq!(
+            content_type, "text/plain; charset=utf-8",
+            "the served content-type must be pinned to text/plain, not relayed \
+             from the upstream (which answered text/html here)"
+        );
+    }
+
+    /// Curation must gate every spelling of a metadata request, not just the
+    /// canonical one. A version-constrained block rule is evaluated against the
+    /// version parsed from the requested distribution, so a request that names
+    /// the blocked wheel through a stacked `.metadata` suffix must resolve to
+    /// the same distribution and be blocked identically — otherwise the version
+    /// parses as `None`, the version-constrained rule is skipped, and the
+    /// blocked version's metadata is served anyway.
+    #[tokio::test]
+    async fn test_curation_blocks_every_metadata_suffix_shape() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let blocked_wheel = "demo-1.0-py3-none-any.whl";
+        let allowed_wheel = "demo-2.0-py3-none-any.whl";
+        let blocked_metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+        let allowed_metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 2.0\n";
+
+        // The upstream would happily serve both versions: only curation may
+        // withhold 1.0, so a 403 here cannot come from an unreachable mock.
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{}{}",
+                pep658_index_html(blocked_wheel),
+                pep658_index_html(allowed_wheel)
+            )))
+            .mount(&upstream)
+            .await;
+        for (wheel, metadata) in [
+            (blocked_wheel, blocked_metadata),
+            (allowed_wheel, allowed_metadata),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{wheel}.metadata")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&upstream)
+                .await;
+            let dist_info = wheel.split('-').take(2).collect::<Vec<_>>().join("-");
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{wheel}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(wheel_with_metadata(&dist_info, metadata)),
+                )
+                .mount(&upstream)
+                .await;
+        }
+
+        // `=1.0`, not `==1.0`: `version_matches` strips a single leading `=`,
+        // so the PEP 440 spelling would leave the target as `=1.0` and match
+        // nothing — which would make this test vacuously green.
+        enable_curation_with_rule(&fx.pool, fx.repo_id, fx.user_id, "demo*", "=1.0").await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let request = |suffix: &str| {
+            let state = state.clone();
+            let uri = format!("/{}/simple/{project}/{suffix}", fx.repo_key);
+            async move { tdh::send(tdh::router_anon(super::router(), state), tdh::get(uri)).await }
+        };
+
+        let (canonical_status, canonical_body) =
+            request(&format!("{blocked_wheel}.metadata")).await;
+        let (stacked_status, stacked_body) =
+            request(&format!("{blocked_wheel}.metadata.metadata")).await;
+        let (allowed_status, allowed_body) = request(&format!("{allowed_wheel}.metadata")).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            canonical_status,
+            StatusCode::FORBIDDEN,
+            "the canonical metadata request for a blocked version must 403; body: {}",
+            String::from_utf8_lossy(&canonical_body)
+        );
+        assert_eq!(
+            stacked_status,
+            StatusCode::FORBIDDEN,
+            "a stacked .metadata suffix names the same blocked distribution and \
+             must 403 identically; body: {}",
+            String::from_utf8_lossy(&stacked_body)
+        );
+        // The strongest discriminator: pre-fix this response was a 200 whose
+        // body was the blocked version's real METADATA.
+        assert_ne!(
+            &stacked_body[..],
+            blocked_metadata,
+            "a blocked version's metadata must never be served through any suffix shape"
+        );
+        assert_eq!(
+            allowed_status,
+            StatusCode::OK,
+            "a version the rule does not constrain must still be served; body: {}",
+            String::from_utf8_lossy(&allowed_body)
+        );
+        assert_eq!(
+            &allowed_body[..],
+            allowed_metadata,
+            "the unblocked version must serve its own METADATA"
+        );
     }
 
     #[test]
