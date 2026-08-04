@@ -606,6 +606,14 @@ pub(crate) fn manifest_storage_key(digest: &str) -> String {
     format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, digest)
 }
 
+/// A manifest PUT *by digest* must hash to that digest (compared
+/// case-insensitively, since clients may send uppercase hex); a *tag* reference
+/// is unconstrained. Extracted so the integrity guard in `handle_put_manifest`
+/// is unit-testable. (#3104 review)
+fn manifest_digest_reference_matches(reference: &str, computed_digest: &str) -> bool {
+    !reference.starts_with("sha256:") || reference.eq_ignore_ascii_case(computed_digest)
+}
+
 fn upload_storage_key(uuid: &Uuid) -> String {
     format!("oci-uploads/{}", uuid)
 }
@@ -4634,12 +4642,113 @@ async fn handle_get_blob(
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
 }
 
+/// OCI cross-repository blob mount: `POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<repo>`.
+///
+/// Returns `Some(201 Created)` when the blob was mounted into the target repo.
+/// Returns `None` when the mount cannot be satisfied, in which case the caller
+/// MUST fall through to opening a normal upload session — the distribution-spec
+/// requires a failed mount to degrade to an ordinary upload (202), never to
+/// error. That fallback is also what keeps this from becoming a cross-tenant
+/// probe: an unauthorized or unknown source is indistinguishable from a plain
+/// upload start, so no existence information leaks (#3109).
+///
+/// A mount is only taken when it is provably safe and free:
+/// * the caller can read the SOURCE repo (its own authorization check — the
+///   write grant on the target confers nothing on the source);
+/// * the source repo actually holds the blob;
+/// * the blob's content-addressed object is already present in the TARGET
+///   repo's storage backend. Blob keys are global per storage location, so this
+///   holds whenever the two repos share a location and correctly declines the
+///   mount when they do not, rather than registering a row pointing at an
+///   object the target cannot read.
+#[allow(clippy::too_many_arguments)]
+async fn try_mount_blob(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+    target_repo_id: Uuid,
+    target_location: &crate::storage::StorageLocation,
+    image_name: &str,
+    mount_digest: &str,
+    from_image: &str,
+) -> Option<Response> {
+    // A malformed digest is not a mount request we can honour.
+    let digest = Sha256Digest::parse_digest_param(mount_digest).ok()?;
+    let canonical = digest.as_prefixed();
+
+    let source = resolve_repo(&state.db, from_image).await.ok()?;
+    // Mounting from the target itself is a no-op; let the normal path run.
+    if source.id == target_repo_id {
+        return None;
+    }
+
+    // Read authorization on the SOURCE repo, evaluated independently of the
+    // target. A public repo confers the read baseline; otherwise the caller
+    // needs an actual `read` grant. Token repo-scope applies even to admins.
+    enforce_token_repo_scope(claims, source.id).ok()?;
+    if !source.is_public {
+        match state
+            .permission_service
+            .check_repository_action(claims.sub, source.id, "read", claims.is_admin)
+            .await
+        {
+            Ok(true) => {}
+            // Denied, or the lookup failed: decline the mount and fall back.
+            _ => return None,
+        }
+    }
+
+    let blob = sqlx::query!(
+        "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        source.id,
+        canonical
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()??;
+
+    // The object must already be readable through the TARGET's backend.
+    let storage = state.storage_for_repo(target_location).ok()?;
+    if !storage.exists(&blob.storage_key).await.unwrap_or(false) {
+        return None;
+    }
+
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+        target_repo_id, canonical, blob.size_bytes, blob.storage_key
+    )
+    .execute(&state.db)
+    .await
+    {
+        // Registering the mount failed; fall back to a real upload rather than
+        // reporting a success the registry cannot back.
+        tracing::warn!(digest = %canonical, "OCI blob mount row insert failed: {}", e);
+        return None;
+    }
+
+    tracing::debug!(
+        from = %source.key, to = %image_name, digest = %canonical,
+        "OCI cross-repo blob mount satisfied"
+    );
+    Some(
+        Response::builder()
+            .status(StatusCode::CREATED)
+            .header(LOCATION, format!("/v2/{}/blobs/{}", image_name, canonical))
+            .header("Docker-Content-Digest", canonical.as_str())
+            .header(CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_start_upload(
     state: &SharedState,
     headers: &HeaderMap,
     base_url: &str,
     image_name: &str,
     query_digest: Option<&str>,
+    query_mount: Option<&str>,
+    query_mount_from: Option<&str>,
     body: Body,
 ) -> Response {
     let scope = push_scope(image_name);
@@ -4677,6 +4786,18 @@ async fn handle_start_upload(
     }
     let repo_id = repo.id;
     let location = repo.location;
+
+    // Cross-repository blob mount (#3109). Attempted before any upload session
+    // is created, since a satisfied mount replaces the upload entirely. A mount
+    // that cannot be satisfied returns None and falls through to the normal
+    // upload path, as the spec requires.
+    if let (Some(mount), Some(from)) = (query_mount, query_mount_from) {
+        if let Some(resp) =
+            try_mount_blob(state, &claims, repo_id, &location, image_name, mount, from).await
+        {
+            return resp;
+        }
+    }
 
     let storage = match state.storage_for_repo(&location) {
         Ok(s) => s,
@@ -7893,6 +8014,18 @@ async fn handle_put_manifest(
 
     // Compute digest
     let digest = compute_sha256(&body);
+    // Integrity (OCI conformance corpus, distribution-spec): when a manifest is
+    // PUT BY DIGEST, the body must hash to that digest or the registry must
+    // reject with 400 DIGEST_INVALID. Tag references (non-`sha256:`) are
+    // unaffected. The blob-completion path already enforced this; the manifest
+    // path did not, so a mismatched-digest manifest was accepted (201).
+    if !manifest_digest_reference_matches(reference, &digest) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "provided digest did not match the uploaded manifest content",
+        );
+    }
     let manifest_key = manifest_storage_key(&digest);
 
     // Classify by content BEFORE storing or tagging. The Content-Type header
@@ -9132,12 +9265,17 @@ async fn catch_all(
         }
         ("POST", "uploads") => {
             let digest = query.get("digest").map(|s| s.as_str()).map(str::to_owned);
+            // Cross-repo blob mount (#3109): `?mount=<digest>&from=<repo>`.
+            let mount = query.get("mount").map(|s| s.as_str()).map(str::to_owned);
+            let mount_from = query.get("from").map(|s| s.as_str()).map(str::to_owned);
             handle_start_upload(
                 &state,
                 &headers,
                 base_url,
                 &image_name,
                 digest.as_deref(),
+                mount.as_deref(),
+                mount_from.as_deref(),
                 body,
             )
             .await
@@ -22682,6 +22820,174 @@ mod cross_repo_session_regression_tests {
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
 
+    /// Create a second local docker repo that SHARES an existing repo's storage
+    /// directory. Blob keys are content-addressed and global per storage
+    /// location, so co-locating two repos is what makes a cross-repo mount a
+    /// pure metadata operation. Returns (id, key).
+    async fn create_docker_repo_sharing_storage(
+        pool: &PgPool,
+        label: &str,
+        storage_dir: &std::path::Path,
+    ) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("ph-test-docker-{}-{}", label, id);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'local'::repository_type, 'docker'::repository_format, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(storage_dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("insert sharing docker repo");
+        (id, key)
+    }
+
+    /// Push a blob into `repo_key` monolithically and return its digest.
+    async fn push_blob(state: &SharedState, repo_key: &str, auth: &str, body: &[u8]) -> String {
+        let digest = format!("sha256:{}", sha256_hex(body));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                repo_key, digest
+            ))
+            .header("Authorization", auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+        let resp = router()
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "seed blob push failed");
+        digest
+    }
+
+    /// #3109: `POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<repo>` must
+    /// mount an existing blob from another repository the caller can read,
+    /// returning 201 with a blob Location instead of opening an upload session.
+    /// RED before the mount branch (the params were silently dropped and every
+    /// mount degraded into a full re-upload), GREEN after.
+    #[tokio::test]
+    async fn handle_start_upload_cross_repo_mount_succeeds() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (src_id, src_key, storage_dir) = create_docker_repo(&pool, "mountsrc").await;
+        let (dst_id, dst_key) =
+            create_docker_repo_sharing_storage(&pool, "mountdst", &storage_dir).await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let digest = push_blob(&state, &src_key, &auth, b"mountable-blob-payload").await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?mount={}&from={}",
+                dst_key, digest, src_key
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router()
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a satisfiable cross-repo mount must return 201, not open an upload session"
+        );
+        assert_eq!(
+            resp.headers().get(LOCATION).unwrap().to_str().unwrap(),
+            format!("/v2/{}/myimage/blobs/{}", dst_key, digest),
+            "mount Location must point at the blob in the TARGET repo"
+        );
+
+        // The blob must now be registered against the target repo too.
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(dst_id)
+        .bind(&digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1, "mount must record an oci_blobs row for the target");
+
+        cleanup_all(&pool, &[src_id, dst_id], user_id, &[storage_dir]).await;
+    }
+
+    /// #3109: a mount that cannot be satisfied must DEGRADE to a normal upload
+    /// session (202), never error — that fallback is what the spec requires and
+    /// is also what stops the mount parameters from becoming a cross-repo
+    /// blob-existence probe.
+    #[tokio::test]
+    async fn handle_start_upload_unsatisfiable_mount_falls_back_to_upload_session() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (src_id, src_key, storage_dir) = create_docker_repo(&pool, "mountmisssrc").await;
+        let (dst_id, dst_key) =
+            create_docker_repo_sharing_storage(&pool, "mountmissdst", &storage_dir).await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        // A digest that was never pushed anywhere, and a source repo that does
+        // not exist at all. Both must behave identically: a plain upload start.
+        let absent = format!("sha256:{}", sha256_hex(b"never-pushed-anywhere"));
+        for (label, from) in [
+            ("unknown blob in a real repo", src_key.clone()),
+            (
+                "nonexistent source repo",
+                "ph-test-no-such-repo".to_string(),
+            ),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/{}/myimage/blobs/uploads/?mount={}&from={}",
+                    dst_key, absent, from
+                ))
+                .header("Authorization", &auth)
+                .body(Body::empty())
+                .unwrap();
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::ACCEPTED,
+                "{label}: an unsatisfiable mount must fall back to a 202 upload session"
+            );
+            assert!(
+                resp.headers().contains_key(LOCATION),
+                "{label}: the fallback must still hand back an upload Location"
+            );
+        }
+
+        // Nothing may have been registered against the target repo.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(dst_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "a failed mount must not register any blob");
+
+        cleanup_all(&pool, &[src_id, dst_id], user_id, &[storage_dir]).await;
+    }
+
     /// #1776: create a non-local OCI repo (remote/virtual) marked public, with a
     /// configured upstream so resolution succeeds. Returns (id, key, dir).
     async fn create_typed_oci_repo(
@@ -26033,6 +26339,128 @@ mod virtual_scan_gate_tests {
             clean_status,
             StatusCode::OK,
             "a clean image's blob through the virtual must still serve (no over-block)"
+        );
+    }
+
+    // Conformance corpus (distribution-spec): OCI pure-function UNIT targets not
+    // already covered elsewhere in this file. (parse_pagination_params,
+    // compute_sha256, oci_lexical_cmp, build_pagination_link_header, and
+    // manifest_storage_key are already tested above and are not duplicated here.)
+    #[test]
+    fn test_apply_cursor_pagination_n_zero_is_empty_page() {
+        let (page, more) = apply_cursor_pagination(vec!["a".to_string(), "b".to_string()], None, 0);
+        assert!(page.is_empty(), "n=0 must yield an empty page");
+        assert!(!more, "n=0 must not advertise more");
+    }
+
+    #[test]
+    fn test_classify_manifest_image_index_malformed() {
+        // Not JSON, and a degenerate object (no config, no manifests) -> Malformed.
+        assert!(matches!(
+            classify_manifest(b"not json"),
+            ManifestClass::Malformed
+        ));
+        assert!(matches!(classify_manifest(b"{}"), ManifestClass::Malformed));
+        // A manifests array with no image config of its own -> Index.
+        let index = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"sha256:aa","mediaType":"application/vnd.oci.image.manifest.v1+json"}]}"#;
+        assert!(matches!(classify_manifest(index), ManifestClass::Index));
+        // An image config descriptor with a rootfs layer -> Image.
+        let image = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cc"},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:dd"}]}"#;
+        assert!(matches!(classify_manifest(image), ManifestClass::Image));
+    }
+
+    #[test]
+    fn test_is_index_content_type_matches_index_media_types_only() {
+        assert!(is_index_content_type(
+            "application/vnd.oci.image.index.v1+json"
+        ));
+        assert!(is_index_content_type(
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        ));
+        // Media-type parameters and casing are tolerated.
+        assert!(is_index_content_type(
+            "Application/VND.OCI.Image.Index.V1+JSON; charset=utf-8"
+        ));
+        // A single-image manifest is NOT an index.
+        assert!(!is_index_content_type(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
+        assert!(!is_index_content_type("text/plain"));
+    }
+
+    #[test]
+    fn test_upload_storage_keys_and_progress_range() {
+        let id = uuid::Uuid::nil();
+        assert_eq!(
+            upload_storage_key(&id),
+            "oci-uploads/00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            upload_part_storage_key("oci-uploads/x", 5, &id),
+            "oci-uploads/x.part.00000005.00000000-0000-0000-0000-000000000000"
+        );
+        // Received-byte range is inclusive: empty -> "0-0", else "0-(n-1)".
+        assert_eq!(upload_progress_range(0), "0-0");
+        assert_eq!(upload_progress_range(1), "0-0");
+        assert_eq!(upload_progress_range(100), "0-99");
+        assert_eq!(upload_progress_range(-5), "0-0");
+    }
+
+    #[test]
+    fn test_parse_oci_path_routes_operations_and_multi_segment_names() {
+        let s = |x: &str| x.to_string();
+        // Tag listing.
+        assert_eq!(
+            parse_oci_path("/myrepo/tags/list"),
+            Some((s("myrepo"), s("tags"), Some(s("list"))))
+        );
+        // Manifest by tag, multi-segment repository name.
+        assert_eq!(
+            parse_oci_path("/library/alpine/manifests/3.19"),
+            Some((s("library/alpine"), s("manifests"), Some(s("3.19"))))
+        );
+        // Manifest by digest.
+        assert_eq!(
+            parse_oci_path("/repo/manifests/sha256:abc"),
+            Some((s("repo"), s("manifests"), Some(s("sha256:abc"))))
+        );
+        // Blob by digest.
+        assert_eq!(
+            parse_oci_path("/repo/blobs/sha256:def"),
+            Some((s("repo"), s("blobs"), Some(s("sha256:def"))))
+        );
+        // Blob upload session: no uuid, and with a uuid.
+        assert_eq!(
+            parse_oci_path("/repo/blobs/uploads"),
+            Some((s("repo"), s("uploads"), None))
+        );
+        assert_eq!(
+            parse_oci_path("/repo/blobs/uploads/uuid-123"),
+            Some((s("repo"), s("uploads"), Some(s("uuid-123"))))
+        );
+        // A path with no content operation does not route.
+        assert_eq!(parse_oci_path("/repo/foo/bar"), None);
+    }
+
+    // Review: the manifest push-by-digest integrity guard (previously untested).
+    #[test]
+    fn test_manifest_digest_reference_matches() {
+        let d = "sha256:abcdef";
+        assert!(
+            manifest_digest_reference_matches("latest", d),
+            "a tag reference is unconstrained"
+        );
+        assert!(
+            manifest_digest_reference_matches("sha256:abcdef", d),
+            "a matching digest reference passes"
+        );
+        assert!(
+            manifest_digest_reference_matches("sha256:ABCDEF", d),
+            "an uppercase digest reference matches case-insensitively"
+        );
+        assert!(
+            !manifest_digest_reference_matches("sha256:deadbeef", d),
+            "a mismatched digest reference is rejected"
         );
     }
 }

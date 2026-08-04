@@ -1343,6 +1343,14 @@ fn build_simple_project_response(
                 if let Some(rp) = requires_python {
                     file["requires-python"] = serde_json::Value::String(rp);
                 }
+                // PEP 658/714: a wheel ships its METADATA and AK already serves
+                // it at `<file>.metadata`, so advertise `core-metadata` here so
+                // installers (pip/uv) can fetch metadata without downloading the
+                // whole wheel. sdists carry no such metadata, so they must not
+                // advertise it. Surfaced by the conformance corpus (pip harvest).
+                if filename.ends_with(".whl") {
+                    file["core-metadata"] = serde_json::Value::Bool(true);
+                }
                 // PEP 700: surface the distribution's upload timestamp as an
                 // RFC 3339 / ISO 8601 `upload-time` field (#1773).
                 if let Some(ut) = a.upload_time {
@@ -1353,12 +1361,28 @@ fn build_simple_project_response(
             })
             .collect();
 
-        let versions: Vec<String> = artifacts
+        // PEP 691 `versions`: dedupe, then order by PEP 440 instead of
+        // lexicographically, so `1.9` precedes `1.10` (#3106). Anything that
+        // does not parse as PEP 440 has no defined position, so it sorts after
+        // every parseable version (by string, for stability) rather than
+        // interleaving with them.
+        let mut versions: Vec<String> = artifacts
             .iter()
             .filter_map(|a| a.version.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
+        versions.sort_by(|a, b| {
+            match (
+                PypiHandler::pep440_sort_key(a),
+                PypiHandler::pep440_sort_key(b),
+            ) {
+                (Some(ka), Some(kb)) => ka.cmp(&kb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            }
+        });
 
         // PEP 708 / Simple API v1.2: advertise v1.2 and, when the project has
         // operator `tracks` declarations, emit them under meta.tracks so
@@ -1403,10 +1427,18 @@ fn build_simple_project_response(
     html.push_str(&format!("<h1>Links for {}</h1>\n", normalized));
 
     for a in artifacts {
-        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        let raw_filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        // Security: the filename is publisher-controlled, so it must be
+        // HTML-escaped before it is spliced into this Simple-index page —
+        // otherwise a filename like `x"><script>...</script>.whl` is stored XSS
+        // that runs for anyone (incl. admins) viewing the index.
+        let filename = html_escape(raw_filename);
         let url = format!(
             "/pypi/{}/simple/{}/{}#sha256={}",
-            repo_key, normalized, filename, a.checksum_sha256
+            repo_key,
+            normalized,
+            filename,
+            html_escape(&a.checksum_sha256)
         );
 
         let requires_python = a
@@ -1427,9 +1459,17 @@ fn build_simple_project_response(
             .map(|ut| format!(" data-upload-time=\"{}\"", ut.format("%Y-%m-%dT%H:%M:%SZ")))
             .unwrap_or_default();
 
+        // PEP 658/714: advertise the wheel's METADATA (HTML parity with the JSON
+        // branch), since AK serves `<file>.metadata`.
+        let cm_attr = if raw_filename.ends_with(".whl") {
+            " data-core-metadata=\"true\""
+        } else {
+            ""
+        };
+
         html.push_str(&format!(
-            "<a href=\"{}\"{}{}>{}</a><br/>\n",
-            url, rp_attr, ut_attr, filename
+            "<a href=\"{}\"{}{}{}>{}</a><br/>\n",
+            url, rp_attr, ut_attr, cm_attr, filename
         ));
     }
 
@@ -1469,13 +1509,20 @@ fn merge_local_into_remote_simple_html(
 
     let mut local_lines = String::new();
     for a in local {
-        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
-        if existing.contains(filename) {
+        let raw_filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        if existing.contains(raw_filename) {
             continue;
         }
+        // Security: escape the publisher-controlled filename before splicing it
+        // into the merged HTML index (stored-XSS otherwise; see the sibling
+        // build_simple_project_response HTML branch).
+        let filename = html_escape(raw_filename);
         let url = format!(
             "/pypi/{}/simple/{}/{}#sha256={}",
-            repo_key, normalized, filename, a.checksum_sha256
+            repo_key,
+            normalized,
+            filename,
+            html_escape(&a.checksum_sha256)
         );
         let requires_python = a
             .metadata
@@ -1491,9 +1538,15 @@ fn merge_local_into_remote_simple_html(
             .upload_time
             .map(|ut| format!(" data-upload-time=\"{}\"", ut.format("%Y-%m-%dT%H:%M:%SZ")))
             .unwrap_or_default();
+        // PEP 658/714: advertise wheel METADATA (HTML parity with the JSON path).
+        let cm_attr = if raw_filename.ends_with(".whl") {
+            " data-core-metadata=\"true\""
+        } else {
+            ""
+        };
         local_lines.push_str(&format!(
-            "<a href=\"{}\"{}{}>{}</a><br/>\n",
-            url, rp_attr, ut_attr, filename
+            "<a href=\"{}\"{}{}{}>{}</a><br/>\n",
+            url, rp_attr, ut_attr, cm_attr, filename
         ));
     }
 
@@ -3295,6 +3348,13 @@ async fn upload(
     let filename = file_name.ok_or_else(|| {
         AppError::Validation("Missing filename in content field".to_string()).into_response()
     })?;
+    // Security (#3107): the filename becomes a segment of the artifact storage
+    // path, so reject anything that could escape it before it is used below.
+    if !is_safe_upload_filename(&filename) {
+        return Err(
+            AppError::Validation(format!("Invalid upload filename: {filename:?}")).into_response(),
+        );
+    }
 
     let normalized = PypiHandler::normalize_name(&pkg_name);
 
@@ -3465,6 +3525,25 @@ fn pypi_content_type(filename: &str) -> &'static str {
     }
 }
 
+/// Reject an uploaded PyPI filename that is unsafe as a path segment or when
+/// rendered. Physical storage is content-addressed (keyed by SHA-256), so this
+/// is not the sole defense — the Simple-index render sites HTML-escape the
+/// filename — but it is defense-in-depth at the ingest choke-point: reject path
+/// separators, parent references, control characters, and HTML metacharacters
+/// (`< > "`). Legitimate wheel/sdist filenames never contain any of these. (#3107)
+fn is_safe_upload_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains('<')
+        && !name.contains('>')
+        && !name.contains('"')
+        && !name.chars().any(|c| c.is_control())
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -3497,6 +3576,15 @@ static REWRITE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?is)<a\s+([^>]*?)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))([^>]*)>"#)
         .unwrap()
 });
+
+/// Matches an upstream `<base ...>` element. A `<base href>` re-anchors every
+/// relative/root-relative link on the page; because `rewrite_upstream_urls`
+/// emits ROOT-RELATIVE download URLs (`/pypi/<repo>/...`), a surviving `<base>`
+/// would make the client resolve them against the upstream origin instead of
+/// Artifact Keeper — a proxy bypass that also discloses the upstream host and
+/// breaks air-gapped installs. We strip it. Same class as the #2801
+/// Content-Type sniff fix, for the `<base>` vector.
+static BASE_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<base\b[^>]*>").unwrap());
 
 /// Split a URL into its base (scheme + host) and path components.
 ///
@@ -3666,8 +3754,22 @@ fn bad_upstream_simple_index() -> Response {
 fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     let normalized = PypiHandler::normalize_name(project);
 
+    // Neutralize any upstream `<base href>` first: our rewritten download links
+    // are root-relative, so a surviving `<base>` re-anchors them onto the
+    // upstream origin (proxy bypass + host disclosure). Strip to a FIXPOINT:
+    // removing one `<base>` can splice surrounding bytes into a NEW one
+    // (`<ba<base x>se href=...>`), so loop until nothing more matches.
+    let mut html = html.to_string();
+    loop {
+        let stripped = BASE_TAG_RE.replace_all(&html, "").into_owned();
+        if stripped == html {
+            break;
+        }
+        html = stripped;
+    }
+
     REWRITE_RE
-        .replace_all(html, |caps: &regex::Captures| {
+        .replace_all(&html, |caps: &regex::Captures| {
             let before_href = &caps[1];
             // The href value is in whichever quote-alternation group matched
             // (double / single / unquoted); `after` is the trailing group.
@@ -7822,6 +7924,106 @@ mod tests {
         assert_eq!(files[0]["upload-time"], "2026-01-02T03:04:05Z");
     }
 
+    // Conformance corpus (pip/warehouse harvest): a wheel's METADATA is served
+    // at `<file>.metadata`, so the PEP 691 JSON must advertise `core-metadata`
+    // (PEP 658/714) for the installer fast path; sdists must not. RED before the
+    // core-metadata emission, GREEN after.
+    #[test]
+    fn test_build_simple_project_response_json_advertises_core_metadata_for_wheels() {
+        let artifacts = vec![
+            SimpleProjectArtifact {
+                path: "pkg-1.0.0-py3-none-any.whl".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 3000,
+                checksum_sha256: "cafe".to_string(),
+                metadata: None,
+                upload_time: None,
+            },
+            SimpleProjectArtifact {
+                path: "pkg-1.0.0.tar.gz".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 2000,
+                checksum_sha256: "beef".to_string(),
+                metadata: None,
+                upload_time: None,
+            },
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        let response =
+            build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let files = json["files"].as_array().unwrap();
+        let wheel = files
+            .iter()
+            .find(|f| f["filename"].as_str().unwrap().ends_with(".whl"))
+            .unwrap();
+        let sdist = files
+            .iter()
+            .find(|f| f["filename"].as_str().unwrap().ends_with(".tar.gz"))
+            .unwrap();
+        assert_eq!(
+            wheel["core-metadata"],
+            serde_json::Value::Bool(true),
+            "wheel must advertise core-metadata: {json}"
+        );
+        assert!(
+            sdist.get("core-metadata").is_none(),
+            "sdist must not advertise core-metadata: {json}"
+        );
+    }
+
+    // Conformance corpus (pypa/packaging ordering vectors): the PEP 691
+    // `versions` array must be ordered by PEP 440, not lexicographically.
+    // The old BTreeSet<String> put `1.10` before `1.9` and `10.0` before `9.0`,
+    // which misleads any consumer treating the last entry as "latest".
+    // RED before the pep440_sort_key ordering, GREEN after. (#3106)
+    #[test]
+    fn test_build_simple_project_response_json_versions_are_pep440_ordered() {
+        let raw = ["1.9", "1.10", "10.0", "9.0", "1.0", "2.0rc1", "2.0"];
+        let artifacts: Vec<SimpleProjectArtifact> = raw
+            .iter()
+            .map(|v| SimpleProjectArtifact {
+                path: format!("pkg-{v}.tar.gz"),
+                version: Some((*v).to_string()),
+                size_bytes: 10,
+                checksum_sha256: "abc".to_string(),
+                metadata: None,
+                upload_time: None,
+            })
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        let response =
+            build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions: Vec<&str> = json["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["1.0", "1.9", "1.10", "2.0rc1", "2.0", "9.0", "10.0"],
+            "versions must be PEP 440-ordered, not lexicographic: {json}"
+        );
+    }
+
     #[test]
     fn test_build_simple_project_response_json_omits_upload_time_when_absent() {
         let artifacts = vec![SimpleProjectArtifact {
@@ -10982,6 +11184,227 @@ mod tests {
             scan_header.as_deref(),
             Some("clean"),
             "fail-open keeps the cached-verdict fast path on an unknown probe"
+        );
+    }
+
+    // Conformance corpus (pip harvest, MIT): a `<base href>` on an upstream
+    // Simple index must be neutralized, or it re-anchors our root-relative
+    // rewritten download URLs onto the upstream origin — a proxy bypass that
+    // discloses the upstream host and breaks air-gapped installs. RED before
+    // the BASE_TAG_RE strip, GREEN after. Sibling of the #2801 sniff fix.
+    #[test]
+    fn test_rewrite_upstream_urls_neutralizes_base_href() {
+        let upstream = concat!(
+            "<!DOCTYPE html><html><head>",
+            "<base href=\"https://internal-mirror.example/simple/\">",
+            "</head><body>",
+            "<a href=\"foo-1.0.tar.gz#sha256=abc\">foo-1.0.tar.gz</a>",
+            "</body></html>"
+        );
+        let out = super::rewrite_upstream_urls(upstream, "myrepo", "foo");
+        assert!(
+            !out.to_lowercase().contains("<base"),
+            "<base> tag survived the rewrite: {out}"
+        );
+        assert!(
+            !out.contains("internal-mirror.example"),
+            "upstream host leaked through <base>: {out}"
+        );
+        assert!(
+            out.contains("/pypi/myrepo/simple/foo/foo-1.0.tar.gz"),
+            "anchor was not rewritten through the proxy: {out}"
+        );
+    }
+
+    // Conformance corpus (#2801): sniff_simple_index must classify a proxied
+    // body by content, never trusting a mislabeled upstream Content-Type. JSON
+    // (leading {/[), HTML (anchor/doctype/root), else Binary -> 502.
+    #[test]
+    fn test_sniff_simple_index_classifies_by_content() {
+        use super::{sniff_simple_index as sniff, SniffedSimpleIndex as S};
+        assert_eq!(sniff(br#"{"meta":{"api-version":"1.1"}}"#), S::Json);
+        assert_eq!(sniff(b"  \n\t[ ]"), S::Json, "leading whitespace then [");
+        assert_eq!(sniff(b"\xEF\xBB\xBF{}"), S::Json, "UTF-8 BOM then {{");
+        assert_eq!(sniff(b"<!DOCTYPE html><html></html>"), S::Html);
+        assert_eq!(sniff(b"<html><body></body></html>"), S::Html);
+        assert_eq!(sniff(b"<a href=\"x-1.0.whl\">x</a>"), S::Html);
+        assert_eq!(sniff(b"PK\x03\x04 not an index",), S::Binary, "zip/binary");
+        assert_eq!(sniff(b"plain text, no markers"), S::Binary);
+        assert_eq!(sniff(b""), S::Binary, "empty body");
+    }
+
+    // Regression guard: the HTML rewriter rebuilds each download URL from the
+    // FILENAME, so a relative upstream href can never survive (this is why the
+    // earlier "relative-url leak" was a false alarm), and the #sha256 fragment
+    // is preserved.
+    #[test]
+    fn test_rewrite_upstream_urls_is_relative_safe_and_keeps_fragment() {
+        let html = concat!(
+            "<a href=\"../../packages/ab/foo-1.0-py3-none-any.whl#sha256=dead\">w</a>",
+            "<a href=\"foo-1.0.tar.gz\">s</a>"
+        );
+        let out = super::rewrite_upstream_urls(html, "r", "p");
+        assert!(!out.contains("../../"), "relative path survived: {out}");
+        assert!(
+            out.contains("/pypi/r/simple/p/foo-1.0-py3-none-any.whl#sha256=dead"),
+            "wheel url/fragment wrong: {out}"
+        );
+        assert!(
+            out.contains("/pypi/r/simple/p/foo-1.0.tar.gz"),
+            "sdist url wrong: {out}"
+        );
+    }
+
+    // Regression guard: the JSON rewriter rebuilds files[].url from the filename
+    // (relative-safe), returns None for non-PEP-691 bodies, and preserves the
+    // other file fields (hashes).
+    #[test]
+    fn test_rewrite_upstream_simple_json_rebuilds_and_preserves() {
+        let json = br#"{"meta":{"api-version":"1.1"},"name":"p","files":[
+            {"filename":"foo-1.0-py3-none-any.whl","url":"../../x/foo-1.0-py3-none-any.whl",
+             "hashes":{"sha256":"deadbeef"}}]}"#;
+        let out = super::rewrite_upstream_simple_json(json, "r", "p").expect("valid PEP 691");
+        assert!(!out.contains("../../"), "relative url survived: {out}");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            doc["files"][0]["url"],
+            "/pypi/r/simple/p/foo-1.0-py3-none-any.whl"
+        );
+        assert_eq!(doc["files"][0]["hashes"]["sha256"], "deadbeef");
+        // Not a PEP 691 body (no files array) -> None so the caller falls back.
+        assert!(super::rewrite_upstream_simple_json(b"<html></html>", "r", "p").is_none());
+        assert!(super::rewrite_upstream_simple_json(br#"{"nope":1}"#, "r", "p").is_none());
+    }
+
+    // Binary-distribution spec: the wheel compatibility tag is the last three
+    // '-'-fields of the stem (python-abi-platform), lowercased; non-wheels and
+    // too-short names have no tag.
+    #[test]
+    fn test_wheel_compat_tag_extracts_last_three_fields_lowercased() {
+        use super::wheel_compat_tag as tag;
+        assert_eq!(
+            tag("numpy-1.0.0-cp39-cp39-manylinux1_x86_64.whl").as_deref(),
+            Some("cp39-cp39-manylinux1_x86_64")
+        );
+        assert_eq!(
+            tag("foo-1.0-py3-none-any.whl").as_deref(),
+            Some("py3-none-any")
+        );
+        // A build tag (6 fields) still yields the trailing python-abi-platform.
+        assert_eq!(
+            tag("foo-1.0-1-py3-none-any.whl").as_deref(),
+            Some("py3-none-any")
+        );
+        // Case-insensitive (tags are lowercased).
+        assert_eq!(
+            tag("Foo-1.0-CP39-CP39-Win_AMD64.whl").as_deref(),
+            Some("cp39-cp39-win_amd64")
+        );
+        // Non-wheel and malformed names have no platform tag.
+        assert_eq!(tag("foo-1.0.tar.gz"), None);
+        assert_eq!(tag("foo-1.0.whl"), None);
+    }
+
+    #[test]
+    fn test_pypi_content_type_by_extension() {
+        use super::pypi_content_type as ct;
+        assert_eq!(ct("x-1.0-py3-none-any.whl"), "application/zip");
+        assert_eq!(ct("x.zip"), "application/zip");
+        assert_eq!(ct("x-1.0.tar.gz"), "application/gzip");
+        assert_eq!(ct("x-1.0.tar.bz2"), "application/x-bzip2");
+        assert_eq!(ct("x-1.0.exe"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_html_escape_escapes_markup_and_quotes() {
+        use super::html_escape as esc;
+        assert_eq!(esc("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+        assert_eq!(esc("\"q\" 'a'"), "&quot;q&quot; &#39;a&#39;");
+        assert_eq!(esc("plain"), "plain");
+    }
+
+    // version_from_pypi_filename: the version is the field after the name for a
+    // wheel, and the final '-'-segment for an sdist (project names may contain
+    // '-', PEP 440 versions do not). Unknown/degenerate names have no version.
+    #[test]
+    fn test_version_from_pypi_filename() {
+        use super::version_from_pypi_filename as ver;
+        assert_eq!(ver("foo-1.2.3-py3-none-any.whl").as_deref(), Some("1.2.3"));
+        assert_eq!(ver("my-cool-pkg-2.0.tar.gz").as_deref(), Some("2.0"));
+        assert_eq!(ver("pkg-1.0.zip").as_deref(), Some("1.0"));
+        assert_eq!(ver("pkg-3.1.tar.xz").as_deref(), Some("3.1"));
+        assert_eq!(ver("nover.txt"), None);
+        assert_eq!(ver("noversion.whl"), None);
+    }
+
+    // Security (#3107): the upload filename guard accepts real wheel/sdist names
+    // and rejects path separators, parent references, and control characters.
+    #[test]
+    fn test_is_safe_upload_filename_rejects_traversal_and_separators() {
+        use super::is_safe_upload_filename as safe;
+        assert!(safe("dtfpkg-1.0.0-py3-none-any.whl"));
+        assert!(safe("dtfpkg-1.0.0.tar.gz"));
+        assert!(!safe("../evil.whl"));
+        assert!(!safe("a/b.whl"));
+        assert!(!safe("a\\b.whl"));
+        assert!(!safe(".."));
+        assert!(!safe("."));
+        assert!(!safe(""));
+        assert!(!safe("foo\0bar.whl"));
+        assert!(!safe("x..y.whl"));
+        // HTML metacharacters (defense-in-depth for the Simple-index render).
+        assert!(!safe("x\"><script>.whl"));
+        assert!(!safe("a<b.whl"));
+        assert!(!safe("a>b.whl"));
+    }
+
+    // Review (security blocker): the <base> strip must reach a FIXPOINT — a
+    // self-splicing decoy that reconstitutes a <base> after one pass must not
+    // survive, or the proxy-bypass/host-disclosure returns.
+    #[test]
+    fn test_rewrite_upstream_urls_strips_spliced_base_tag() {
+        let html = r#"<ba<base dummy>se href="//evil.example/"><a href="pkg-1.0.whl">pkg</a>"#;
+        let out = super::rewrite_upstream_urls(html, "myrepo", "proj");
+        assert!(
+            !out.to_lowercase().contains("<base"),
+            "reconstituted <base> survived: {out}"
+        );
+        assert!(!out.contains("evil.example"), "upstream host leaked: {out}");
+        assert!(out.contains("/pypi/myrepo/simple/proj/pkg-1.0.whl"));
+    }
+
+    // Review (security blocker): a publisher-controlled filename must be
+    // HTML-escaped in the Simple-index HTML page (stored XSS otherwise); wheels
+    // also advertise data-core-metadata in the HTML branch (parity with JSON).
+    #[test]
+    fn test_build_simple_project_response_html_escapes_filename_and_advertises_core_metadata() {
+        // A slash-free payload so `rsplit('/')` keeps the whole filename (a real
+        // filename can't contain '/'; the injection vector is < > " ).
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "evil\"><img src=y onerror=alert(1)>.whl".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 10,
+            checksum_sha256: "cafe".to_string(),
+            metadata: None,
+            upload_time: None,
+        }];
+        let headers = HeaderMap::new(); // no Accept -> HTML branch
+        let response =
+            build_simple_project_response(&headers, "repo", "x", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<img"), "unescaped tag rendered: {html}");
+        assert!(
+            html.contains("&lt;img"),
+            "filename not HTML-escaped: {html}"
+        );
+        assert!(html.contains("&quot;"), "quote not HTML-escaped: {html}");
+        assert!(
+            html.contains("data-core-metadata"),
+            "wheel core-metadata not advertised in the HTML branch"
         );
     }
 }
