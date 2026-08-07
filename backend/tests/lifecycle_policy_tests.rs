@@ -1499,20 +1499,20 @@ async fn test_max_versions_cascades_oci_tags() {
         .expect("failed to connect to database");
 
     let repo_id = create_test_repo(&pool, &format!("test-cascade-mv-{}", Uuid::new_v4())).await;
+    sqlx::query("UPDATE repositories SET format = 'docker' WHERE id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("failed to make lifecycle test repository a docker repository");
     let svc = LifecycleService::new(pool.clone());
 
-    // Three artifacts share the same `name` ("img:rolling") so max_versions
-    // with keep=1 will soft-delete the two older ones. Each has its own
-    // (digest, tag) so the cascade has three distinct (path, storage_key)
-    // join targets to consider.
+    // Three tags of one Docker image must form one max_versions partition.
+    // The Docker artifact name includes the tag (`img:rolling-N`), so this is
+    // a regression test for grouping by image name rather than full tag.
     let digest_old = "sha256:1407aa00000000000000000000000000000000000000000000000000000001";
     let digest_mid = "sha256:1407aa00000000000000000000000000000000000000000000000000000002";
     let digest_new = "sha256:1407aa00000000000000000000000000000000000000000000000000000003";
 
-    // insert_oci_manifest_artifact sets `name = "{image}:{tag}"`. To make all
-    // three rows share the same name (the field max_versions partitions on),
-    // we insert them via a single-image, single-tag shape and override the
-    // tag per row to keep `(repository_id, path)` unique.
     let _id_old =
         insert_oci_manifest_artifact(&pool, repo_id, "img", "rolling-1", digest_old, 100).await;
     let _id_mid =
@@ -1523,27 +1523,18 @@ async fn test_max_versions_cascades_oci_tags() {
     insert_oci_tag(&pool, repo_id, "img", "rolling-2", digest_mid).await;
     insert_oci_tag(&pool, repo_id, "img", "rolling-3", digest_new).await;
 
-    // Force all three rows to share the same `name` so they form one
-    // max_versions partition. The insert helper writes "img:<tag>"; rewrite
-    // it to a single canonical name. The cascade still keys on `path`, not
-    // `name`, so this rewrite does not weaken the join.
-    sqlx::query("UPDATE artifacts SET name = 'img:rolling' WHERE repository_id = $1")
-        .bind(repo_id)
-        .execute(&pool)
-        .await
-        .expect("failed to align names for max_versions partition");
-
     // Surviving sibling tags for the two doomed digests, each in its OWN
-    // single-member max_versions partition (distinct names, keep=1 keeps
-    // each), so the cascade may prune the rolling-1/rolling-2 tags without
-    // orphaning those digests (#1682 guard). Inserted AFTER the
-    // name-alignment UPDATE so they are not pulled into the `img:rolling`
-    // partition. The insert helper already writes a distinct name per row
-    // ("img:alias-old", "img:alias-mid"), so no rename is needed.
-    insert_oci_manifest_artifact(&pool, repo_id, "img", "alias-old", digest_old, 100).await;
-    insert_oci_tag(&pool, repo_id, "img", "alias-old", digest_old).await;
-    insert_oci_manifest_artifact(&pool, repo_id, "img", "alias-mid", digest_mid, 100).await;
-    insert_oci_tag(&pool, repo_id, "img", "alias-mid", digest_mid).await;
+    // single-member partition, so the cascade may prune rolling-1/rolling-2
+    // without orphaning those digests (#1682 guard).
+    // NOTE: these must be two DIFFERENT image names. Sharing one image name
+    // would put both in the same retention partition, so `keep = 1` would prune
+    // one of them and `artifacts_removed` would be 3, not 2 -- which is exactly
+    // how this test failed before, on the PR head as well as here. The test
+    // only runs on main/release branches, so a PR could not surface it.
+    insert_oci_manifest_artifact(&pool, repo_id, "other-old", "alias-old", digest_old, 100).await;
+    insert_oci_tag(&pool, repo_id, "other-old", "alias-old", digest_old).await;
+    insert_oci_manifest_artifact(&pool, repo_id, "other-mid", "alias-mid", digest_mid, 100).await;
+    insert_oci_tag(&pool, repo_id, "other-mid", "alias-mid", digest_mid).await;
 
     // Backdate so created_at ordering is deterministic.
     sqlx::query(
@@ -1593,11 +1584,11 @@ async fn test_max_versions_cascades_oci_tags() {
     );
     // The surviving sibling tags protecting digest_old / digest_mid remain.
     assert!(
-        oci_tag_exists(&pool, repo_id, "img", "alias-old").await,
+        oci_tag_exists(&pool, repo_id, "other-old", "alias-old").await,
         "surviving sibling protecting digest_old must remain"
     );
     assert!(
-        oci_tag_exists(&pool, repo_id, "img", "alias-mid").await,
+        oci_tag_exists(&pool, repo_id, "other-mid", "alias-mid").await,
         "surviving sibling protecting digest_mid must remain"
     );
 
