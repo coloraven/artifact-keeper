@@ -3176,12 +3176,63 @@ pub async fn local_fetch_or_redirect(
         };
         let redirect = match &proxy_cache_backend {
             Some(b) => {
+                // The artifacts row alone does not prove the cached object
+                // still exists: retention tooling (e.g. an object-store
+                // lifecycle policy expiring cache entries by age) deletes
+                // proxy-cache objects without updating the database. A
+                // redirect signed for a missing key 404s at the object store,
+                // where the client is beyond any fallback we control — and the
+                // row keeps serving dead redirects until manual repair. So
+                // probe existence through the same no-prefix handle before
+                // signing. Capability check first, mirroring #1555 — never pay
+                // the probe on a backend that cannot redirect anyway.
+                //
+                // Scope, deliberately understated: this is an EXISTENCE probe,
+                // strictly narrower than the `is_cache_fresh` gate the sibling
+                // paths (`proxy_fetch_or_redirect`, `try_member_cache_redirect`)
+                // apply. Those additionally read the `__cache_meta__.json`
+                // sidecar for TTL, revalidate the pinned ETag, and apply
+                // `cache_quarantine_gate` for the #2075 Package Age Policy hold.
+                // None of that happens here, so a present-but-stale or
+                // still-held entry can still be signed. That gap is
+                // pre-existing (this argument was hardcoded `true`); closing it
+                // needs the repo_key/path pair and is tracked separately. This
+                // change only removes the dead-redirect case.
+                //
+                // On a miss the buffered read below takes over. Note it does
+                // NOT simply return NotFound: it routes through
+                // `coordinated_retry_get`, which takes a cluster-wide advisory
+                // lease (#1609) and returns 507 if the object is still absent.
+                // The self-heal comes from the sole caller (the PyPI
+                // virtual-member loop) discarding that error and continuing to
+                // the remote member's upstream re-fetch.
+                //
+                // An `Err` from the probe means "unknown", not "absent", so it
+                // is logged rather than swallowed — otherwise an object-store
+                // brownout silently converts every redirect on this path into a
+                // fully-buffered read through the backend, with no signal that
+                // it happened. We still fall through on `Err` (never sign a
+                // redirect we could not verify); the log is what makes that
+                // transition visible.
+                let object_present = b.supports_redirect()
+                    && match b.exists(&artifact.storage_key).await {
+                        Ok(present) => present,
+                        Err(e) => {
+                            tracing::warn!(
+                                storage_key = %artifact.storage_key,
+                                error = %e,
+                                "proxy-cache existence probe failed; treating as absent \
+                                 and falling through to the buffered read"
+                            );
+                            false
+                        }
+                    };
                 try_proxy_cache_redirect(
                     b.as_ref(),
                     &artifact.storage_key,
                     /* presigned_enabled = */ true,
                     expiry,
-                    /* cache_is_fresh = */ true,
+                    /* cache_is_fresh = */ object_present,
                 )
                 .await
             }
@@ -7247,6 +7298,7 @@ mod tests {
         last_put: StdArc<std::sync::Mutex<Option<(String, Bytes)>>>,
         get_behavior: RecordingGetBehavior,
         supports: bool,
+        exists_result: bool,
     }
 
     impl RecordingStorage {
@@ -7262,7 +7314,16 @@ mod tests {
                 last_put: StdArc::new(std::sync::Mutex::new(None)),
                 get_behavior,
                 supports,
+                exists_result: true,
             }
+        }
+
+        /// Override the `exists()` result — for the #3067/#3068 existence-gate
+        /// tests, where `supports_redirect() == true` must not be enough on
+        /// its own to trigger a presign.
+        fn with_exists(mut self, exists_result: bool) -> Self {
+            self.exists_result = exists_result;
+            self
         }
     }
 
@@ -7284,7 +7345,7 @@ mod tests {
             }
         }
         async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
-            Ok(true)
+            Ok(self.exists_result)
         }
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
@@ -7335,7 +7396,7 @@ mod tests {
             }
         }
         async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
-            Ok(true)
+            Ok(self.exists_result)
         }
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
@@ -10967,6 +11028,116 @@ mod tests {
             recorded, 0,
             "a proxy-cache serve must NOT be counted (#1278; out of scope for #2260)"
         );
+    }
+
+    /// #3067/#3068: `supports_redirect() == true` alone must not be enough to
+    /// sign a redirect — `exists()` returning false (a DB row surviving an
+    /// out-of-band delete, e.g. a lifecycle rule) must fall through to the
+    /// buffered read instead of presigning. Complements the #1555 test above,
+    /// which only covers the `supports_redirect() == false` short-circuit.
+    ///
+    /// Runs both `exists()` outcomes so the `true` case is a positive
+    /// control: without it, this test would pass identically if the
+    /// proxy-cache redirect branch were never entered at all (e.g. from a
+    /// storage-key shape regression), not because `exists()` gates it.
+    #[tokio::test]
+    async fn test_local_fetch_or_redirect_gated_by_object_existence_3068() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        for exists in [false, true] {
+            let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+                return;
+            };
+
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let repo_info = fx.repo_info("remote", Some("https://upstream.example.test"));
+
+            // Redirect-capable proxy-cache backend whose exists() is the
+            // thing under test: false simulates a DB row surviving an
+            // out-of-band delete; true is the ordinary fresh-cache case.
+            let proxy_backend = StdArc::new(RecordingStorage::new(true).with_exists(exists));
+            let service = StdArc::new(crate::services::storage_service::StorageService::new(
+                proxy_backend.clone(),
+            ));
+            let proxy = StdArc::new(crate::services::proxy_service::ProxyService::new(
+                fx.pool.clone(),
+                service,
+            ));
+            let state =
+                tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy);
+
+            // Seed real bytes on the repo's own (filesystem) storage,
+            // separate from the mock proxy-cache backend above, so the
+            // exists() == false case has something real to fall through to.
+            let body: &[u8] = b"still-here";
+            let artifact_path = "simple/foo/foo-1.0-py3-none-any.whl";
+            // Use the real content-key shape `CacheKeys::derive` produces
+            // (`proxy-cache/<repo>/<path>/__content__`), not just something
+            // that satisfies the `proxy-cache/` prefix check — otherwise the
+            // fixture exercises a key namespace the cache writer never emits.
+            let storage_key = format!("proxy-cache/{}/{}/__content__", fx.repo_key, artifact_path);
+            tdh::seed_artifact(
+                &state,
+                &fx.pool,
+                &repo_info,
+                &storage_key,
+                artifact_path,
+                "foo",
+                "1.0",
+                "application/zip",
+                Bytes::from_static(body),
+                fx.user_id,
+            )
+            .await;
+
+            let location = repo_info.storage_location();
+            let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+                client_ip: None,
+                user_id: None,
+                user_agent: None,
+                is_head: false,
+            };
+            let result = super::local_fetch_or_redirect(
+                &fx.pool,
+                &state,
+                fx.repo_id,
+                &location,
+                artifact_path,
+                &ctx,
+            )
+            .await;
+
+            fx.teardown().await;
+
+            let resp = result.expect("fetch must succeed (redirect or streamed fallback)");
+            if exists {
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::FOUND,
+                    "exists() == true must sign a redirect"
+                );
+                assert_eq!(
+                    proxy_backend.presigned_calls.load(Ordering::SeqCst),
+                    1,
+                    "exists() == true must attempt exactly one presign"
+                );
+            } else {
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "exists() == false must fall through to a streamed 200, never a stale 302"
+                );
+                assert!(
+                    resp.headers().get("location").is_none(),
+                    "a redirect-capable backend reporting the object absent must NOT redirect"
+                );
+                assert_eq!(
+                    proxy_backend.presigned_calls.load(Ordering::SeqCst),
+                    0,
+                    "get_presigned_url must never be attempted when exists() == false"
+                );
+            }
+        }
     }
 
     /// Count `download_statistics` rows attributed to any artifact in `repo_id`.
