@@ -78,15 +78,19 @@ pub const NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS: u64 = 86_400;
 /// identity/gzip) fit comfortably, while the cap bounds worst-case memory.
 pub const NPM_PACKUMENT_CACHE_MAX_ENTRIES: usize = 8_192;
 
-/// Namespace for Redis keys, so cache entries never collide with other users
-/// of a shared Redis database.
-const REDIS_KEY_NAMESPACE: &str = "ak:npm-packument:";
+/// Versioned namespace for encoded entries and their invalidation indexes.
+/// Keep this in sync with [`REDIS_ENTRY_VERSION`] so mixed-version replicas
+/// never reject and overwrite each other's values during rolling deploys.
+const REDIS_ENTRY_NAMESPACE: &str = "ak:npm-packument:v2:";
+
+/// Stable namespace for cross-replica coordination keys.
+const REDIS_COORDINATION_NAMESPACE: &str = "ak:npm-packument:";
 
 /// Namespace for single-flight lease keys on the shared proxy-hydration map
 /// (sibling of the proxy path's `proxy-cache:` / `proxy-stream:` prefixes).
 const FLIGHT_LEASE_NAMESPACE: &str = "npm-packument:";
 
-/// Key prefix (under [`REDIS_KEY_NAMESPACE`]) for cross-replica background
+/// Key prefix (under [`REDIS_COORDINATION_NAMESPACE`]) for cross-replica background
 /// refresh leases (#2248).
 const REFRESH_LEASE_KEY_PREFIX: &str = "refresh-lease:";
 
@@ -139,11 +143,18 @@ const REDIS_UNAVAILABLE_COOLDOWN: Duration = Duration::from_secs(5);
 /// reproduce the response. `content_encoding` is set (`gzip`) only when the
 /// bytes are gzip-compressed; the metadata compression layer passes through
 /// responses that already carry a `Content-Encoding` header.
+///
+/// `etag` is always computed from the *identity* (uncompressed) body, so the
+/// identity and gzip variants of one packument share a single ETag. A client's
+/// `If-None-Match` therefore revalidates successfully no matter which variant
+/// it holds, and no matter whether the response came from this cache or from
+/// the uncached per-request path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachedPackument {
     pub bytes: Bytes,
     pub content_type: String,
     pub content_encoding: Option<String>,
+    pub etag: String,
 }
 
 /// A successful cache read: the entry plus its age, so freshness is always
@@ -451,7 +462,12 @@ impl PackumentCacheBackend for InProcessPackumentCache {
 
 /// Version tag leading every encoded Redis value, so a future layout change
 /// can never be misparsed as the current one.
-const REDIS_ENTRY_VERSION: u8 = 1;
+///
+/// Bumped to 2 when `etag` joined [`CachedPackument`]: a v1 value carries no
+/// ETag, so it is rejected by [`decode_redis_entry`] and surfaces as a miss
+/// that recomputes. That is the intended upgrade path — serving a v1 entry
+/// with a fabricated ETag would hand clients a tag that never revalidates.
+const REDIS_ENTRY_VERSION: u8 = 2;
 
 /// Milliseconds since the Unix epoch. Redis entries store their write time so
 /// freshness is computed client-side; wall-clock time (not `Instant`) because
@@ -465,7 +481,10 @@ fn now_unix_ms() -> u64 {
 
 /// Serialize an entry for Redis:
 /// `version(1) | stored_at_ms(8 BE) | ct_len(2 BE) | content_type |
-///  enc_len(1) | content_encoding | body`.
+///  enc_len(1) | content_encoding | etag_len(1) | etag | body`.
+///
+/// `etag` precedes the body for the same reason the other headers do: every
+/// field but the body is length-prefixed, so the body is whatever remains.
 fn encode_redis_entry(entry: &CachedPackument, stored_at_ms: u64) -> Vec<u8> {
     let ct = entry.content_type.as_bytes();
     let enc = entry
@@ -473,13 +492,16 @@ fn encode_redis_entry(entry: &CachedPackument, stored_at_ms: u64) -> Vec<u8> {
         .as_deref()
         .unwrap_or_default()
         .as_bytes();
-    let mut out = Vec::with_capacity(12 + ct.len() + enc.len() + entry.bytes.len());
+    let etag = entry.etag.as_bytes();
+    let mut out = Vec::with_capacity(13 + ct.len() + enc.len() + etag.len() + entry.bytes.len());
     out.push(REDIS_ENTRY_VERSION);
     out.extend_from_slice(&stored_at_ms.to_be_bytes());
     out.extend_from_slice(&(ct.len().min(u16::MAX as usize) as u16).to_be_bytes());
     out.extend_from_slice(&ct[..ct.len().min(u16::MAX as usize)]);
     out.push(enc.len().min(u8::MAX as usize) as u8);
     out.extend_from_slice(&enc[..enc.len().min(u8::MAX as usize)]);
+    out.push(etag.len().min(u8::MAX as usize) as u8);
+    out.extend_from_slice(&etag[..etag.len().min(u8::MAX as usize)]);
     out.extend_from_slice(&entry.bytes);
     out
 }
@@ -502,12 +524,21 @@ fn decode_redis_entry(raw: &[u8]) -> Option<(CachedPackument, u64)> {
     } else {
         Some(String::from_utf8(encoding.to_vec()).ok()?)
     };
-    let body = raw.get(enc_end..)?;
+    let etag_len = *raw.get(enc_end)? as usize;
+    let etag_end = enc_end.checked_add(1)?.checked_add(etag_len)?;
+    let etag = String::from_utf8(raw.get(enc_end + 1..etag_end)?.to_vec()).ok()?;
+    // An entry without an ETag could not be revalidated, so reject it rather
+    // than serve a response whose `If-None-Match` can never match.
+    if etag.is_empty() {
+        return None;
+    }
+    let body = raw.get(etag_end..)?;
     Some((
         CachedPackument {
             bytes: Bytes::copy_from_slice(body),
             content_type,
             content_encoding,
+            etag,
         },
         stored_at_ms,
     ))
@@ -657,19 +688,19 @@ impl RedisPackumentCache {
     }
 
     fn namespaced(key: &str) -> String {
-        format!("{}{}", REDIS_KEY_NAMESPACE, key)
+        format!("{}{}", REDIS_ENTRY_NAMESPACE, key)
     }
 
     /// The per-package key-index `SET` used for scan-free invalidation.
     fn index_key(prefix: &str) -> String {
-        format!("{}idx:{}", REDIS_KEY_NAMESPACE, prefix)
+        format!("{}idx:{}", REDIS_ENTRY_NAMESPACE, prefix)
     }
 
     /// The cross-replica refresh-lease key for one flight (#2248).
     fn lease_key(flight_key: &str) -> String {
         format!(
             "{}{}{}",
-            REDIS_KEY_NAMESPACE, REFRESH_LEASE_KEY_PREFIX, flight_key
+            REDIS_COORDINATION_NAMESPACE, REFRESH_LEASE_KEY_PREFIX, flight_key
         )
     }
 }
@@ -1261,6 +1292,7 @@ mod tests {
             bytes: Bytes::from_static(body),
             content_type: "application/json".to_string(),
             content_encoding: None,
+            etag: "\"test-etag\"".to_string(),
         }
     }
 
@@ -1269,6 +1301,7 @@ mod tests {
             bytes: Bytes::from_static(body),
             content_type: "application/vnd.npm.install-v1+json".to_string(),
             content_encoding: Some("gzip".to_string()),
+            etag: "\"test-etag-gz\"".to_string(),
         }
     }
 
@@ -1507,9 +1540,23 @@ mod tests {
             bytes: Bytes::new(),
             content_type: "application/json".to_string(),
             content_encoding: None,
+            etag: "\"empty\"".to_string(),
         };
         let (decoded, _) = decode_redis_entry(&encode_redis_entry(&e, 7)).expect("decode");
         assert_eq!(decoded, e);
+    }
+
+    #[test]
+    fn redis_entry_decode_rejects_entry_without_etag() {
+        // A v1 layout (no ETag field) re-tagged as v2 must be rejected rather
+        // than decoded into an entry whose `If-None-Match` could never match.
+        let e = CachedPackument {
+            bytes: Bytes::from_static(b"{}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            etag: String::new(),
+        };
+        assert!(decode_redis_entry(&encode_redis_entry(&e, 7)).is_none());
     }
 
     #[test]
@@ -1530,10 +1577,37 @@ mod tests {
     #[test]
     fn redis_index_key_is_namespaced_per_prefix() {
         let index = RedisPackumentCache::index_key(&invalidation_prefix("repo", "pkg"));
-        assert_eq!(index, "ak:npm-packument:idx:repo:pkg:");
+        assert_eq!(index, "ak:npm-packument:v2:idx:repo:pkg:");
+        assert_eq!(
+            RedisPackumentCache::namespaced("entry"),
+            "ak:npm-packument:v2:entry"
+        );
+        assert_eq!(
+            RedisPackumentCache::lease_key("flight"),
+            "ak:npm-packument:refresh-lease:flight"
+        );
         assert_ne!(
             index,
             RedisPackumentCache::index_key(&invalidation_prefix("repo", "other"))
+        );
+    }
+
+    /// The entry namespace must track [`REDIS_ENTRY_VERSION`]. The two are only
+    /// tied together by a comment, and bumping the version while leaving the
+    /// namespace behind silently reintroduces the rolling-deploy failure the
+    /// namespace exists to prevent: mixed-version replicas sharing entry keys,
+    /// each rejecting and overwriting the other's values.
+    #[test]
+    fn redis_entry_namespace_tracks_entry_version() {
+        assert!(
+            REDIS_ENTRY_NAMESPACE.ends_with(&format!("v{}:", REDIS_ENTRY_VERSION)),
+            "entry namespace {REDIS_ENTRY_NAMESPACE:?} must carry v{REDIS_ENTRY_VERSION}"
+        );
+        // Coordination keys must NOT be version-scoped, or single-flight stops
+        // deduplicating across versions mid-deploy.
+        assert!(
+            !REDIS_COORDINATION_NAMESPACE.contains(&format!("v{}:", REDIS_ENTRY_VERSION)),
+            "coordination namespace must stay stable across entry versions"
         );
     }
 

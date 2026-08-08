@@ -15,7 +15,8 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, VARY,
+    ACCEPT, ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
+    VARY,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -31,6 +32,7 @@ use tower_http::compression::CompressionLayer;
 use tracing::{debug, info};
 
 use crate::api::extractors::RequestBaseUrl;
+use crate::api::handlers::cache_headers::{check_conditional_request, compute_etag};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
@@ -131,6 +133,71 @@ fn npm_metadata_compression_layer() -> CompressionLayer<impl Predicate> {
 /// bounded JSON; keep this aligned with the upstream npm metadata cap so
 /// large public packuments (for example `prisma`) can still be cached.
 const NPM_PACKUMENT_BUFFER_CAP: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
+/// `Cache-Control` for a packument served from the computed-packument cache
+/// (Remote / Virtual repos).
+///
+/// A short client-side freshness window is safe here because the server already
+/// serves these from a cache with its own TTL (`proxy_cache_ttl_secs`, 300s by
+/// default), so against a TTL-only deployment 60s adds no staleness class that
+/// did not already exist.
+///
+/// That argument is weaker when `npm_upstream_feed_enabled` is on (#2249,
+/// `services/upstream_feed.rs`). The feed exists precisely so a proxy can bound
+/// metadata staleness by *upstream events* rather than by TTL:
+/// `PackumentInvalidationAction` drops the entry within seconds of the npmjs
+/// `_changes` notification. For those deployments 60s IS a new staleness class,
+/// because the client no longer sends the request that the invalidation would
+/// have served correctly. The feed defaults to off (`config.rs`), so this is a
+/// documented interaction rather than a live regression -- but if it is turned
+/// on by default, this directive should be gated on it.
+const NPM_CACHE_CONTROL_CACHED: &str = "private, max-age=60";
+
+/// `Cache-Control` for a packument built per-request — hosted repos, age-gated
+/// repos, or no cache configured.
+///
+/// Deliberately `no-cache`, NOT `max-age=60`. `get_package_metadata_cached`
+/// documents why hosted packuments are not server-cached: it would break
+/// read-your-writes, because "a publish on one pod would leave other pods
+/// serving the pre-publish entry for the fresh window". A client-side freshness
+/// window reintroduces exactly that, one layer further out, where AK's
+/// Postgres LISTEN/NOTIFY invalidation cannot reach it at all —
+/// `scripts/native-tests/test-npm.sh` is literally that shape (publish, sleep 2,
+/// install, constant package name, shared `~/.npm/_cacache`).
+///
+/// `no-cache` still stores the response and still revalidates with
+/// `If-None-Match`, so the bodiless 304s this feature exists for are unaffected
+/// (#3052 asked for cheap revalidation, not a freshness window).
+const NPM_CACHE_CONTROL_UNCACHED: &str = "private, no-cache";
+const NPM_VARY: &str = "Accept, Accept-Encoding";
+
+/// Which client-side `Cache-Control` a repo type may hand out.
+///
+/// Extracted as a pure function purely so it can be tested. Inline, this
+/// decision was structurally untestable: the only way to observe it was through
+/// `get_package_metadata_cached`, and every test that drove that function with
+/// a Virtual repo threw the response headers away. Collapsing it to
+/// `NPM_CACHE_CONTROL_CACHED` left the whole suite green while re-opening the
+/// read-your-writes window on Virtual repos -- the same "computed, threaded,
+/// then dropped" shape that has now bitten this change twice, one call frame
+/// apart. A pure function with a table test cannot go inert unnoticed.
+///
+/// See [`NPM_CACHE_CONTROL_CACHED`] / [`NPM_CACHE_CONTROL_UNCACHED`] for why
+/// Remote is the only type that earns a freshness window.
+fn client_cache_control_for(repo_type: &str) -> &'static str {
+    // Parsed rather than string-compared so the decision fails CLOSED. The
+    // column is a raw `String` here, and `from_db_str`'s own docs note that
+    // `resolve_repo_by_key` yields an empty string when the column read fails
+    // -- an unparseable or future type must not fall into a freshness window
+    // by default. Variants are enumerated for the same reason: adding a
+    // RepositoryType should be a compile error here, not a silent `_ =>`.
+    match RepositoryType::from_db_str(repo_type) {
+        Some(RepositoryType::Remote) => NPM_CACHE_CONTROL_CACHED,
+        Some(RepositoryType::Local)
+        | Some(RepositoryType::Virtual)
+        | Some(RepositoryType::Staging) => NPM_CACHE_CONTROL_UNCACHED,
+        None => NPM_CACHE_CONTROL_UNCACHED,
+    }
+}
 
 /// True when the client advertises `gzip` (or `*`) in `Accept-Encoding`, i.e.
 /// the metadata compression layer would have gzipped the response. Only gzip
@@ -172,14 +239,59 @@ fn gzip_encode(data: &[u8]) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-/// Build a `Response` from a cached computed packument. The
-/// `Content-Encoding` header (present when the body is gzip) makes the
-/// metadata compression layer skip this response, so the pre-encoded bytes
+async fn compute_packument_etag(body: &Bytes) -> Result<String, Response> {
+    let body = body.clone();
+    tokio::task::spawn_blocking(move || compute_etag(&body))
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to compute packument ETag: {e}")).into_response()
+        })
+}
+
+/// `cache_control` must be the same directive the 200 for this request would
+/// have carried: a 304 that advertises a longer freshness window than its 200
+/// lets a client hold a revalidated entry past the point the 200 would have
+/// gone stale.
+fn check_packument_conditional_request(
+    headers: &HeaderMap,
+    etag: &str,
+    cache_control: &'static str,
+) -> Option<Response> {
+    HeaderValue::from_str(etag).ok()?;
+    let mut response = check_conditional_request(headers, etag)?;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static(NPM_VARY));
+    Some(response)
+}
+
+/// Build a `Response` from a cached computed packument, or a `304 Not
+/// Modified` when the request's `If-None-Match` already carries the entry's
+/// ETag. The `Content-Encoding` header (present when the body is gzip) makes
+/// the metadata compression layer skip this response, so the pre-encoded bytes
 /// are served verbatim. `Vary` covers both request dimensions of the cache
 /// key: tower-http only adds `Vary: accept-encoding` when it compresses, so
 /// pre-encoded hits must declare it themselves or a shared HTTP cache could
 /// serve one client's encoding (or Accept variant) to another.
-fn cached_packument_response(entry: &CachedPackument) -> Response {
+///
+/// The cache headers are applied here rather than by delegating to
+/// `cache_headers::cacheable_response`, because that helper builds a fresh
+/// response carrying only cache headers and would drop the `Content-Encoding`
+/// and `Vary` guarantees above.
+fn cached_packument_response(
+    entry: &CachedPackument,
+    request_headers: &HeaderMap,
+    cache_control: &'static str,
+) -> Response {
+    if let Some(not_modified) =
+        check_packument_conditional_request(request_headers, &entry.etag, cache_control)
+    {
+        return not_modified;
+    }
+
     let mut response = Response::new(Body::from(entry.bytes.clone()));
     let headers = response.headers_mut();
     // Stored values originate from valid responses, but a corrupt shared
@@ -194,8 +306,89 @@ fn cached_packument_response(entry: &CachedPackument) -> Response {
             headers.insert(CONTENT_ENCODING, value);
         }
     }
-    headers.insert(VARY, HeaderValue::from_static("Accept, Accept-Encoding"));
+    headers.insert(VARY, HeaderValue::from_static(NPM_VARY));
+    // Stored ETags are generated by `compute_etag` (quoted hex), but a corrupt
+    // shared cache entry must not panic; an unsettable ETag simply degrades to
+    // a response the client must revalidate.
+    //
+    // Both arms set `Cache-Control`. Leaving it off on the degraded arm would
+    // be worse than it looks: a 200 to a GET with no `Cache-Control` is
+    // *heuristically* cacheable (RFC 9111 4.2.2) and, more to the point, no
+    // longer carries `private` -- so the failure mode of a corrupt entry would
+    // be a less restrictive directive than the success path. Degrade to
+    // `no-cache`, which is the strictest directive here and needs no validator.
+    if let Ok(value) = HeaderValue::from_str(&entry.etag) {
+        headers.insert(ETAG, value);
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    } else {
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static(NPM_CACHE_CONTROL_UNCACHED),
+        );
+    }
     response
+}
+
+/// Attach `ETag` + `Cache-Control` to a packument response built per-request
+/// (no computed-packument cache: hosted repos, age-gated repos, or no cache
+/// configured), or replace it with `304 Not Modified` when the client's
+/// `If-None-Match` matches.
+///
+/// The ETag is computed from the identity body, the same basis the cached path
+/// stores in [`CachedPackument::etag`], so both paths agree on the tag for the
+/// same packument and a client keeps revalidating if a repo's cache eligibility
+/// changes underneath it.
+///
+/// `Vary` is required here for the same reason the cached path sets it: private
+/// client caches still need separate entries for full/abbreviated and encoded
+/// variants. Non-`200` and non-JSON responses are passed through untouched.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped; the exempt call is marked inline below (#1608)
+async fn packument_response_with_cache_headers(
+    response: Response,
+    request_headers: &HeaderMap,
+) -> Result<Response, Response> {
+    if response.status() != StatusCode::OK {
+        return Ok(response);
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !is_cacheable_packument_content_type(&content_type) {
+        return Ok(response);
+    }
+
+    let (mut parts, body) = response.into_parts();
+    // STREAMING-EXEMPT: capped metadata read (a computed npm packument JSON, not an artifact blob); this body is already fully in memory (built from a String, or a buffered proxy read) and is bounded to <=128 MiB via NPM_PACKUMENT_BUFFER_CAP; tracked under #1608
+    let body_bytes = axum::body::to_bytes(body, NPM_PACKUMENT_BUFFER_CAP)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to read packument body: {}", e)).into_response()
+        })?;
+
+    let etag = compute_packument_etag(&body_bytes).await?;
+    if let Some(not_modified) =
+        check_packument_conditional_request(request_headers, &etag, NPM_CACHE_CONTROL_UNCACHED)
+    {
+        return Ok(not_modified);
+    }
+
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        parts.headers.insert(ETAG, value);
+        parts.headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static(NPM_CACHE_CONTROL_UNCACHED),
+        );
+        parts
+            .headers
+            .insert(VARY, HeaderValue::from_static(NPM_VARY));
+    }
+    if let Ok(value) = HeaderValue::from_str(&body_bytes.len().to_string()) {
+        parts.headers.insert(CONTENT_LENGTH, value);
+    }
+    Ok(Response::from_parts(parts, Body::from(body_bytes)))
 }
 
 /// How the age gate affects computed-packument cache eligibility for a repo.
@@ -302,9 +495,34 @@ async fn get_package_metadata_cached(
     let cache_eligible = (repo.repo_type == RepositoryType::Remote
         || repo.repo_type == RepositoryType::Virtual)
         && !age_gate_bypasses_packument_cache(state, &repo).await;
+    // Server-side caching is safe for Remote AND Virtual, because #2490's
+    // LISTEN/NOTIFY fanout (`invalidate_package_and_virtuals`, which explicitly
+    // walks `virtual_repo_keys`) drops the entry on every replica the moment a
+    // member publishes.
+    //
+    // A CLIENT-side freshness window is only safe for Remote. A Virtual repo may
+    // aggregate a hosted member, which is a write target -- and invalidation
+    // cannot reach npm's `cacache`, so `max-age` there re-opens exactly the
+    // read-your-writes window the fanout exists to close.
+    //
+    // Remote is safe -- but not, as an earlier draft of this comment claimed,
+    // because nothing can write to a Remote repo. npm-native publish and
+    // dist-tag writes are blocked (`reject_write_if_not_hosted`), yet generic
+    // upload, chunked upload and migration import all resolve a repository
+    // without a `repo_type` guard and can land rows against a Remote repo.
+    //
+    // The real invariant is on the READ side: `get_package_metadata` answers a
+    // Remote repo purely from the upstream proxy and 404s when the proxy is
+    // unavailable -- it never consults local artifact rows -- so a locally
+    // planted row cannot alter a Remote packument and there is no local write
+    // for an invalidation to miss. Stated this way because a future "serve
+    // local rows when upstream is down" change would silently invalidate it,
+    // and that is the change to re-check this directive against.
+    let client_cache_control = client_cache_control_for(&repo.repo_type);
     let Some(cache) = state.npm_packument_cache.clone().filter(|_| cache_eligible) else {
-        return get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated)
-            .await;
+        let response =
+            get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated).await?;
+        return packument_response_with_cache_headers(response, headers).await;
     };
     let want_gzip = accepts_gzip(headers);
     let key = packument_cache::cache_key(
@@ -371,7 +589,7 @@ async fn get_package_metadata_cached(
             },
         )
         .await
-        .map(|entry| cached_packument_response(&entry))
+        .map(|entry| cached_packument_response(&entry, headers, client_cache_control))
 }
 
 /// True when a response status is an authoritative "this package does not
@@ -438,10 +656,16 @@ async fn compute_and_store_packument(
             AppError::Internal(format!("Failed to read packument body: {}", e)).into_response()
         })?;
 
+    // One ETag for both encodings, computed from the identity body: the gzip
+    // variant is derived from these same bytes, so a client revalidates
+    // successfully whichever variant its `Accept-Encoding` selected.
+    let etag = compute_packument_etag(&body_bytes).await?;
+
     let identity_entry = CachedPackument {
         bytes: body_bytes.clone(),
         content_type: content_type.clone(),
         content_encoding: None,
+        etag: etag.clone(),
     };
     cache
         .store_guarded(
@@ -459,6 +683,7 @@ async fn compute_and_store_packument(
                 bytes: Bytes::from(gz),
                 content_type,
                 content_encoding: Some("gzip".to_string()),
+                etag,
             };
             cache
                 .store_guarded(
@@ -4140,6 +4365,7 @@ fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header::IF_NONE_MATCH;
 
     // -----------------------------------------------------------------------
     // npm scope policy (#2327)
@@ -8332,8 +8558,9 @@ mod tests {
             bytes: Bytes::from_static(b"gz"),
             content_type: NPM_ABBREVIATED_CONTENT_TYPE.to_string(),
             content_encoding: Some("gzip".to_string()),
+            etag: compute_etag(b"{}"),
         };
-        let response = cached_packument_response(&gz);
+        let response = cached_packument_response(&gz, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
         assert_eq!(
@@ -8343,19 +8570,141 @@ mod tests {
         // Pre-encoded hits must declare both cache-key request dimensions:
         // tower-http only adds Vary when IT compresses.
         assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
+        assert_eq!(response.headers()[ETAG], compute_etag(b"{}"));
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, max-age=60");
 
         let identity = CachedPackument {
             bytes: Bytes::from_static(b"{}"),
             content_type: "application/json".to_string(),
             content_encoding: None,
+            etag: compute_etag(b"{}"),
         };
-        let response = cached_packument_response(&identity);
+        let response =
+            cached_packument_response(&identity, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             response.headers().get(CONTENT_ENCODING).is_none(),
             "identity entries must not claim a content encoding"
         );
         assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
+        assert_eq!(response.headers()[ETAG], compute_etag(b"{}"));
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, max-age=60");
+    }
+
+    /// `cached_packument_response` must EMIT the directive it is handed, not
+    /// the one that happens to be right for a Remote repo.
+    ///
+    /// This is the test that was missing. The caller computes
+    /// `client_cache_control` per repo type and threads it in, but the 200
+    /// branch hardcoded `NPM_CACHE_CONTROL_CACHED` and only the 304 branch
+    /// read the parameter -- so a Virtual repo's packument shipped
+    /// `max-age=60` on the response that actually carries the body, and
+    /// `no-cache` only on revalidation. Every existing call site in this
+    /// module passed `NPM_CACHE_CONTROL_CACHED`, so the parameter's effect on
+    /// a 200 had no coverage at all and the whole repo-type split was inert.
+    ///
+    /// Both assertions are literals on purpose: comparing against the
+    /// constant production reads is what hid this in the first place.
+    /// The repo-type -> directive decision itself, which was previously
+    /// impossible to observe: it lived inline in `get_package_metadata_cached`,
+    /// and every test that drove that function with a Virtual repo threw the
+    /// response headers away. Collapsing it to `NPM_CACHE_CONTROL_CACHED` left
+    /// the whole suite green while re-opening the Virtual read-your-writes
+    /// window -- the same "computed, threaded, then dropped" failure as the
+    /// commit before this one, one call frame up.
+    ///
+    /// Literals on the right-hand side, deliberately.
+    #[test]
+    fn test_client_cache_control_for_repo_type_table() {
+        assert_eq!(
+            client_cache_control_for("remote"),
+            "private, max-age=60",
+            "Remote is answered purely from the upstream proxy and has no \
+             local publish path to invalidate against, so it earns a window"
+        );
+        for hosted_or_aggregating in ["virtual", "local", "staging"] {
+            assert_eq!(
+                client_cache_control_for(hosted_or_aggregating),
+                "private, no-cache",
+                "{hosted_or_aggregating} can serve a write target; a client \
+                 freshness window there is unreachable by invalidation"
+            );
+        }
+        // Fails closed. `from_db_str` returns None for an unknown type, and
+        // `resolve_repo_by_key` yields an empty string when the column read
+        // fails -- neither may default into a freshness window.
+        for unknown in ["", "REMOTE", "federated", "remote "] {
+            assert_eq!(
+                client_cache_control_for(unknown),
+                "private, no-cache",
+                "an unparseable repo_type ({unknown:?}) must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cached_packument_response_emits_the_directive_it_is_given() {
+        let entry = CachedPackument {
+            bytes: Bytes::from_static(b"{\"name\":\"left-pad\"}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            etag: compute_etag(b"{\"name\":\"left-pad\"}"),
+        };
+
+        // 200: no conditional header, so this is the cold-client response.
+        let response =
+            cached_packument_response(&entry, &HeaderMap::new(), NPM_CACHE_CONTROL_UNCACHED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-cache");
+        assert!(
+            !response.headers()[CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("max-age"),
+            "a repo that cannot invalidate client caches must not hand out a \
+             freshness window on the body-carrying response"
+        );
+
+        // 304: the same request, revalidating. Must agree with the 200.
+        let mut conditional = HeaderMap::new();
+        conditional.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_str(&entry.etag).expect("valid etag"),
+        );
+        let not_modified =
+            cached_packument_response(&entry, &conditional, NPM_CACHE_CONTROL_UNCACHED);
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(not_modified.headers()[CACHE_CONTROL], "private, no-cache");
+    }
+
+    /// A corrupt stored ETag must degrade to a STRICTER directive, not to none.
+    ///
+    /// The unsettable-ETag arm previously set no `Cache-Control` at all. A 200
+    /// to a GET with no `Cache-Control` is heuristically cacheable (RFC 9111
+    /// 4.2.2) and, worse, no longer carries `private` -- so a corrupt shared
+    /// cache entry produced a *less* restrictive response than a healthy one.
+    #[test]
+    fn test_cached_packument_corrupt_etag_still_carries_private_no_cache() {
+        let entry = CachedPackument {
+            bytes: Bytes::from_static(b"{\"name\":\"left-pad\"}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            // A newline cannot go in a header value, so `from_str` fails.
+            etag: "\"bad\netag\"".to_string(),
+        };
+        let response =
+            cached_packument_response(&entry, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get(ETAG).is_none(),
+            "an unsettable ETag must be omitted, not panic"
+        );
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "private, no-cache",
+            "the degraded arm must stay private and must not invite \
+             heuristic caching of a response with no validator"
+        );
     }
 
     #[test]
@@ -8366,11 +8715,327 @@ mod tests {
             bytes: Bytes::from_static(b"{}"),
             content_type: "bad\r\nvalue".to_string(),
             content_encoding: Some("also\nbad".to_string()),
+            etag: "bad\retag".to_string(),
         };
-        let response = cached_packument_response(&corrupt);
+        let response =
+            cached_packument_response(&corrupt, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
         assert!(response.headers().get(CONTENT_ENCODING).is_none());
+        // An unsettable ETag degrades to `no-cache` rather than to no
+        // directive at all: omitting the header entirely made the corrupt
+        // path *less* restrictive than the healthy one (heuristically
+        // cacheable, and no longer `private`).
+        assert!(response.headers().get(ETAG).is_none());
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-cache");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let response = cached_packument_response(&corrupt, &headers, NPM_CACHE_CONTROL_CACHED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(ETAG).is_none());
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-cache");
+    }
+
+    #[test]
+    fn test_cached_packument_response_304_on_matching_if_none_match() {
+        let entry = CachedPackument {
+            bytes: Bytes::from_static(b"{\"name\":\"left-pad\"}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            etag: compute_etag(b"{\"name\":\"left-pad\"}"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_str(&entry.etag).expect("valid etag"),
+        );
+
+        let response = cached_packument_response(&entry, &headers, NPM_CACHE_CONTROL_CACHED);
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()[ETAG], entry.etag);
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, max-age=60");
+        assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
+    }
+
+    #[test]
+    fn test_cached_packument_response_200_on_stale_if_none_match() {
+        let entry = CachedPackument {
+            bytes: Bytes::from_static(b"{\"name\":\"left-pad\"}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            etag: compute_etag(b"{\"name\":\"left-pad\"}"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_str(&compute_etag(b"{\"name\":\"other\"}")).expect("valid etag"),
+        );
+
+        let response = cached_packument_response(&entry, &headers, NPM_CACHE_CONTROL_CACHED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[ETAG], entry.etag);
+    }
+
+    /// The regression this whole change turns on: the gzip and identity
+    /// variants of one packument are separate cache entries with different
+    /// bytes, so hashing the *stored* bytes would hand a gzip client a
+    /// different ETag than an identity client and break revalidation whenever
+    /// a repo's cache eligibility (or the client's Accept-Encoding) shifted.
+    /// Both variants must carry the identity-derived ETag.
+    #[test]
+    fn test_gzip_and_identity_variants_share_one_etag() {
+        let identity_body = b"{\"name\":\"left-pad\",\"versions\":{}}";
+        let gzipped = gzip_encode(identity_body).expect("gzip");
+        assert_ne!(
+            gzipped.as_slice(),
+            identity_body.as_slice(),
+            "gzip must actually change the bytes for this test to mean anything"
+        );
+
+        let canonical = compute_etag(identity_body);
+        let identity = CachedPackument {
+            bytes: Bytes::from_static(identity_body),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            etag: canonical.clone(),
+        };
+        let gz = CachedPackument {
+            bytes: Bytes::from(gzipped),
+            content_type: "application/json".to_string(),
+            content_encoding: Some("gzip".to_string()),
+            etag: canonical.clone(),
+        };
+
+        let identity_response =
+            cached_packument_response(&identity, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
+        let gz_response =
+            cached_packument_response(&gz, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
+        assert_eq!(identity_response.headers()[ETAG], canonical);
+        assert_eq!(gz_response.headers()[ETAG], canonical);
+
+        // And the shared tag revalidates against either variant.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_str(&canonical).expect("valid etag"),
+        );
+        assert_eq!(
+            cached_packument_response(&identity, &headers, NPM_CACHE_CONTROL_CACHED).status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert_eq!(
+            cached_packument_response(&gz, &headers, NPM_CACHE_CONTROL_CACHED).status(),
+            StatusCode::NOT_MODIFIED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_uncached_packument_gets_cache_headers() {
+        let body = "{\"name\":\"left-pad\"}";
+        let response = build_json_metadata_response(body.to_string());
+        let response = packument_response_with_cache_headers(response, &HeaderMap::new())
+            .await
+            .expect("headers applied");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[ETAG], compute_etag(body.as_bytes()));
+        // Assert the LITERAL, not the constant. Comparing against the constant
+        // is a tautology: change the constant's value and both sides of the
+        // assertion move together, so it cannot catch a regression to
+        // `max-age`. Verified -- reverting the constant to "private, max-age=60"
+        // left this test green until it was written this way.
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "private, no-cache",
+            "a per-request (hosted) packument must not carry a client-side \
+             freshness window: a publish would then be invisible to another pod \
+             for its duration, which is the read-your-writes break the server \
+             cache is deliberately avoiding"
+        );
+        assert!(
+            !response.headers()[CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("max-age"),
+            "no max-age on the uncached path"
+        );
+        // Making the response cacheable obliges us to declare that `Accept`
+        // selects between the full and abbreviated packument, or a shared cache
+        // could serve the wrong variant.
+        assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    }
+
+    #[tokio::test]
+    async fn test_uncached_packument_304_matches_cached_path_etag() {
+        // The uncached path must derive the same tag the cached path stores, so
+        // a client keeps revalidating if a repo stops being cache-eligible.
+        let body = "{\"name\":\"left-pad\"}";
+        let canonical = compute_etag(body.as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_str(&canonical).expect("valid etag"),
+        );
+
+        let response = build_json_metadata_response(body.to_string());
+        let response = packument_response_with_cache_headers(response, &headers)
+            .await
+            .expect("headers applied");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        // A 304 must repeat the directive its 200 would have carried. Status
+        // alone left this unguarded: swapping the constant at the uncached
+        // 304 site to the cached one passed, which would advertise a 60s
+        // freshness window on the revalidation leg of a repo whose 200 says
+        // `no-cache` -- the read-your-writes break, one layer out.
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-cache");
+
+        let cached = CachedPackument {
+            bytes: Bytes::from_static(b"{\"name\":\"left-pad\"}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            etag: canonical.clone(),
+        };
+        assert_eq!(
+            cached_packument_response(&cached, &headers, NPM_CACHE_CONTROL_CACHED).status(),
+            StatusCode::NOT_MODIFIED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_uncached_packument_changed_body_changes_etag() {
+        let first = packument_response_with_cache_headers(
+            build_json_metadata_response("{\"versions\":{\"1.0.0\":{}}}".to_string()),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("headers applied");
+        let second = packument_response_with_cache_headers(
+            build_json_metadata_response("{\"versions\":{\"1.0.0\":{},\"1.0.1\":{}}}".to_string()),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("headers applied");
+
+        assert_ne!(first.headers()[ETAG], second.headers()[ETAG]);
+    }
+
+    #[tokio::test]
+    async fn test_uncached_non_200_and_non_json_are_left_alone() {
+        // Errors must never be marked cacheable.
+        let error = AppError::NotFound("nope".to_string()).into_response();
+        let error = packument_response_with_cache_headers(error, &HeaderMap::new())
+            .await
+            .expect("passthrough");
+        assert!(error.headers().get(ETAG).is_none());
+        assert!(error.headers().get(CACHE_CONTROL).is_none());
+
+        // Non-JSON passthrough bodies keep the existing behaviour.
+        let passthrough = build_ok_response("text/plain", "not json");
+        let passthrough = packument_response_with_cache_headers(passthrough, &HeaderMap::new())
+            .await
+            .expect("passthrough");
+        assert_eq!(passthrough.status(), StatusCode::OK);
+        assert!(passthrough.headers().get(ETAG).is_none());
+    }
+
+    /// A corrupt shared-cache entry must not panic even when the request is
+    /// conditional. `If-None-Match: *` matches regardless of the stored tag, so
+    /// it reaches the `304` builder — which panics on an invalid header value —
+    /// without needing a client that echoes the corrupt tag back.
+    #[test]
+    fn test_corrupt_etag_with_conditional_request_does_not_panic() {
+        let corrupt = CachedPackument {
+            bytes: Bytes::from_static(b"{}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            etag: "bad\retag".to_string(),
+        };
+
+        for value in [b"*".as_slice(), b"bad\retag".as_slice()] {
+            let mut headers = HeaderMap::new();
+            // Presented the way a client on the wire would; `*` in particular is
+            // a perfectly ordinary request header, not a hostile input.
+            let Ok(header) = HeaderValue::from_bytes(value) else {
+                continue;
+            };
+            headers.insert(IF_NONE_MATCH, header);
+
+            let response = cached_packument_response(&corrupt, &headers, NPM_CACHE_CONTROL_CACHED);
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "corrupt entry must degrade to an uncacheable 200, not a 304"
+            );
+            assert!(response.headers().get(ETAG).is_none());
+            assert_eq!(response.headers()[CACHE_CONTROL], "private, no-cache");
+        }
+    }
+
+    /// npm is the only format handler mounted behind a `CompressionLayer`, so
+    /// a `304` it emits passes through that layer on the way out. A compressed
+    /// `304` would be a protocol violation (a body, and a `Content-Encoding`,
+    /// on a response defined to have neither), so pin the interaction.
+    #[tokio::test]
+    async fn test_304_passes_through_compression_layer_bodiless() {
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let body = b"{\"name\":\"left-pad\"}";
+        let expected = compute_etag(body);
+        // Routed through THIS module's response builder, not the shared
+        // `check_conditional_request` helper. Calling the helper directly made
+        // this test pass on a tree with every line of this change removed --
+        // it pinned tower-http's treatment of a 304, which is worth having,
+        // but said nothing about the packument path that produces one.
+        let app =
+            Router::new()
+                .route(
+                    "/pkg",
+                    get(move |headers: HeaderMap| {
+                        let entry = CachedPackument {
+                            bytes: Bytes::from_static(b"{\"name\":\"left-pad\"}"),
+                            content_type: "application/json".to_string(),
+                            content_encoding: None,
+                            etag: compute_etag(b"{\"name\":\"left-pad\"}"),
+                        };
+                        async move {
+                            cached_packument_response(&entry, &headers, NPM_CACHE_CONTROL_CACHED)
+                        }
+                    }),
+                )
+                .layer(npm_metadata_compression_layer());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/pkg")
+                    .header(IF_NONE_MATCH, &expected)
+                    .header(ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route");
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(
+            response.headers().get(CONTENT_ENCODING).is_none(),
+            "a 304 must not be content-encoded, got {:?}",
+            response.headers().get(CONTENT_ENCODING)
+        );
+        assert_eq!(response.headers()[ETAG], expected);
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, max-age=60");
+        let received = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        assert!(
+            received.is_empty(),
+            "a 304 must not carry a body, got {} bytes",
+            received.len()
+        );
     }
 
     #[test]
@@ -8485,7 +9150,7 @@ mod db_cov_tests {
         state: &crate::api::SharedState,
         repo_key: &str,
         package: &str,
-    ) -> (axum::http::StatusCode, serde_json::Value) {
+    ) -> (axum::http::StatusCode, Option<String>, serde_json::Value) {
         let response = super::get_package_metadata_cached(
             state,
             repo_key,
@@ -8496,11 +9161,19 @@ mod db_cov_tests {
         .await
         .unwrap_or_else(|error_response| error_response);
         let status = response.status();
+        // Surfaced deliberately: this helper used to drop the headers, which is
+        // why three Virtual-fixture tests drove the repo-type decision six
+        // times over and still could not see which directive it produced.
+        let cache_control = response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("read packument body");
         let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-        (status, json)
+        (status, cache_control, json)
     }
 
     /// Minimal `npm publish` body for one version.
@@ -8568,7 +9241,7 @@ mod db_cov_tests {
         let state =
             tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
 
-        let (status_first, first) =
+        let (status_first, _, first) =
             fetch_packument_json(&state, &fx.repo_key, "cache-widget").await;
 
         // Break every non-cache path: unroutable upstream + wiped raw proxy
@@ -8581,7 +9254,7 @@ mod db_cov_tests {
         std::fs::remove_dir_all(&fx.storage_dir).expect("wipe proxy cache");
         std::fs::create_dir_all(&fx.storage_dir).expect("recreate storage dir");
 
-        let (status_second, second) =
+        let (status_second, _, second) =
             fetch_packument_json(&state, &fx.repo_key, "cache-widget").await;
 
         fx.teardown().await;
@@ -8605,6 +9278,210 @@ mod db_cov_tests {
         );
         // Dropping the mock server verifies `expect(1)`: exactly one
         // upstream fetch across both requests.
+    }
+
+    /// Regression test for the missing HTTP caching this change adds: on an
+    /// unpatched build a packument response carries no `ETag` and no
+    /// `Cache-Control`, and a conditional re-request is answered with another
+    /// full `200` instead of a `304`, so `npm`/`yarn` re-download every
+    /// packument on every metadata request.
+    /// The served ETag must be DERIVED from the packument bytes, through the
+    /// real store path -- not merely present and well-formed.
+    ///
+    /// My first attempt at this guard called `compute_etag` directly and never
+    /// touched `compute_and_store_packument`. Replacing the production
+    /// `let etag = compute_packument_etag(&body_bytes).await?` with a hardcoded
+    /// constant left it green, along with the rest of the suite: every
+    /// cached-path test hand-builds `CachedPackument { etag: compute_etag(..) }`,
+    /// so nothing asserted the stored tag came from the body.
+    ///
+    /// This drives `get_package_metadata_cached` and checks the tag the client
+    /// actually receives against `compute_etag` over the body it actually
+    /// receives. A constant fails immediately, because the two cannot agree.
+    #[tokio::test]
+    async fn test_served_etag_is_derived_from_the_served_body() {
+        use axum::http::header::ETAG;
+        use axum::http::{HeaderMap, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/derive-widget"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "derive-widget",
+                "dist-tags": {"latest": "2.0.0"},
+                "versions": {
+                    "2.0.0": {
+                        "name": "derive-widget",
+                        "version": "2.0.0",
+                        "dist": {"tarball": "https://registry.example.test/d.tgz"}
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let response = super::get_package_metadata_cached(
+            &state,
+            &fx.repo_key,
+            "derive-widget",
+            "http://localhost",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|error_response| error_response);
+
+        let status = response.status();
+        let served_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let served_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let served_etag = served_etag.expect("packument must carry an ETag");
+        assert_eq!(
+            served_etag,
+            crate::api::handlers::cache_headers::compute_etag(&served_body),
+            "the served ETag must be computed from the served bytes; a constant \
+             or any tag not derived from the body fails here"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_packument_carries_etag_and_answers_304() {
+        use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
+        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/etag-widget"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "etag-widget",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "etag-widget",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball":
+                                "https://registry.example.test/etag-widget/-/etag-widget-1.0.0.tgz"
+                        }
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let first = super::get_package_metadata_cached(
+            &state,
+            &fx.repo_key,
+            "etag-widget",
+            "http://localhost",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|error_response| error_response);
+
+        let first_status = first.status();
+        let etag = first
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let cache_control = first
+            .headers()
+            .get(CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        // Revalidate with whatever tag the first response advertised.
+        let mut conditional = HeaderMap::new();
+        if let Some(ref tag) = etag {
+            conditional.insert(IF_NONE_MATCH, HeaderValue::from_str(tag).expect("etag"));
+        }
+        let second = super::get_package_metadata_cached(
+            &state,
+            &fx.repo_key,
+            "etag-widget",
+            "http://localhost",
+            &conditional,
+        )
+        .await
+        .unwrap_or_else(|error_response| error_response);
+        let second_status = second.status();
+        let second_body = axum::body::to_bytes(second.into_body(), 1024 * 1024)
+            .await
+            .expect("read second body");
+
+        fx.teardown().await;
+
+        assert_eq!(first_status, StatusCode::OK);
+        // Literal, not the constant: comparing against the constant is a
+        // tautology -- change its value and both sides move together, so it
+        // cannot catch a regression. `private` is the load-bearing half here;
+        // `public` would invite shared caches to store an authenticated,
+        // per-repo packument.
+        assert_eq!(
+            cache_control.as_deref(),
+            Some("private, max-age=60"),
+            "a Remote packument must be privately cacheable with a short window"
+        );
+        let etag = etag.expect("packument must carry an ETag");
+        assert!(
+            etag.starts_with('"') && etag.ends_with('"'),
+            "ETag must be the quoted form clients send back, got {etag}"
+        );
+        assert_eq!(
+            second_status,
+            StatusCode::NOT_MODIFIED,
+            "a matching If-None-Match must revalidate to 304, not re-send the packument"
+        );
+        assert!(
+            second_body.is_empty(),
+            "a 304 must not carry a body, got {} bytes",
+            second_body.len()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8778,8 +9655,22 @@ mod db_cov_tests {
         assert!(published.is_ok(), "publish 1.0.0 must succeed");
 
         // Warm the virtual repo's computed-packument cache.
-        let (status, warm) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        let (status, cache_control, warm) =
+            fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
         assert_eq!(status, StatusCode::OK);
+        // The repo-type decision, observed through the real wiring rather than
+        // by handing the response builder a constant. This fixture already
+        // aggregates a hosted member and publishes to it below, which is
+        // exactly the topology that makes a client freshness window unsafe:
+        // the #2490 fanout drops the server entry, but nothing reaches npm's
+        // `cacache`. A literal, because comparing against the constant
+        // production reads is what hid this the first two times.
+        assert_eq!(
+            cache_control.as_deref(),
+            Some("private, no-cache"),
+            "a Virtual repo aggregates a hosted write target -- it must not \
+             hand clients a freshness window on the body-carrying response"
+        );
         assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
 
         // Seed a version directly in the member's tables, bypassing the
@@ -8798,7 +9689,7 @@ mod db_cov_tests {
             fx.user_id,
         )
         .await;
-        let (_, cached) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        let (_, _, cached) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
         assert!(
             cached["versions"]["9.9.9"].is_null(),
             "a fresh virtual cache hit must serve the cached packument, not recompute; \
@@ -8818,7 +9709,7 @@ mod db_cov_tests {
         )
         .await;
         assert!(republished.is_ok(), "publish 2.0.0 must succeed");
-        let (_, after_publish) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        let (_, _, after_publish) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
         assert!(
             after_publish["versions"]["2.0.0"].is_object()
                 && after_publish["versions"]["9.9.9"].is_object(),
@@ -8840,7 +9731,7 @@ mod db_cov_tests {
         )
         .await;
         assert!(tagged.is_ok(), "dist-tag add must succeed");
-        let (_, after_tag) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        let (_, _, after_tag) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
 
         cleanup_member(&fx, member_id, &member_dir).await;
         fx.teardown().await;
@@ -8885,7 +9776,7 @@ mod db_cov_tests {
         assert!(published.is_ok(), "publish must succeed");
 
         // Warm the virtual repo's cache.
-        let (status, warm) = fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
+        let (status, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
 
@@ -8908,7 +9799,8 @@ mod db_cov_tests {
         // Without invalidation the virtual repo would keep serving the cached
         // packument for the whole fresh window; with it, the recompute finds
         // no versions and the package is gone.
-        let (status_after, after) = fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
+        let (status_after, _, after) =
+            fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
 
         cleanup_member(&fx, member_id, &member_dir).await;
         fx.teardown().await;
@@ -9012,7 +9904,7 @@ mod db_cov_tests {
         let state = build_state_with_fresh_ttl(&fx, 0);
 
         // Miss: computes v1 and stores it.
-        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+        let (status, _, first) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
 
@@ -9030,7 +9922,7 @@ mod db_cov_tests {
 
         // Stale hit: the OLD body is served immediately while the refresh
         // runs in the background.
-        let (status, stale) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+        let (status, _, stale) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             stale["versions"]["1.0.0"].is_object() && stale["versions"]["2.0.0"].is_null(),
@@ -9042,7 +9934,7 @@ mod db_cov_tests {
         let mut refreshed = stale;
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let (_, current) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+            let (_, _, current) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
             refreshed = current;
             if refreshed["versions"]["2.0.0"].is_object() {
                 break;
@@ -9136,7 +10028,7 @@ mod db_cov_tests {
         let state = std::sync::Arc::new(app_state);
 
         // Miss: computes v1 inline — the one permitted upstream request.
-        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
+        let (status, _, first) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
 
@@ -9145,7 +10037,7 @@ mod db_cov_tests {
         repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
 
         // Stale hit: served from cache; the refresh must be lease-skipped.
-        let (status, stale) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
+        let (status, _, stale) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(stale["versions"]["1.0.0"].is_object(), "got {stale:?}");
 
@@ -9201,7 +10093,7 @@ mod db_cov_tests {
         let state = build_state_with_fresh_ttl(&fx, 0);
 
         // Warm the cache with the live packument.
-        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
+        let (status, _, first) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
 
@@ -9216,7 +10108,7 @@ mod db_cov_tests {
         // requests must converge on 404 rather than the ghost packument.
         let mut final_status = StatusCode::OK;
         for _ in 0..50 {
-            let (status, _) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
+            let (status, _, _) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
             final_status = status;
             if final_status == StatusCode::NOT_FOUND {
                 break;
@@ -9240,7 +10132,7 @@ mod db_cov_tests {
     /// client sees.
     #[tokio::test]
     async fn test_gzip_variant_served_pre_encoded() {
-        use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, VARY};
+        use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ETAG, VARY};
         use axum::http::{HeaderMap, StatusCode};
         use flate2::read::GzDecoder;
         use std::io::Read;
@@ -9266,6 +10158,7 @@ mod db_cov_tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let mut gzip_etags: Vec<String> = Vec::new();
         // Twice: the first request stores both variants, the second is a
         // warm gzip hit.
         for pass in ["cold", "warm"] {
@@ -9292,6 +10185,14 @@ mod db_cov_tests {
                 Some("Accept, Accept-Encoding"),
                 "{pass}: pre-encoded responses must declare Vary themselves"
             );
+            gzip_etags.push(
+                response
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| panic!("{pass}: gzip variant must carry an ETag")),
+            );
             let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
                 .expect("read body");
@@ -9304,6 +10205,58 @@ mod db_cov_tests {
             assert!(
                 json["versions"]["1.0.0"].is_object(),
                 "{pass}: gunzipped body must be the packument, got {json:?}"
+            );
+        }
+
+        // The cross-variant invariant: the gzip entry must carry the
+        // IDENTITY-derived tag, not a hash of its own compressed bytes.
+        //
+        // This has to be asserted across variants. Checking that the gzip
+        // response's tag equals `compute_etag` over the gzip body would be
+        // self-consistent under the very bug it is meant to catch, and the
+        // existing variant-sharing test hand-builds both cache entries with
+        // the same tag, so it only proves a struct field gets copied --
+        // `compute_and_store_packument`, which is what actually decides this,
+        // is never invoked by it.
+        //
+        // If the two variants disagree, `If-None-Match` stops matching the
+        // moment a client's `Accept-Encoding` shifts or an intermediary strips
+        // gzip, and the 304 this whole change exists to produce silently never
+        // fires again for that client.
+        let identity_response = super::get_package_metadata_cached(
+            &state,
+            &fx.repo_key,
+            "gzpkg",
+            "http://localhost",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|error_response| error_response);
+        assert_eq!(identity_response.status(), StatusCode::OK);
+        assert!(
+            identity_response.headers().get(CONTENT_ENCODING).is_none(),
+            "the identity request must not get a pre-encoded body"
+        );
+        let identity_etag = identity_response
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .expect("identity variant must carry an ETag")
+            .to_string();
+        let identity_body = axum::body::to_bytes(identity_response.into_body(), 1024 * 1024)
+            .await
+            .expect("read identity body");
+
+        assert_eq!(
+            identity_etag,
+            crate::api::handlers::cache_headers::compute_etag(&identity_body),
+            "the identity tag must be derived from the identity body"
+        );
+        for (pass, gzip_etag) in ["cold", "warm"].iter().zip(&gzip_etags) {
+            assert_eq!(
+                gzip_etag, &identity_etag,
+                "{pass}: the gzip variant must advertise the identity-derived \
+                 ETag so a client that switches encodings still revalidates"
             );
         }
 
