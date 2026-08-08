@@ -94,6 +94,45 @@ fn is_prov_filename(filename: &str) -> bool {
     filename.ends_with(PROV_SUFFIX)
 }
 
+/// OCI manifest rows are not classic Helm chart packages and must never be
+/// rendered into `index.yaml`.
+///
+/// The path check repairs the read side for rows already written through the
+/// OCI Distribution API before repository-format validation was added (#3150).
+/// The media-type check is a second guard in case an imported manifest uses a
+/// non-standard path.
+///
+/// This filter is LOAD-BEARING, not redundant with the `/v2` write gate. That
+/// gate only covers the Distribution API; `services/oci_referenced_content.rs`
+/// (migration import) and `services/peer_instance_service.rs` (federation
+/// replication) also write OCI manifest rows and apply NO repository-format
+/// check. Removing this filter would let those two paths put manifests back
+/// into a classic Helm `index.yaml`.
+///
+/// NOTE on the `"v2/"` literal: this is the artifact PATH prefix written by
+/// `oci_v2::upsert_manifest_artifact` (`format!("v2/{image}/manifests/{ref}")`,
+/// the `artifacts.path` column). Do NOT "unify" it with
+/// `storage::keys::OCI_MANIFEST_STORAGE_PREFIX` (`"oci-manifests/"`) — that
+/// constant is a STORAGE KEY prefix (the `artifacts.storage_key` column). The
+/// two live in different namespaces and only coincidentally describe the same
+/// rows; substituting one for the other silently breaks this filter.
+fn is_oci_manifest_artifact(path: &str, content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+
+    (path.starts_with("v2/") && path.contains("/manifests/"))
+        || matches!(
+            media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+                | "application/vnd.oci.image.index.v1+json"
+                | "application/vnd.docker.distribution.manifest.v2+json"
+                | "application/vnd.docker.distribution.manifest.list.v2+json"
+        )
+}
+
 /// Validate that an uploaded `prov` part really is a clearsigned provenance
 /// document before it is stored.
 ///
@@ -174,7 +213,7 @@ async fn query_charts_from_repo(
 ) -> Result<(), Response> {
     let rows = sqlx::query(
         r#"
-        SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256,
+        SELECT a.id, a.name, a.version, a.path, a.content_type, a.checksum_sha256,
                a.created_at,
                am.metadata
         FROM artifacts a
@@ -194,9 +233,14 @@ async fn query_charts_from_repo(
         let name: String = row.get("name");
         let version: Option<String> = row.get("version");
         let path: String = row.get("path");
+        let content_type: String = row.get("content_type");
         let checksum_sha256: String = row.get("checksum_sha256");
         let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
         let metadata: Option<serde_json::Value> = row.get("metadata");
+
+        if is_oci_manifest_artifact(&path, &content_type) {
+            continue;
+        }
 
         let version = match version {
             Some(v) => v,
@@ -1311,6 +1355,72 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         assert_eq!(url, "/helm/helm-local/charts/ingress-nginx-4.8.0.tgz");
     }
 
+    /// Pins the PATH arm on its own: an OCI-shaped `artifacts.path` with a
+    /// content type that matches NO entry in the media-type list. If the
+    /// `path.starts_with("v2/") && path.contains("/manifests/")` arm is
+    /// deleted, this case flips to false.
+    #[test]
+    fn test_oci_manifest_detected_by_path_arm_alone() {
+        assert!(is_oci_manifest_artifact(
+            "v2/keycloak/manifests/26.7.0",
+            "application/json"
+        ));
+        // The exact shape upsert_manifest_artifact writes, with the generic
+        // content type an older row may carry.
+        assert!(is_oci_manifest_artifact(
+            "v2/org/keycloak/manifests/sha256:abc",
+            "application/octet-stream"
+        ));
+    }
+
+    /// Pins the MEDIA-TYPE arm on its own: a path that fails the `v2/` test so
+    /// only the media type can match. If the media-type arm is deleted, these
+    /// flip to false.
+    #[test]
+    fn test_oci_manifest_detected_by_media_type_arm_alone() {
+        for content_type in [
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.oci.image.index.v1+json; charset=utf-8",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        ] {
+            assert!(
+                is_oci_manifest_artifact("imported/manifest", content_type),
+                "{content_type} must be recognised without an OCI-shaped path"
+            );
+        }
+    }
+
+    /// Pins the `&&` INSIDE the path arm. Each of these satisfies exactly one
+    /// half of the path test and carries a non-OCI media type, so flipping the
+    /// `&&` to `||` turns them true and fails this test.
+    #[test]
+    fn test_oci_manifest_path_arm_requires_both_halves() {
+        // `v2/` prefix but not a manifest path (a blob).
+        assert!(!is_oci_manifest_artifact(
+            "v2/keycloak/blobs/sha256:abc",
+            "application/octet-stream"
+        ));
+        // `/manifests/` present but not under the `v2/` prefix: a classic
+        // chart that merely lives in a directory called `manifests`.
+        assert!(!is_oci_manifest_artifact(
+            "keycloak/manifests/keycloak-26.7.0.tgz",
+            "application/gzip"
+        ));
+    }
+
+    #[test]
+    fn test_classic_helm_chart_artifacts_are_not_oci_manifests() {
+        assert!(!is_oci_manifest_artifact(
+            "keycloak/26.7.0/keycloak-26.7.0.tgz",
+            "application/gzip"
+        ));
+        assert!(!is_oci_manifest_artifact(
+            "keycloak-26.7.0.tgz",
+            "application/octet-stream"
+        ));
+    }
+
     #[test]
     fn test_sha256_computation() {
         let mut hasher = Sha256::new();
@@ -1452,6 +1562,58 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
             "the URL helm derives from index.yaml must serve the chart"
         );
         assert_eq!(&got[..], b"helm-chart-bytes");
+
+        f.teardown().await;
+    }
+
+    /// Regression guard for #3150: OCI manifest rows written into a classic
+    /// Helm repository by older versions must not leak into `index.yaml`.
+    #[tokio::test]
+    async fn test_helm_index_excludes_existing_oci_manifest_rows() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "helm/keycloak/26.7.0/keycloak-26.7.0.tgz",
+            "keycloak/26.7.0/keycloak-26.7.0.tgz",
+            "keycloak",
+            "26.7.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"classic-chart"),
+            f.user_id,
+        )
+        .await;
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "oci/manifests/abcdef",
+            "v2/keycloak/manifests/26.7.0",
+            "keycloak:26.7.0",
+            "26.7.0",
+            "application/vnd.oci.image.manifest.v1+json",
+            bytes::Bytes::from_static(br#"{"schemaVersion":2}"#),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "index generation failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let index: HelmIndex = serde_yaml::from_slice(&body).expect("valid Helm index");
+        assert_eq!(index.entries.len(), 1);
+        assert!(index.entries.contains_key("keycloak"));
+        assert!(!index.entries.contains_key("keycloak:26.7.0"));
 
         f.teardown().await;
     }
