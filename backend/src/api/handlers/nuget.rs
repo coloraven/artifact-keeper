@@ -597,6 +597,49 @@ fn merge_upstream_search_data(
     added
 }
 
+/// Resolve the upstream fetch URL and the stable proxy-cache key for a
+/// flat-container `sub_path` (`{id}/index.json`, `{id}/{version}/{file}`).
+///
+/// NuGet V3 has no fixed layout, so the package-content base must come from the
+/// upstream service index rather than being concatenated onto the configured
+/// upstream URL (#2775). Extracted from [`proxy_v3_flatcontainer`] so the
+/// verified `.nupkg` repair path (#2929) can buffer and hash the body itself
+/// while still resolving its URL through exactly the same discovery — the
+/// buffered repair that predated #2919 built the URL by concatenation and 404'd
+/// against every real feed.
+async fn flatcontainer_fetch_target(
+    proxy: &crate::services::proxy_service::ProxyService,
+    fetch_repo_id: uuid::Uuid,
+    fetch_repo_key: &str,
+    upstream_url: &str,
+    sub_path: &str,
+) -> Result<(String, String), Response> {
+    let resources =
+        discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
+    let pkg_base = guard_upstream_base(
+        resources.package_base.as_ref(),
+        upstream_url,
+        "PackageBaseAddress",
+    )?;
+    Ok((
+        format!("{}/{}", pkg_base, sub_path),
+        format!("v3/flatcontainer/{}", sub_path),
+    ))
+}
+
+/// Byte ceiling on a *verified* (buffered) `.nupkg` repair (#2929).
+///
+/// The unverified repair streams and is therefore unbounded by design. A
+/// verified repair cannot stream — the digest is only known once the last byte
+/// has arrived — so it has to hold the body, and holding an unbounded body is
+/// how a repair path becomes a memory-exhaustion primitive (#2928). 128 MiB
+/// covers the large native-runtime packages that motivated #2919
+/// (`Microsoft.CodeAnalysis.*`, `Microsoft.ML.*`, `SkiaSharp.NativeAssets.*`)
+/// while staying far below the buffered proxy-scan ceiling the process already
+/// tolerates. Exceeding it is a hard error, never a silent downgrade to an
+/// unverified stream: see the repair arm in `flatcontainer_download`.
+const VERIFIED_NUPKG_REPAIR_MAX_BYTES: usize = 128 * 1024 * 1024;
+
 /// Proxy an upstream V3 flat-container document (version list or `.nupkg`).
 /// `sub_path` is the portion after the package-content base, e.g.
 /// `{id}/index.json` or `{id}/{version}/{file}`. Version lists carry no URLs so
@@ -610,15 +653,9 @@ async fn proxy_v3_flatcontainer(
     sub_path: &str,
     streaming: bool,
 ) -> Result<Response, Response> {
-    let resources =
-        discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
-    let pkg_base = guard_upstream_base(
-        resources.package_base.as_ref(),
-        upstream_url,
-        "PackageBaseAddress",
-    )?;
-    let fetch_url = format!("{}/{}", pkg_base, sub_path);
-    let cache_path = format!("v3/flatcontainer/{}", sub_path);
+    let (fetch_url, cache_path) =
+        flatcontainer_fetch_target(proxy, fetch_repo_id, fetch_repo_key, upstream_url, sub_path)
+            .await?;
     if streaming {
         proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
             proxy,
@@ -1378,38 +1415,170 @@ async fn flatcontainer_download(
     //     guaranteed 404. The repair was broken against a real feed regardless of
     //     body size.
     //
-    // The repair now takes exactly the route the primary cache-miss arm above
-    // takes: `proxy_v3_flatcontainer(.., streaming = true)` resolves
-    // `PackageBaseAddress` from the upstream service index and streams the body
-    // to the client while teeing it into the proxy cache. The cache key is
-    // unchanged (`v3/flatcontainer/{id}/{version}/{file}`, the exact path the old
-    // buffered fetch keyed on), so entries cached by the previous code are still
-    // hits rather than orphans.
+    // The repair resolves `PackageBaseAddress` from the upstream service index
+    // and keys the proxy cache on `v3/flatcontainer/{id}/{version}/{file}` — the
+    // exact path the old buffered fetch keyed on — so entries cached by the
+    // previous code are still hits rather than orphans. Which *transfer* shape it
+    // uses depends on whether the row carries a digest we can enforce.
     //
-    // Gating is preserved: `check_artifact_download` above already ran for this
-    // row, and the streaming leader re-applies the Package Age Policy hold
-    // (#1770/#1771 — a policy-enabled repo refuses to open a new streaming fetch
-    // at all) plus the sidecar `quarantine_until` on a proxy-cache hit. The
-    // buffered helper's hydration lease is likewise not lost: the streaming fetch
-    // single-flights the cold-cache open itself (#1631 layer 2 / #1694). The
-    // repaired response carries the proxy's streaming shape rather than this
-    // handler's `Content-Length`/`Content-Disposition` — identical to the primary
-    // Remote arm, and NuGet clients name the file from the request URL.
+    // #2929 — VERIFY-THEN-SERVE when it does.
+    //
+    // The repair pulls fresh bytes from upstream and writes them back under THIS
+    // row's storage key. `check_artifact_download` a few lines above authorised
+    // this download on THIS row, and the row records `checksum_sha256`. So the
+    // hash an admin reviewed when releasing this artifact from quarantine is the
+    // hash the client must actually receive; if the repair serves something else,
+    // the quarantine decision was made about a blob nobody ever delivered and the
+    // control is weaker than it reads.
+    //
+    // Enforcing that requires the whole body in hand BEFORE any of it is written
+    // back or forwarded, which is why this arm buffers where the primary
+    // cache-miss arm streams. Streaming and aborting mid-body on a mismatch is
+    // not an equivalent option: the digest is only known after the last byte has
+    // already been forwarded, so the client is left holding a truncated file it
+    // may cache or retry into — a failure that is silent at exactly the moment it
+    // most needs to be loud. On a mismatch nothing is written back, so the entry
+    // stays missing: a transient bad upstream self-heals on the next request and a
+    // persistently wrong one keeps erroring instead of poisoning the cache.
+    //
+    // The refetch still commits to the SHARED proxy cache under
+    // `v3/flatcontainer/...` before this gate sees the bytes, exactly as the
+    // streaming repair does. That is contained rather than ignored: the artifact
+    // row is looked up ABOVE this point, so while the row exists every request
+    // for it lands here and is re-gated — a mismatching cached body is refused
+    // again rather than served warm (the repair is idempotent in that sense).
+    // The proxy-cache entry only becomes directly reachable through the
+    // no-row arm, where there is no recorded digest and no row-scoped quarantine
+    // decision to honour in the first place. Keeping unverified bytes out of the
+    // proxy cache as well needs a buffered-verified fetch primitive that does not
+    // exist yet; it is a cache-hygiene improvement, not a hole in this gate.
+    //
+    // Buffering is bounded by `VERIFIED_NUPKG_REPAIR_MAX_BYTES` (#2928), applied
+    // twice: pre-flight against the row's recorded `size_bytes`, and again as the
+    // capped fetch's own ceiling in case the row understates what upstream serves.
+    // Over-limit is a hard error. It deliberately does NOT fall back to the
+    // unverified streaming repair — silently downgrading integrity for big
+    // packages would make the guarantee depend on package size, which is the one
+    // property an attacker controls.
+    //
+    // When the row has no enforceable digest (see `normalize_expected_sha256`),
+    // there is nothing to verify against and the repair takes exactly the route
+    // the primary cache-miss arm takes: `proxy_v3_flatcontainer(.., streaming =
+    // true)` streams the body to the client while teeing it into the proxy cache,
+    // unbounded and unchanged from #2919. Gating is preserved on that path: the
+    // streaming leader re-applies the Package Age Policy hold (#1770/#1771 — a
+    // policy-enabled repo refuses to open a new streaming fetch at all) plus the
+    // sidecar `quarantine_until` on a proxy-cache hit, and it single-flights the
+    // cold-cache open itself (#1631 layer 2 / #1694) so the buffered helper's
+    // hydration lease is not lost. Its response carries the proxy's streaming
+    // shape rather than this handler's `Content-Length`/`Content-Disposition` —
+    // identical to the primary Remote arm, and NuGet clients name the file from
+    // the request URL.
+    //
+    // A blob that IS present is streamed straight from storage as before: this
+    // arm only governs the repair, and re-hashing every stored byte on every hit
+    // is a different (much more expensive) control than #2929 asks for.
+    //
+    // `content_length` normally comes from the row, as for any streamed blob. The
+    // verified repair overrides it with the length it actually holds: a row whose
+    // `size_bytes` has drifted from its (verified-correct) body would otherwise
+    // emit a `Content-Length` the body never satisfies, leaving the client
+    // hanging or treating a complete file as truncated.
+    let mut content_length = artifact.size_bytes;
     let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
         match storage.get_stream(&artifact.storage_key).await {
             Ok(stream) => stream,
             Err(crate::error::AppError::NotFound(missing)) => {
-                if repo.repo_type == RepositoryType::Remote {
-                    if let (Some(ref upstream_url), Some(ref proxy)) =
-                        (&repo.upstream_url, &state.proxy_service)
-                    {
+                let remote_proxy = if repo.repo_type == RepositoryType::Remote {
+                    match (&repo.upstream_url, &state.proxy_service) {
+                        (Some(upstream_url), Some(proxy)) => Some((upstream_url, proxy)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                let Some((upstream_url, proxy)) = remote_proxy else {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Storage error: {}", missing),
+                    )
+                        .into_response());
+                };
+
+                let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
+
+                match proxy_helpers::normalize_expected_sha256(&artifact.checksum_sha256) {
+                    Some(expected) => {
                         tracing::warn!(
                             artifact_id = %artifact.id,
                             storage_key = %artifact.storage_key,
                             "nuget proxy cache entry is missing on disk; re-fetching from the \
-                             discovered PackageBaseAddress (streaming)"
+                             discovered PackageBaseAddress (buffered, digest-verified)"
                         );
-                        let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
+
+                        if artifact.size_bytes > VERIFIED_NUPKG_REPAIR_MAX_BYTES as i64 {
+                            tracing::error!(
+                                target: "security",
+                                artifact_id = %artifact.id,
+                                storage_key = %artifact.storage_key,
+                                size_bytes = artifact.size_bytes,
+                                limit_bytes = VERIFIED_NUPKG_REPAIR_MAX_BYTES,
+                                "refusing to repair a missing .nupkg: verification requires \
+                                 buffering the whole body and this row exceeds the ceiling; \
+                                 serving it unverified would silently drop the #2929 guarantee"
+                            );
+                            return Err((
+                                StatusCode::INSUFFICIENT_STORAGE,
+                                "cached package is missing and is too large to repair under \
+                                 checksum verification; restore it from backup or re-publish",
+                            )
+                                .into_response());
+                        }
+
+                        let (fetch_url, cache_path) = flatcontainer_fetch_target(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &sub_path,
+                        )
+                        .await?;
+
+                        let content = proxy_helpers::get_cached_or_refetch(
+                            &state.db,
+                            artifact.id,
+                            storage.as_ref(),
+                            &artifact.storage_key,
+                            Some(expected.as_str()),
+                            || async {
+                                let (bytes, _content_type) =
+                                    proxy_helpers::proxy_fetch_capped_with_cache_key(
+                                        proxy,
+                                        repo.id,
+                                        &repo_key,
+                                        upstream_url,
+                                        &fetch_url,
+                                        &cache_path,
+                                        VERIFIED_NUPKG_REPAIR_MAX_BYTES,
+                                    )
+                                    .await?;
+                                Ok(bytes)
+                            },
+                        )
+                        .await?;
+
+                        content_length = content.len() as i64;
+                        Box::pin(futures::stream::once(async move { Ok(content) }))
+                    }
+                    None => {
+                        tracing::warn!(
+                            artifact_id = %artifact.id,
+                            storage_key = %artifact.storage_key,
+                            "nuget proxy cache entry is missing on disk; re-fetching from the \
+                             discovered PackageBaseAddress (streaming, no enforceable digest \
+                             recorded)"
+                        );
                         let response = proxy_v3_flatcontainer(
                             proxy,
                             repo.id,
@@ -1431,11 +1600,6 @@ async fn flatcontainer_download(
                         return Ok(response);
                     }
                 }
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Storage error: {}", missing),
-                )
-                    .into_response());
             }
             Err(e) => {
                 return Err((
@@ -1457,7 +1621,7 @@ async fn flatcontainer_download(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .header(CONTENT_LENGTH, content_length.to_string())
         .body(Body::from_stream(
             body.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
         ))
@@ -4380,6 +4544,32 @@ mod read_db_tests {
         filename: &str,
         size_bytes: i64,
     ) -> Uuid {
+        // Not a bare 64-hex SHA-256, so `normalize_expected_sha256` reads it as
+        // "no enforceable digest" and the repair takes the UNVERIFIED streaming
+        // route — which is what the two tests using this seed are about.
+        seed_row_without_blob_with_checksum(
+            fx,
+            name,
+            version,
+            filename,
+            size_bytes,
+            "test-seed-missing-blob",
+        )
+        .await
+    }
+
+    /// As [`seed_row_without_blob`], but pins the row's `checksum_sha256`.
+    ///
+    /// A bare lowercase 64-hex value here is what routes the repair through the
+    /// digest-verified buffered path (#2929).
+    async fn seed_row_without_blob_with_checksum(
+        fx: &tdh::Fixture,
+        name: &str,
+        version: &str,
+        filename: &str,
+        size_bytes: i64,
+        checksum_sha256: &str,
+    ) -> Uuid {
         let artifact_path = format!("v3/flatcontainer/{}/{}/{}", name, version, filename);
         let storage_key = format!("nuget/{}/{}/{}", name, version, filename);
         proxy_helpers::insert_artifact(
@@ -4390,7 +4580,7 @@ mod read_db_tests {
                 name,
                 version,
                 size_bytes,
-                checksum_sha256: "test-seed-missing-blob",
+                checksum_sha256,
                 content_type: "application/octet-stream",
                 storage_key: &storage_key,
                 uploaded_by: fx.user_id,
@@ -4398,6 +4588,190 @@ mod read_db_tests {
         )
         .await
         .expect("insert artifacts row without blob")
+    }
+
+    /// Drive `flatcontainer_download` against an upstream that serves
+    /// `upstream_body`, for a row seeded with `row_checksum` and no blob.
+    ///
+    /// Returns `(result, upstream_request_paths)`. The caller asserts; teardown
+    /// happens here so a failing assertion never leaks fixture rows.
+    async fn run_repair_with_row_checksum(
+        package_id: &str,
+        version: &str,
+        upstream_body: &[u8],
+        row_checksum: &str,
+        calls: usize,
+    ) -> Option<(Vec<Result<(StatusCode, Vec<u8>), StatusCode>>, Vec<String>)> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let fx = tdh::Fixture::setup("remote", "nuget").await?;
+        let upstream = MockServer::start().await;
+        mount_v3_index(&upstream).await;
+
+        let filename = format!("{}.{}.nupkg", package_id, version);
+        let discovered_path = format!("/flat/{}/{}/{}", package_id, version, filename);
+        Mock::given(method("GET"))
+            .and(path(discovered_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(upstream_body.to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+
+        seed_row_without_blob_with_checksum(
+            &fx,
+            package_id,
+            version,
+            &filename,
+            upstream_body.len() as i64,
+            row_checksum,
+        )
+        .await;
+
+        let mut outcomes = Vec::new();
+        for _ in 0..calls {
+            let resp = super::flatcontainer_download(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    package_id.to_string(),
+                    version.to_string(),
+                    filename.clone(),
+                )),
+                Default::default(),
+            )
+            .await;
+            outcomes.push(match resp {
+                Ok(r) => {
+                    let status = r.status();
+                    let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                    Ok((status, body.to_vec()))
+                }
+                Err(r) => Err(r.status()),
+            });
+        }
+
+        let requested: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        fx.teardown().await;
+        Some((outcomes, requested))
+    }
+
+    /// #2929: a repaired `.nupkg` whose bytes match the row's recorded
+    /// `checksum_sha256` is served, and the write-back makes the next request a
+    /// local hit rather than a second upstream pull.
+    ///
+    /// The companion to the mismatch test below: without this one, "refuse every
+    /// repair" would also satisfy that assertion.
+    #[tokio::test]
+    async fn test_flatcontainer_repair_serves_a_body_matching_the_rows_digest_2929() {
+        let body = b"PK\x03\x04-repaired-and-verified-nupkg-bytes".repeat(8);
+        let digest = crate::services::storage_service::StorageService::calculate_hash(&body);
+
+        let Some((outcomes, requested)) =
+            run_repair_with_row_checksum("verified.package", "1.0.0", &body, &digest, 2).await
+        else {
+            return;
+        };
+
+        let (status, served) = match &outcomes[0] {
+            Ok(v) => v.clone(),
+            Err(status) => panic!("a digest-matching repair must succeed, got {status}"),
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &served[..],
+            &body[..],
+            "the verified repair must serve the upstream bytes in full"
+        );
+
+        match &outcomes[1] {
+            Ok((status, served)) => {
+                assert_eq!(*status, StatusCode::OK, "the warm read must succeed");
+                assert_eq!(&served[..], &body[..], "the warm read must be identical");
+            }
+            Err(status) => panic!("the warm read must succeed, got {status}"),
+        }
+
+        let pulls = requested.iter().filter(|p| p.starts_with("/flat/")).count();
+        assert_eq!(
+            pulls, 1,
+            "a verified repair must write back, so the second request is a local \
+             hit; upstream saw {requested:?}"
+        );
+    }
+
+    /// #2929 — the load-bearing one. VERIFY THEN SERVE.
+    ///
+    /// `check_artifact_download` authorises on the artifact row, so the hash an
+    /// admin reviewed when releasing that row from quarantine has to be the hash
+    /// the client actually receives. The repair re-pulls from upstream and writes
+    /// back under the row's own storage key; if those bytes are never compared to
+    /// the row's `checksum_sha256`, the quarantine decision was made about a blob
+    /// nobody ever delivered.
+    ///
+    /// So a mismatching body must reach the client NOT AT ALL — not "truncated
+    /// after the mismatch was noticed", which is why this path buffers instead of
+    /// streaming. And it must not be written back: the second call below must
+    /// fail exactly like the first, proving the bad body did not become a warm
+    /// entry that later requests are served from.
+    #[tokio::test]
+    async fn test_flatcontainer_repair_refuses_a_body_failing_the_rows_digest_2929() {
+        let body = b"PK\x03\x04-bytes-that-are-not-what-the-row-records".repeat(8);
+        // Well-formed so it is actually enforced rather than being discarded as
+        // "no digest available" by `normalize_expected_sha256`.
+        let wrong = "b".repeat(64);
+        assert_ne!(
+            wrong,
+            crate::services::storage_service::StorageService::calculate_hash(&body),
+            "fixture digest must differ or the test proves nothing"
+        );
+
+        let Some((outcomes, requested)) =
+            run_repair_with_row_checksum("forged.package", "2.0.0", &body, &wrong, 2).await
+        else {
+            return;
+        };
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            match outcome {
+                Err(status) => assert_eq!(
+                    *status,
+                    StatusCode::BAD_GATEWAY,
+                    "call {i}: a digest mismatch must fail the repair explicitly"
+                ),
+                Ok((status, served)) => panic!(
+                    "call {i}: a body failing the row's recorded digest must never be \
+                     served (#2929); got {status} with {} bytes",
+                    served.len()
+                ),
+            }
+        }
+
+        assert!(
+            requested.iter().any(|p| p.starts_with("/flat/")),
+            "the repair must actually have pulled upstream, or the refusal is \
+             vacuous; upstream saw {requested:?}"
+        );
     }
 
     /// The repair must re-pull through the **discovered** `PackageBaseAddress`,

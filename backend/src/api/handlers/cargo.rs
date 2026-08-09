@@ -146,6 +146,77 @@ async fn resolve_upstream_dl_url(
     Some(dl_url)
 }
 
+/// Extract the `cksum` recorded for `version` from a sparse-index document
+/// (#2929).
+///
+/// The sparse index is NDJSON: one JSON object per line, each carrying `vers`
+/// and `cksum`. `cksum` is the SHA-256 of the `.crate` file — it is exactly
+/// what cargo itself verifies the download against, and on a split-host
+/// registry (crates.io serves the index from `index.crates.io` and the
+/// `.crate` from a separate download host) it is sourced independently of the
+/// host that serves the bytes.
+///
+/// Returns `None` when the document is unparseable, the version is absent, or
+/// the recorded value is not a bare lowercase SHA-256 — all of which mean "no
+/// enforceable digest", so the caller falls back to an unverified fetch rather
+/// than failing the download.
+fn cksum_for_version(index_ndjson: &[u8], version: &str) -> Option<String> {
+    let text = std::str::from_utf8(index_ndjson).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            // A single malformed line must not hide a later good one.
+            continue;
+        };
+        if entry.get("vers").and_then(|v| v.as_str()) != Some(version) {
+            continue;
+        }
+        return entry
+            .get("cksum")
+            .and_then(|v| v.as_str())
+            .and_then(proxy_helpers::normalize_expected_sha256);
+    }
+    None
+}
+
+/// Resolve the sparse-index `cksum` for `{name}/{version}` from the upstream
+/// registry so the streamed `.crate` download can be digest-gated (#2929).
+///
+/// Best-effort by construction: any failure (no proxy, index fetch error,
+/// missing version, non-canonical digest) returns `None` and the download
+/// proceeds unverified, exactly as it did before. The index fetch uses the
+/// same proxy-cached, capped metadata helper the sparse-index handler uses, so
+/// a cargo client — which always reads the index immediately before
+/// downloading — finds it warm.
+async fn resolve_index_cksum(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    name_lower: &str,
+    version: &str,
+) -> Option<String> {
+    let proxy = state.proxy_service.as_ref()?;
+    let base_url = repo
+        .index_upstream_url
+        .as_deref()
+        .or(repo.upstream_url.as_deref())?;
+    let index_path = cargo_sparse_index_path_upstream(name_lower);
+    let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        repo_key,
+        base_url,
+        &index_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    .ok()?;
+    cksum_for_version(&content, version)
+}
+
 /// Build the full download URL for a crate, using the upstream `dl` template
 /// when available. Falls back to `{upstream_url}/api/v1/crates/{name}/{version}/download`.
 ///
@@ -916,13 +987,34 @@ async fn download(
                     // The *metadata* fetches on this handler (config.json, sparse
                     // index) stay capped and buffered — an 8 MiB ceiling is
                     // correct for those.
-                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                    // #2929: gate the proxy-cache commit on the sparse index's
+                    // recorded `cksum` for this exact `{name}/{version}`. The
+                    // index entry this same handler serves already carries the
+                    // digest cargo verifies the download against, but the
+                    // download arm reached the streaming helper that hardcodes
+                    // `expected_checksum: None`, so the digest was decorative:
+                    // a `.crate` whose bytes disagreed with it was committed to
+                    // the cache and served warm from then on.
+                    //
+                    // This cannot catch a wholly compromised registry — index
+                    // and bytes could both be forged — but on a split-host
+                    // registry (crates.io: `index.crates.io` vs the download
+                    // host) it catches a misbehaving or compromised download
+                    // host while the index is intact, and it catches ordinary
+                    // corruption or a clean-EOF truncation on either. A body
+                    // that fails the gate is still streamed to the client
+                    // (which verifies it independently and errors); it is only
+                    // kept out of the cache.
+                    let expected_cksum =
+                        resolve_index_cksum(&state, &repo, &repo_key, &name_lower, &version).await;
+                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         repo.id,
                         &repo_key,
                         &dl_base,
                         &dl_path,
                         &cache_path,
+                        expected_cksum,
                         RepositoryFormat::Cargo,
                     )
                     .await?;
@@ -1701,6 +1793,249 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    // ── #2929: the sparse-index cksum must gate the .crate cache commit ──
+
+    const CKSUM_A: &str = "abc1230000000000000000000000000000000000000000000000000000000def";
+
+    #[test]
+    fn test_cksum_for_version_picks_the_matching_version() {
+        let ndjson = format!(
+            "{{\"name\":\"serde\",\"vers\":\"1.0.0\",\"cksum\":\"{}\"}}\n\
+             {{\"name\":\"serde\",\"vers\":\"1.0.1\",\"cksum\":\"{}\"}}",
+            CKSUM_A,
+            "2".repeat(64)
+        );
+        assert_eq!(
+            super::cksum_for_version(ndjson.as_bytes(), "1.0.0").as_deref(),
+            Some(CKSUM_A),
+            "the digest must be the one recorded for the requested version"
+        );
+        assert_eq!(
+            super::cksum_for_version(ndjson.as_bytes(), "1.0.1").as_deref(),
+            Some("2".repeat(64).as_str())
+        );
+        assert_ne!(
+            CKSUM_A,
+            CKSUM_A.to_uppercase(),
+            "the fixture must contain hex letters or the case test below is vacuous"
+        );
+        assert_eq!(
+            super::cksum_for_version(ndjson.as_bytes(), "9.9.9"),
+            None,
+            "an absent version means no enforceable digest, not a wrong one"
+        );
+    }
+
+    #[test]
+    fn test_cksum_for_version_degrades_on_unusable_input() {
+        // A non-canonical cksum must read as "no digest available" rather than
+        // being enforced: it could never equal the streamed lowercase-hex
+        // SHA-256, so enforcing it would reject the crate on every fetch and
+        // re-pull upstream forever.
+        let prefixed = format!("{{\"vers\":\"1.0.0\",\"cksum\":\"sha256:{CKSUM_A}\"}}");
+        assert_eq!(super::cksum_for_version(prefixed.as_bytes(), "1.0.0"), None);
+
+        let upper = format!(
+            "{{\"vers\":\"1.0.0\",\"cksum\":\"{}\"}}",
+            CKSUM_A.to_uppercase()
+        );
+        assert_eq!(super::cksum_for_version(upper.as_bytes(), "1.0.0"), None);
+
+        assert_eq!(super::cksum_for_version(b"not json at all", "1.0.0"), None);
+        assert_eq!(super::cksum_for_version(b"", "1.0.0"), None);
+        assert_eq!(
+            super::cksum_for_version(b"{\"vers\":\"1.0.0\"}", "1.0.0"),
+            None,
+            "an entry with no cksum is not a digest"
+        );
+    }
+
+    /// A malformed line must not hide a good entry further down: the sparse
+    /// index is NDJSON produced by a third party, and a single bad line
+    /// silently disabling the digest gate for the whole crate would make the
+    /// guard trivially bypassable by a hostile index.
+    #[test]
+    fn test_cksum_for_version_skips_a_malformed_line() {
+        let ndjson = format!("this-is-not-json\n{{\"vers\":\"1.0.0\",\"cksum\":\"{CKSUM_A}\"}}");
+        assert_eq!(
+            super::cksum_for_version(ndjson.as_bytes(), "1.0.0").as_deref(),
+            Some(CKSUM_A)
+        );
+    }
+
+    /// Fixture shared by the two #2929 cache-gate tests below.
+    ///
+    /// Serves a sparse-index document recording `index_cksum` for
+    /// `{name}/{version}` and a download host serving `body`, then issues two
+    /// cold requests through the real router. The upstream download mock is
+    /// pinned to `expected_download_hits`, which is what actually distinguishes
+    /// the two cases: a committed cache entry makes the second request a hit
+    /// (1 upstream fetch), a refused commit makes it another miss (2).
+    ///
+    /// Returns the served bodies plus the proxy cache dir so the caller can
+    /// assert on what was persisted.
+    async fn run_cargo_download_with_index_cksum(
+        name: &str,
+        version: &str,
+        body: Vec<u8>,
+        index_cksum: &str,
+        expected_download_hits: u64,
+    ) -> Option<(Vec<u8>, Vec<u8>, tempfile::TempDir)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let fx = tdh::Fixture::setup("remote", "cargo").await?;
+
+        let server = MockServer::start().await;
+
+        // The sparse index this same handler proxies. `cksum` is the digest the
+        // download is gated on.
+        let index_doc = format!(
+            "{{\"name\":\"{name}\",\"vers\":\"{version}\",\"cksum\":\"{index_cksum}\",\"deps\":[],\"features\":{{}},\"yanked\":false}}\n"
+        );
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!(
+                "/{}",
+                cargo_sparse_index_path_upstream(name)
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index_doc))
+            .mount(&server)
+            .await;
+
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(expected_download_hits)
+            .mount(&server)
+            .await;
+
+        let (state, dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let request_path = format!(
+            "/cargo/{}/api/v1/crates/{}/{}/download",
+            fx.repo_key, name, version
+        );
+
+        let (cold_status, cold_body) = tdh::send(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(request_path.clone()),
+        )
+        .await;
+        assert_eq!(
+            cold_status,
+            StatusCode::OK,
+            "cold download must succeed; body was {}",
+            String::from_utf8_lossy(&cold_body)
+        );
+
+        // Give the asynchronous tee its chance to commit either way. The
+        // matching case must commit (and does so well inside this budget); the
+        // mismatching case must still not have committed when the budget
+        // expires, which is what makes the negative assertion meaningful rather
+        // than a race the test happens to win.
+        for _ in 0..400 {
+            if tdh::committed_cache_entry_exists(dir.path(), body.len() as u64) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let (warm_status, warm_body) = tdh::send(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(request_path),
+        )
+        .await;
+        assert_eq!(warm_status, StatusCode::OK, "second download must succeed");
+
+        fx.teardown().await;
+        // Dropping the MockServer verifies `.expect(...)`.
+        drop(server);
+
+        Some((cold_body.to_vec(), warm_body.to_vec(), dir))
+    }
+
+    /// #2929: a `.crate` whose bytes match the sparse index's recorded `cksum`
+    /// is committed to the proxy cache and served warm from then on.
+    ///
+    /// The companion to the mismatch test below — without this one, "never
+    /// commits anything" would also pass.
+    #[tokio::test]
+    async fn test_remote_crate_download_commits_cache_on_matching_index_cksum_2929() {
+        let name = "gated-crate";
+        let version = "2.0.0";
+        let body = b"a plausible .crate tarball payload".repeat(32);
+        let good = crate::services::storage_service::StorageService::calculate_hash(&body);
+
+        // One upstream download: the second request is served from the cache.
+        let Some((cold, warm, dir)) =
+            run_cargo_download_with_index_cksum(name, version, body.clone(), &good, 1).await
+        else {
+            return;
+        };
+
+        assert_eq!(&cold[..], &body[..], "cold read must serve upstream bytes");
+        assert_eq!(&warm[..], &body[..], "warm read must serve identical bytes");
+        assert!(
+            crate::api::handlers::test_db_helpers::committed_cache_entry_exists(
+                dir.path(),
+                body.len() as u64
+            ),
+            "a digest-matching body must be committed to the proxy cache (#2929)"
+        );
+    }
+
+    /// #2929: a `.crate` whose bytes DISAGREE with the sparse index's recorded
+    /// `cksum` must never be committed to the proxy cache.
+    ///
+    /// This is the regression that the source-grep test it replaces could only
+    /// approximate. It fails if the download arm is reverted to the unverified
+    /// streaming helper, if the resolved digest is passed as `None`, or if the
+    /// gate is moved after the cache write — none of which a text assertion on
+    /// this file can distinguish from a working gate.
+    ///
+    /// The body is still streamed to the client: cargo verifies the download
+    /// against this same `cksum` itself and will reject it, and truncating the
+    /// response would only turn a detected corruption into an ambiguous one.
+    /// What must not happen is the bad body becoming a warm cache entry served
+    /// to everyone afterwards.
+    #[tokio::test]
+    async fn test_remote_crate_download_refuses_cache_commit_on_cksum_mismatch_2929() {
+        let name = "forged-crate";
+        let version = "3.1.4";
+        let body = b"bytes that do not match the recorded cksum".repeat(32);
+        // Well-formed (bare lowercase 64-hex) so it passes
+        // `normalize_expected_sha256` and is actually enforced, rather than
+        // being discarded as "no digest available".
+        let wrong = "9".repeat(64);
+        assert_ne!(
+            wrong,
+            crate::services::storage_service::StorageService::calculate_hash(&body),
+            "fixture digest must actually differ or the test proves nothing"
+        );
+
+        // Two upstream downloads: nothing was cached, so the second request is
+        // another cold miss.
+        let Some((cold, warm, dir)) =
+            run_cargo_download_with_index_cksum(name, version, body.clone(), &wrong, 2).await
+        else {
+            return;
+        };
+
+        assert_eq!(
+            &cold[..],
+            &body[..],
+            "the client is still served the full body; cargo verifies it independently"
+        );
+        assert_eq!(&warm[..], &body[..], "the refetch serves the full body too");
+        assert!(
+            !crate::api::handlers::test_db_helpers::committed_cache_entry_exists(
+                dir.path(),
+                body.len() as u64
+            ),
+            "a body failing the index cksum must NOT be committed to the proxy cache (#2929)"
+        );
+    }
 
     /// Regression test for the cargo instance of the buffered-download class
     /// (#895 / #2192).
