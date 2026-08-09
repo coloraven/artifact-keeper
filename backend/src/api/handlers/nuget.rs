@@ -1261,6 +1261,7 @@ async fn flatcontainer_versions(
 
 async fn flatcontainer_download(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package_id, version, filename)): Path<(String, String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -1351,6 +1352,7 @@ async fn flatcontainer_download(
                 );
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
@@ -3300,6 +3302,7 @@ mod tests {
         // Call the handler directly via extractors.
         let result = super::flatcontainer_download(
             axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
             axum::extract::Path((
                 fx.repo_key.clone(),
                 package_id_lower.clone(),
@@ -4492,6 +4495,7 @@ mod read_db_tests {
 
         let resp = super::flatcontainer_download(
             axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
             axum::extract::Path((
                 fx.repo_key.clone(),
                 "newtonsoft.json".to_string(),
@@ -4830,6 +4834,7 @@ mod read_db_tests {
 
         let resp = super::flatcontainer_download(
             axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
             axum::extract::Path((
                 fx.repo_key.clone(),
                 package_id.to_string(),
@@ -4974,6 +4979,7 @@ mod read_db_tests {
 
         let resp = super::flatcontainer_download(
             axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
             axum::extract::Path((
                 fx.repo_key.clone(),
                 package_id.to_string(),
