@@ -149,6 +149,15 @@ impl IntoResponse for DownloadResponse {
 ///
 /// This helper checks if the storage backend supports redirects and returns
 /// either a 302 redirect to a presigned URL or streams the content directly.
+///
+/// **Method-unaware (#3209).** It has no request context, so it cannot tell a
+/// `GET` from a `HEAD`, and a presigned URL is signed for ONE method (the
+/// method is the first line of the SigV4 canonical request). A caller on a
+/// route registered `get(..)` only — where axum answers `HEAD` by running the
+/// GET handler — must therefore gate the call on `DownloadContext::is_head`
+/// itself, or use a helper that takes the context
+/// ([`try_presigned_redirect`]'s callers in `proxy_helpers` do). This helper
+/// currently has no callers anywhere in the workspace.
 pub async fn serve_from_storage<S: StorageBackend + ?Sized>(
     storage: &S,
     key: &str,
@@ -185,7 +194,10 @@ pub async fn serve_from_storage<S: StorageBackend + ?Sized>(
     })
 }
 
-/// Serve content with custom expiry for presigned URLs
+/// Serve content with custom expiry for presigned URLs.
+///
+/// Method-unaware, with the same #3209 caveat as [`serve_from_storage`]; it too
+/// currently has no callers anywhere in the workspace.
 pub async fn serve_from_storage_with_expiry<S: StorageBackend + ?Sized>(
     storage: &S,
     key: &str,
@@ -528,11 +540,33 @@ mod tests {
     use crate::storage::PresignedUrl as PU;
     use async_trait::async_trait;
 
-    /// A mock backend that supports presigned URLs.
-    struct RedirectBackend;
+    /// A mock backend whose only variable is whether it can presign.
+    ///
+    /// The two cases previously lived as separate structs whose `put`/`get`/
+    /// `exists`/`delete`/`put_stream` bodies were byte-identical — 24 duplicated
+    /// lines, enough on its own to put this file over the 3% jscpd gate. The
+    /// redirect capability is the single axis these tests vary, so it is a
+    /// field rather than a second impl.
+    struct MockBackend {
+        supports_redirect: bool,
+    }
+
+    impl MockBackend {
+        fn redirecting() -> Self {
+            Self {
+                supports_redirect: true,
+            }
+        }
+
+        fn non_redirecting() -> Self {
+            Self {
+                supports_redirect: false,
+            }
+        }
+    }
 
     #[async_trait]
-    impl StorageBackend for RedirectBackend {
+    impl StorageBackend for MockBackend {
         async fn put(&self, _key: &str, _content: Bytes) -> AppResult<()> {
             Ok(())
         }
@@ -546,13 +580,18 @@ mod tests {
             Ok(())
         }
         fn supports_redirect(&self) -> bool {
-            true
+            self.supports_redirect
         }
         async fn get_presigned_url(
             &self,
             key: &str,
             expires_in: Duration,
         ) -> AppResult<Option<PU>> {
+            // Mirrors the real backends: a backend that cannot redirect does not
+            // hand out a signed URL either.
+            if !self.supports_redirect {
+                return Ok(None);
+            }
             Ok(Some(PU {
                 url: format!("https://s3.example.com/{}", key),
                 expires_in,
@@ -568,35 +607,9 @@ mod tests {
         }
     }
 
-    /// A mock backend that does not support presigned URLs.
-    struct NoRedirectBackend;
-
-    #[async_trait]
-    impl StorageBackend for NoRedirectBackend {
-        async fn put(&self, _key: &str, _content: Bytes) -> AppResult<()> {
-            Ok(())
-        }
-        async fn get(&self, _key: &str) -> AppResult<Bytes> {
-            Ok(Bytes::from_static(b"data"))
-        }
-        async fn exists(&self, _key: &str) -> AppResult<bool> {
-            Ok(true)
-        }
-        async fn delete(&self, _key: &str) -> AppResult<()> {
-            Ok(())
-        }
-        async fn put_stream(
-            &self,
-            key: &str,
-            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
-        ) -> crate::error::Result<crate::storage::PutStreamResult> {
-            crate::storage::buffered_put_stream_fallback(self, key, stream).await
-        }
-    }
-
     #[tokio::test]
     async fn test_try_presigned_redirect_enabled_and_supported() {
-        let backend = RedirectBackend;
+        let backend = MockBackend::redirecting();
         let result = super::try_presigned_redirect(
             &backend,
             "cas/ab/cd/abcdef",
@@ -615,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_presigned_redirect_disabled() {
-        let backend = RedirectBackend;
+        let backend = MockBackend::redirecting();
         let result = super::try_presigned_redirect(
             &backend,
             "cas/ab/cd/abcdef",
@@ -632,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_presigned_redirect_backend_no_support() {
-        let backend = NoRedirectBackend;
+        let backend = MockBackend::non_redirecting();
         let result = super::try_presigned_redirect(
             &backend,
             "cas/ab/cd/abcdef",
@@ -649,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_presigned_redirect_uses_configured_expiry() {
-        let backend = RedirectBackend;
+        let backend = MockBackend::redirecting();
         let result =
             super::try_presigned_redirect(&backend, "test-key", true, Duration::from_secs(600))
                 .await;
