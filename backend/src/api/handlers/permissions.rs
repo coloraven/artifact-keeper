@@ -88,6 +88,90 @@ impl From<PermissionRow> for PermissionResponse {
     }
 }
 
+/// Shared SELECT/JOIN fragment that hydrates a `permissions` row's
+/// `principal_name` / `target_name` display columns.
+///
+/// `from_clause` supplies both the row source and its alias, always `p`:
+/// either the base table (`"permissions p"`, used by the plain read paths
+/// [`fetch_permission_row`] and [`list_permissions`]) or a data-modifying
+/// CTE named `p` (used by [`create_permission`] / [`update_permission`] to
+/// collapse INSERT/UPDATE + hydration into one round trip). Every caller
+/// appends its own `WHERE`/`ORDER BY`/pagination clause (or, for the CTE
+/// callers, prefixes a `WITH p AS (...)`) via `format!`. Centralizing this
+/// keeps the principal/target CASE+JOIN logic in exactly one place.
+///
+/// `from_clause` is interpolated into the SQL **unescaped**, so every caller
+/// MUST pass a string literal. It exists to pick between the base table and a
+/// CTE name, nothing else; never route a request-derived value through it.
+///
+/// #2826: the `users` join is intentionally NOT guarded by
+/// `is_service_account`. Between migration 057 (Feb 2026, the column's
+/// introduction) and #2499 (Jul 2026, `principal_type = 'service_account'`
+/// first honored by resolvers), the only working way to grant a service
+/// account fine-grained access was `principal_type = 'user'` + the SA's
+/// `users.id`. No migration re-types those rows, `validate_principal`
+/// (#2503) only guards new writes, and `query_actions`
+/// (`permission_service.rs`) still matches such rows by bare `principal_id`,
+/// so they remain live, enforced grants today. A type guard here would hide
+/// exactly the rows a still-effective grant empowers. Because the join keys
+/// on the `users` primary key, dropping the guard can never attach the
+/// WRONG name to a row -- only a previously-missing one.
+fn hydrate_select(from_clause: &str) -> String {
+    format!(
+        r#"
+        SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
+               p.actions, p.created_at, p.updated_at,
+               CASE
+                   WHEN p.principal_type IN ('user', 'service_account') THEN u.username
+                   WHEN p.principal_type = 'group' THEN g.name
+               END as principal_name,
+               CASE
+                   WHEN p.target_type = 'repository' THEN r.name
+               END as target_name
+        FROM {from_clause}
+        LEFT JOIN users u ON p.principal_type IN ('user', 'service_account')
+                         AND p.principal_id = u.id
+        LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
+        LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
+        "#
+    )
+}
+
+/// Map an error from the create/update write statements.
+///
+/// A unique violation on `permissions(principal_type, principal_id,
+/// target_type, target_id)` is a client-caused conflict on BOTH write paths:
+/// create hits it when the grant already exists, update when a row is
+/// retargeted onto an existing tuple. Only create used to map it, so the
+/// update collision surfaced as a 500 carrying the raw Postgres error text;
+/// sharing the mapping fixes that and keeps the two handlers consistent.
+///
+/// The substring match still fires from inside a data-modifying CTE: wrapping
+/// the INSERT/UPDATE in `WITH p AS (...)` does not change the driver's primary
+/// message, which is what `sqlx::Error::Database`'s `Display` renders.
+fn map_permission_write_error(e: sqlx::Error) -> AppError {
+    let msg = e.to_string();
+    if msg.contains("duplicate key") {
+        AppError::Conflict("Permission already exists".to_string())
+    } else {
+        AppError::Database(msg)
+    }
+}
+
+async fn fetch_permission_row<'e, E>(executor: E, id: Uuid) -> Result<Option<PermissionRow>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as(&format!(
+        "{} WHERE p.id = $1",
+        hydrate_select("permissions p")
+    ))
+    .bind(id)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PermissionListResponse {
     pub items: Vec<PermissionResponse>,
@@ -135,30 +219,16 @@ pub async fn list_permissions(
         }));
     }
 
-    let permissions: Vec<PermissionRow> = sqlx::query_as(
-        r#"
-        SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
-               p.actions, p.created_at, p.updated_at,
-               CASE
-                   WHEN p.principal_type = 'user' THEN u.username
-                   WHEN p.principal_type = 'group' THEN g.name
-               END as principal_name,
-               CASE
-                   WHEN p.target_type = 'repository' THEN r.name
-               END as target_name
-        FROM permissions p
-        LEFT JOIN users u ON p.principal_type = 'user' AND p.principal_id = u.id
-        LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
-        LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
-        WHERE ($1::text IS NULL OR p.principal_type = $1)
+    let permissions: Vec<PermissionRow> = sqlx::query_as(&format!(
+        "{} WHERE ($1::text IS NULL OR p.principal_type = $1)
           AND ($2::uuid IS NULL OR p.principal_id = $2)
           AND ($3::text IS NULL OR p.target_type = $3)
           AND ($4::uuid IS NULL OR p.target_id = $4)
         ORDER BY p.created_at DESC
         OFFSET $5
-        LIMIT $6
-        "#,
-    )
+        LIMIT $6",
+        hydrate_select("permissions p")
+    ))
     .bind(&query.principal_type)
     .bind(query.principal_id)
     .bind(&query.target_type)
@@ -210,18 +280,6 @@ pub struct CreatePermissionRequest {
     pub target_type: String,
     pub target_id: Uuid,
     pub actions: Vec<String>,
-}
-
-#[derive(Debug, FromRow, ToSchema)]
-pub struct CreatedPermissionRow {
-    pub id: Uuid,
-    pub principal_type: String,
-    pub principal_id: Uuid,
-    pub target_type: String,
-    pub target_id: Uuid,
-    pub actions: Vec<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Create a permission
@@ -282,46 +340,57 @@ pub async fn create_permission(
         .validate_principal(&payload.principal_type, payload.principal_id)
         .await?;
 
-    let permission: CreatedPermissionRow = sqlx::query_as(
+    // #2826: hydrate the response inside the write statement. The INSERT's
+    // `RETURNING *` feeds the shared `hydrate_select` joins through a
+    // data-modifying CTE, so create answers with the same
+    // principal_name/target_name a follow-up GET reports. Before this the
+    // handler ran a bare `INSERT ... RETURNING <columns>` and hard-coded both
+    // display fields to `None`; there was no transaction and no second query,
+    // so the round-trip count is unchanged (still one autocommit statement on
+    // the pool) -- what changed is that the one statement now also resolves
+    // the names, instead of needing a follow-up SELECT to do it.
+    //
+    // Being one statement is what makes it atomic: any failure, including the
+    // unique violation the CTE's INSERT raises on a duplicate grant, rolls the
+    // whole statement back, so no error path can leave a half-written row.
+    //
+    // `fetch_one` (error on zero rows) is deliberate: the CTE's INSERT emits
+    // exactly one row on success and the LEFT JOINs (all keyed on a primary
+    // key) cannot drop or duplicate it, so a zero-row result is an invariant
+    // failure, not a legitimate 404.
+    //
+    // The two name fields are snapshot-best-effort: the outer SELECT reads
+    // `users`/`groups`/`repositories` at the statement snapshot, so a
+    // principal or repository committed concurrently mid-statement can echo
+    // back as `null` here and hydrate on the next GET. Do not write a test
+    // asserting these are non-null under concurrency.
+    let query = format!(
         r#"
-        INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, principal_type, principal_id, target_type, target_id, actions, created_at, updated_at
-        "#
-    )
-    .bind(&payload.principal_type)
-    .bind(payload.principal_id)
-    .bind(&payload.target_type)
-    .bind(payload.target_id)
-    .bind(&payload.actions)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("duplicate key") {
-            AppError::Conflict("Permission already exists".to_string())
-        } else {
-            AppError::Database(msg)
-        }
-    })?;
+        WITH p AS (
+            INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *
+        )
+        {}
+        "#,
+        hydrate_select("p")
+    );
+    let permission: PermissionRow = sqlx::query_as(&query)
+        .bind(&payload.principal_type)
+        .bind(payload.principal_id)
+        .bind(&payload.target_type)
+        .bind(payload.target_id)
+        .bind(&payload.actions)
+        .fetch_one(&state.db)
+        .await
+        .map_err(map_permission_write_error)?;
 
     state.permission_service.invalidate_cache();
     state
         .event_bus
         .emit("permission.created", permission.id, None);
 
-    Ok(Json(PermissionResponse {
-        id: permission.id,
-        principal_type: permission.principal_type,
-        principal_id: permission.principal_id,
-        principal_name: None,
-        target_type: permission.target_type,
-        target_id: permission.target_id,
-        target_name: None,
-        actions: permission.actions,
-        created_at: permission.created_at,
-        updated_at: permission.updated_at,
-    }))
+    Ok(Json(PermissionResponse::from(permission)))
 }
 
 /// Get a permission by ID
@@ -356,29 +425,9 @@ pub async fn get_permission(
         return Err(AppError::NotFound("Permission not found".to_string()));
     }
 
-    let permission: PermissionRow = sqlx::query_as(
-        r#"
-        SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
-               p.actions, p.created_at, p.updated_at,
-               CASE
-                   WHEN p.principal_type = 'user' THEN u.username
-                   WHEN p.principal_type = 'group' THEN g.name
-               END as principal_name,
-               CASE
-                   WHEN p.target_type = 'repository' THEN r.name
-               END as target_name
-        FROM permissions p
-        LEFT JOIN users u ON p.principal_type = 'user' AND p.principal_id = u.id
-        LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
-        LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
-        WHERE p.id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
+    let permission = fetch_permission_row(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
 
     Ok(Json(PermissionResponse::from(permission)))
 }
@@ -425,43 +474,46 @@ pub async fn update_permission(
         .validate_principal(&payload.principal_type, payload.principal_id)
         .await?;
 
-    let permission: CreatedPermissionRow = sqlx::query_as(
+    // Same hydrate-inside-the-write-statement shape as create_permission
+    // above (#2826); before this, update ran a bare `UPDATE ... RETURNING
+    // <columns>` and hard-coded both display fields to `None`. The same
+    // atomicity and snapshot-best-effort notes apply.
+    //
+    // Unlike create, a zero-row result here is a legitimate outcome -- the id
+    // does not exist -- so `fetch_optional` -> `None` still maps to
+    // `NotFound` rather than a 500: an UPDATE that matches nothing yields an
+    // empty CTE, and the outer SELECT over it returns no rows.
+    let query = format!(
         r#"
-        UPDATE permissions
-        SET principal_type = $2, principal_id = $3, target_type = $4, target_id = $5,
-            actions = $6, updated_at = NOW()
-        WHERE id = $1
-        RETURNING id, principal_type, principal_id, target_type, target_id, actions, created_at, updated_at
-        "#
-    )
-    .bind(id)
-    .bind(&payload.principal_type)
-    .bind(payload.principal_id)
-    .bind(&payload.target_type)
-    .bind(payload.target_id)
-    .bind(&payload.actions)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
+        WITH p AS (
+            UPDATE permissions
+            SET principal_type = $2, principal_id = $3, target_type = $4, target_id = $5,
+                actions = $6, updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+        )
+        {}
+        "#,
+        hydrate_select("p")
+    );
+    let permission: PermissionRow = sqlx::query_as(&query)
+        .bind(id)
+        .bind(&payload.principal_type)
+        .bind(payload.principal_id)
+        .bind(&payload.target_type)
+        .bind(payload.target_id)
+        .bind(&payload.actions)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(map_permission_write_error)?
+        .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
 
     state.permission_service.invalidate_cache();
     state
         .event_bus
         .emit("permission.updated", permission.id, None);
 
-    Ok(Json(PermissionResponse {
-        id: permission.id,
-        principal_type: permission.principal_type,
-        principal_id: permission.principal_id,
-        principal_name: None,
-        target_type: permission.target_type,
-        target_id: permission.target_id,
-        target_name: None,
-        actions: permission.actions,
-        created_at: permission.created_at,
-        updated_at: permission.updated_at,
-    }))
+    Ok(Json(PermissionResponse::from(permission)))
 }
 
 /// Delete a permission
@@ -522,7 +574,6 @@ pub async fn delete_permission(
         PermissionResponse,
         PermissionListResponse,
         CreatePermissionRequest,
-        CreatedPermissionRow,
     ))
 )]
 pub struct PermissionsApiDoc;
@@ -530,7 +581,506 @@ pub struct PermissionsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use chrono::Utc;
+    use serde_json::json;
+
+    fn permission_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        tdh::router_with_auth(router(), state, auth)
+    }
+
+    /// Seed a fine-grained `permissions` row scoped to a single `["read"]`
+    /// action -- these tests only assert on hydration, so the exact action
+    /// set doesn't matter. Thin wrapper over `tdh::grant_permission` (the
+    /// general form; `tdh::grant_repo_admin`/`grant_repo_actions` are the
+    /// `user` + `repository` specializations these tests don't want).
+    async fn seed_permission(
+        pool: &sqlx::PgPool,
+        principal_type: &str,
+        principal_id: Uuid,
+        target_type: &str,
+        target_id: Uuid,
+    ) -> Uuid {
+        tdh::grant_permission(
+            pool,
+            principal_type,
+            principal_id,
+            target_type,
+            target_id,
+            &["read"],
+        )
+        .await
+    }
+
+    /// Send a request built via the `tdh` request helpers and parse the JSON
+    /// body, asserting 200 OK. Request construction (method/uri/content-type
+    /// boilerplate) lives in `tdh::get`/`tdh::post`/`tdh::put_json`; this
+    /// keeps only the send+assert+parse step local, since that part isn't
+    /// shared with other handler test modules.
+    async fn response_json(
+        state: SharedState,
+        auth: AuthExtension,
+        request: Request<Body>,
+    ) -> serde_json::Value {
+        let (status, body) = tdh::send(permission_app(state, auth), request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "permission request failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body).expect("permission response JSON")
+    }
+
+    /// Teardown for this module's fixtures. `tdh::cleanup` handles the
+    /// admin user + repo-target permissions + repo row; `tdh::cleanup_user`
+    /// handles each extra user principal (service accounts). What's left --
+    /// permissions keyed by a non-admin/non-repo-target row (e.g. the
+    /// `target_type = "global"` fixture) and group rows -- isn't covered by
+    /// either shared helper, so it stays local.
+    async fn cleanup_permission_fixtures(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        admin_id: Uuid,
+        extra_user_ids: &[Uuid],
+        group_ids: &[Uuid],
+    ) {
+        let mut principal_ids: Vec<Uuid> = extra_user_ids.to_vec();
+        principal_ids.push(admin_id);
+        principal_ids.extend_from_slice(group_ids);
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = ANY($1)")
+            .bind(&principal_ids)
+            .execute(pool)
+            .await;
+        if !group_ids.is_empty() {
+            let _ = sqlx::query("DELETE FROM groups WHERE id = ANY($1)")
+                .bind(group_ids)
+                .execute(pool)
+                .await;
+        }
+        for &id in extra_user_ids {
+            tdh::cleanup_user(pool, id).await;
+        }
+        tdh::cleanup(pool, repo_id, admin_id).await;
+    }
+
+    /// The `mismatched_permission` fixture below seeds `principal_type =
+    /// 'service_account'` naming a human admin's `users.id` -- a row shape
+    /// that never occurs from `validate_principal`-gated writes (#2503), but
+    /// can exist from data seeded before that gate, or a legacy row exactly
+    /// like the one #2826's regression test below covers in the other
+    /// direction. It still asserts a real username, not `null`: the join is
+    /// keyed by `users.id`, and `query_actions` (`permission_service.rs`)
+    /// enforces this row by bare `principal_id` regardless of the declared
+    /// `principal_type`, so it is a live grant an admin needs to be able to
+    /// identify. See `hydrate_select`'s doc comment for the full rationale.
+    #[tokio::test]
+    async fn list_and_get_hydrate_principal_names_by_id_regardless_of_type_mismatch() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (service_account_id, service_account_name) = tdh::create_service_account(&pool).await;
+        let (group_id, group_name) = tdh::create_group(&pool).await;
+        let (repo_id, repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let human_permission =
+            seed_permission(&pool, "user", admin_id, "repository", repo_id).await;
+        let service_account_permission = seed_permission(
+            &pool,
+            "service_account",
+            service_account_id,
+            "repository",
+            repo_id,
+        )
+        .await;
+        let group_permission =
+            seed_permission(&pool, "group", group_id, "repository", repo_id).await;
+        let mismatched_permission =
+            seed_permission(&pool, "service_account", admin_id, "repository", repo_id).await;
+
+        let listed = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/?target_id={repo_id}")),
+        )
+        .await;
+        let items = listed["items"].as_array().expect("permission items");
+        let find = |id: Uuid| {
+            items
+                .iter()
+                .find(|item| item["id"] == id.to_string())
+                .expect("listed permission")
+        };
+
+        assert_eq!(find(human_permission)["principal_name"], admin_name);
+        assert_eq!(
+            find(service_account_permission)["principal_name"],
+            service_account_name
+        );
+        assert_eq!(find(group_permission)["principal_name"], group_name);
+        // Mismatched principal_type, still enforced by bare principal_id: named,
+        // not null (see the doc comment above this test).
+        assert_eq!(find(mismatched_permission)["principal_name"], admin_name);
+        assert!(items.iter().all(|item| item["target_name"] == repo_name));
+
+        let fetched_human = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{human_permission}")),
+        )
+        .await;
+        assert_eq!(fetched_human["principal_name"], admin_name);
+        assert_eq!(fetched_human["target_name"], repo_name);
+
+        let fetched_service_account = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{service_account_permission}")),
+        )
+        .await;
+        assert_eq!(
+            fetched_service_account["principal_name"],
+            service_account_name
+        );
+        assert_eq!(fetched_service_account["target_name"], repo_name);
+
+        let fetched_group = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{group_permission}")),
+        )
+        .await;
+        assert_eq!(fetched_group["principal_name"], group_name);
+        assert_eq!(fetched_group["target_name"], repo_name);
+
+        let fetched_mismatch =
+            response_json(state, auth, tdh::get(format!("/{mismatched_permission}"))).await;
+        assert_eq!(fetched_mismatch["principal_name"], admin_name);
+        assert_eq!(fetched_mismatch["target_name"], repo_name);
+
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[group_id])
+            .await;
+    }
+
+    /// #2826 hardening: between migration 057 (Feb 2026, `is_service_account`
+    /// introduced) and #2499 (Jul 2026, `principal_type = 'service_account'`
+    /// first honored by resolvers), the only working way to grant a service
+    /// account fine-grained access was `principal_type = 'user'` + the SA's
+    /// `users.id`. No migration re-types those rows, `validate_principal`
+    /// (#2503) only guards new writes, and `query_actions`
+    /// (`permission_service.rs`) still matches such legacy rows by bare
+    /// `principal_id` -- they are live, enforced grants today. Pin that a
+    /// legacy `principal_type = 'user'` row naming a service account still
+    /// hydrates the SA's username (list AND get), not `null`.
+    ///
+    /// WHAT THIS TEST DOES AND DOES NOT COVER: it is GREEN on the pre-#2826
+    /// code and therefore carries **no** coverage of #2826 itself. The old
+    /// join was `p.principal_type = 'user' AND p.principal_id = u.id`, and a
+    /// service account IS a `users` row, so a `'user'`-typed row naming an SA
+    /// already hydrated before the fix. The #2826 regression guards are
+    /// `list_and_get_hydrate_principal_names_by_id_regardless_of_type_mismatch`
+    /// (the `service_account`-typed rows) and
+    /// `create_and_update_return_hydrated_permission_names`. This one is a
+    /// FORWARD guard: it fails the moment anyone adds an
+    /// `AND u.is_service_account = false` predicate to the user arm -- exactly
+    /// the design considered and rejected while fixing #2826, and the reason
+    /// `hydrate_select` carries the doc comment it does.
+    #[tokio::test]
+    async fn legacy_user_typed_grant_naming_a_service_account_hydrates_its_username() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (service_account_id, service_account_name) = tdh::create_service_account(&pool).await;
+        let (repo_id, repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let legacy_permission =
+            seed_permission(&pool, "user", service_account_id, "repository", repo_id).await;
+
+        let listed = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/?target_id={repo_id}")),
+        )
+        .await;
+        let items = listed["items"].as_array().expect("permission items");
+        let listed_legacy = items
+            .iter()
+            .find(|item| item["id"] == legacy_permission.to_string())
+            .expect("legacy permission in list");
+        assert_eq!(listed_legacy["principal_name"], service_account_name);
+        assert_eq!(listed_legacy["target_name"], repo_name);
+
+        let fetched_legacy =
+            response_json(state, auth, tdh::get(format!("/{legacy_permission}"))).await;
+        assert_eq!(fetched_legacy["principal_name"], service_account_name);
+        assert_eq!(fetched_legacy["target_name"], repo_name);
+
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn create_and_update_return_hydrated_permission_names() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (service_account_id, service_account_name) = tdh::create_service_account(&pool).await;
+        let (repo_id, repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let created = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::post(
+                "/".to_string(),
+                "application/json",
+                Bytes::from(
+                    json!({
+                        "principal_type": "service_account",
+                        "principal_id": service_account_id,
+                        "target_type": "repository",
+                        "target_id": repo_id,
+                        "actions": ["read", "write"]
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(created["principal_name"], service_account_name);
+        assert_eq!(created["target_name"], repo_name);
+
+        let global_target_id = Uuid::new_v4();
+        let permission_id =
+            seed_permission(&pool, "user", admin_id, "global", global_target_id).await;
+        let updated = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::put_json(
+                format!("/{permission_id}"),
+                Bytes::from(
+                    json!({
+                        "principal_type": "service_account",
+                        "principal_id": service_account_id,
+                        "target_type": "global",
+                        "target_id": global_target_id,
+                        "actions": ["admin"]
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(updated["principal_name"], service_account_name);
+        assert!(updated["target_name"].is_null());
+
+        let fetched = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{permission_id}")),
+        )
+        .await;
+        assert_eq!(fetched["principal_name"], service_account_name);
+        assert!(fetched["target_name"].is_null());
+
+        let listed = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!(
+                "/?principal_id={service_account_id}&target_id={global_target_id}"
+            )),
+        )
+        .await;
+        let listed_permission = listed["items"]
+            .as_array()
+            .expect("permission items")
+            .iter()
+            .find(|item| item["id"] == permission_id.to_string())
+            .expect("updated permission in list");
+        assert_eq!(listed_permission["principal_name"], service_account_name);
+        assert!(listed_permission["target_name"].is_null());
+
+        // Positive control for the UPDATE path's `target_name`. Every
+        // assertion above only ever puts update against a `global` target,
+        // whose `target_name` is null under the fix AND under the pre-#2826
+        // code that hard-coded the field to `None` -- `is_null()` there is
+        // satisfied by the bug as well as by the fix, so on its own it leaves
+        // update's `target_name` hydration entirely unguarded. Re-point the
+        // same row at the repository: this assertion can only hold if the
+        // UPDATE's CTE really joins `repositories`. The principal goes back to
+        // the admin so the tuple stays distinct from the row created at the
+        // top of this test (`permissions` is UNIQUE on the four-column key).
+        let retargeted = response_json(
+            state,
+            auth,
+            tdh::put_json(
+                format!("/{permission_id}"),
+                Bytes::from(
+                    json!({
+                        "principal_type": "user",
+                        "principal_id": admin_id,
+                        "target_type": "repository",
+                        "target_id": repo_id,
+                        "actions": ["read"]
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(retargeted["principal_name"], admin_name);
+        assert_eq!(retargeted["target_name"], repo_name);
+
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[]).await;
+    }
+
+    /// The #2826 rewrite moved both write statements inside a data-modifying
+    /// CTE, and the 409 mapping is a substring match on the driver's error
+    /// text (`map_permission_write_error`). Nothing in the repo exercised that
+    /// arm, so a change in how a unique violation surfaces from inside a CTE
+    /// would silently downgrade 409 to 500 unnoticed.
+    ///
+    /// Also pins two things the CTE rewrite is responsible for: that a
+    /// rejected create leaves NO row behind (the single-statement atomicity
+    /// claim in `create_permission`'s comment), and that the same collision
+    /// reached through UPDATE is a 409 too. The update arm previously fell
+    /// through to `AppError::Database` and answered 500 with the raw Postgres
+    /// error text; create and update now share one mapping.
+    #[tokio::test]
+    async fn duplicate_grants_are_conflicts_on_both_create_and_update() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (sa_id, _) = tdh::create_service_account(&pool).await;
+        let (repo_id, _, _dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+        let grant_body = || {
+            Bytes::from(
+                json!({
+                    "principal_type": "service_account",
+                    "principal_id": sa_id,
+                    "target_type": "repository",
+                    "target_id": repo_id,
+                    "actions": ["read"]
+                })
+                .to_string(),
+            )
+        };
+        async fn grants(pool: &sqlx::PgPool, principal_id: Uuid, target_id: Uuid) -> i64 {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM permissions WHERE principal_id = $1 AND target_id = $2",
+            )
+            .bind(principal_id)
+            .bind(target_id)
+            .fetch_one(pool)
+            .await
+            .expect("count service-account grants")
+        }
+
+        let (first, first_body) = tdh::send(
+            permission_app(state.clone(), auth.clone()),
+            tdh::post("/".to_string(), "application/json", grant_body()),
+        )
+        .await;
+        assert_eq!(
+            first,
+            StatusCode::OK,
+            "first create must succeed: {}",
+            String::from_utf8_lossy(&first_body)
+        );
+        assert_eq!(grants(&pool, sa_id, repo_id).await, 1);
+
+        let (second, second_body) = tdh::send(
+            permission_app(state.clone(), auth.clone()),
+            tdh::post("/".to_string(), "application/json", grant_body()),
+        )
+        .await;
+        assert_eq!(
+            second,
+            StatusCode::CONFLICT,
+            "duplicate create must map to 409, not 500: {}",
+            String::from_utf8_lossy(&second_body)
+        );
+        assert_eq!(
+            grants(&pool, sa_id, repo_id).await,
+            1,
+            "the rejected create must not leave a second row"
+        );
+
+        // Same collision via UPDATE: retarget a second row onto the tuple the
+        // create above already occupies.
+        let other = seed_permission(&pool, "user", admin_id, "repository", repo_id).await;
+        let (updated, updated_body) = tdh::send(
+            permission_app(state, auth),
+            tdh::put_json(format!("/{other}"), grant_body()),
+        )
+        .await;
+        assert_eq!(
+            updated,
+            StatusCode::CONFLICT,
+            "an update colliding with an existing grant must map to 409, not 500: {}",
+            String::from_utf8_lossy(&updated_body)
+        );
+        assert_eq!(
+            grants(&pool, sa_id, repo_id).await,
+            1,
+            "the rejected update must not have retargeted the row"
+        );
+
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[sa_id], &[]).await;
+    }
+
+    /// `update_permission`'s 404 has to survive the CTE rewrite: an UPDATE
+    /// matching no row yields an empty CTE, so the outer SELECT over it
+    /// returns nothing and `fetch_optional` -> `None` must still map to
+    /// NotFound rather than a 500. Nothing else covers that path.
+    #[tokio::test]
+    async fn update_of_a_missing_permission_is_not_found_not_a_server_error() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let missing = Uuid::new_v4();
+        let (status, body) = tdh::send(
+            permission_app(state, auth),
+            tdh::put_json(
+                format!("/{missing}"),
+                Bytes::from(
+                    json!({
+                        "principal_type": "user",
+                        "principal_id": admin_id,
+                        "target_type": "global",
+                        "target_id": Uuid::new_v4(),
+                        "actions": ["read"]
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "update of a missing id must be 404: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        tdh::cleanup_user(&pool, admin_id).await;
+    }
 
     // -----------------------------------------------------------------------
     // ListPermissionsQuery deserialization
