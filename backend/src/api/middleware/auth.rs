@@ -450,7 +450,9 @@ pub async fn require_auth_with_bearer_fallback(
 /// Token extraction result
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ExtractedToken<'a> {
-    /// JWT or API token from Bearer scheme
+    /// JWT or API token from the `Bearer` scheme — or from the
+    /// `Token` scheme, which `ansible-galaxy` uses and which is treated as
+    /// Bearer-equivalent (#3137), or from a scheme-less cargo credential.
     Bearer(&'a str),
     /// API token from ApiKey scheme
     ApiKey(&'a str),
@@ -462,9 +464,22 @@ pub(crate) enum ExtractedToken<'a> {
     Invalid,
 }
 
-/// Extract token from Authorization header (supports Bearer, ApiKey, and Basic schemes)
+/// Extract token from Authorization header (supports the Bearer, Token,
+/// ApiKey, and Basic schemes, plus the scheme-less cargo credential).
+/// `Token` — the scheme `ansible-galaxy` sends — resolves to the same
+/// [`ExtractedToken::Bearer`] variant as `Bearer` (#3137).
 fn extract_token_from_auth_header(auth_header: &str) -> ExtractedToken<'_> {
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        ExtractedToken::Bearer(token)
+    } else if let Some(token) = auth_header.strip_prefix("Token ") {
+        // `ansible-galaxy` authenticates Galaxy API calls with
+        // `Authorization: Token <api_key>` — ansible-core
+        // `lib/ansible/galaxy/token.py` sets `GalaxyToken.token_type = 'Token'`
+        // and builds the header as `'%s %s' % (self.token_type, self.get())`;
+        // only its Keycloak/Automation-Hub variant uses `Bearer`. Treat the
+        // `Token` scheme as Bearer-equivalent so the credential flows through
+        // the same JWT → API-token validation chain instead of being rejected
+        // as a malformed header (#3137).
         ExtractedToken::Bearer(token)
     } else if let Some(token) = auth_header.strip_prefix("ApiKey ") {
         ExtractedToken::ApiKey(token)
@@ -485,7 +500,7 @@ fn extract_token_from_auth_header(auth_header: &str) -> ExtractedToken<'_> {
 }
 
 /// Extract token from request headers
-/// Checks: Authorization (Bearer/ApiKey), X-API-Key
+/// Checks: Authorization (Bearer/Token/ApiKey/Basic), X-API-Key
 pub(crate) fn extract_token(request: &Request) -> ExtractedToken<'_> {
     // First, check Authorization header
     if let Some(auth_header) = request
@@ -2090,6 +2105,16 @@ mod tests {
     fn test_extract_apikey_token() {
         let result = extract_token_from_auth_header("ApiKey ak_secret_key");
         assert!(matches!(result, ExtractedToken::ApiKey("ak_secret_key")));
+    }
+
+    #[test]
+    fn test_3137_extract_galaxy_token_scheme_as_bearer() {
+        // `ansible-galaxy` sends `Authorization: Token <api_key>` (ansible-core
+        // lib/ansible/galaxy/token.py, `GalaxyToken.token_type = 'Token'`).
+        // The scheme must resolve as Bearer-equivalent instead of Invalid,
+        // which surfaced as 401 on every authenticated Galaxy call (#3137).
+        let result = extract_token_from_auth_header("Token my-api-token-123");
+        assert!(matches!(result, ExtractedToken::Bearer("my-api-token-123")));
     }
 
     #[test]
@@ -4908,6 +4933,94 @@ mod tests {
                 "format path must resolve the api-token-as-Basic-password to the token owner"
             ),
             other => panic!("expected Resolved(is_api_token) on the format path, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_3137_galaxy_token_scheme_authenticates_api_token() {
+        // The `ansible-galaxy` CLI authenticates every Galaxy API call with
+        // `Authorization: Token <api_key>` (ansible-core
+        // lib/ansible/galaxy/token.py, `GalaxyToken`). Drive the exact header
+        // bytes the CLI sends through the same extract → resolve chain
+        // `repo_visibility_middleware` uses for /ansible/* requests: the
+        // credential must resolve to the token owner rather than being
+        // rejected as a malformed Authorization header (#3137).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "galaxy", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+
+        // Resolve one `Authorization` header value through the exact chain the
+        // visibility middleware uses (`extract_token` → `try_resolve_auth_outcome`
+        // with `allow_basic_api_token = true`).
+        async fn resolve(auth_service: &AuthService, header: &str) -> AuthOutcome {
+            let request = Request::builder()
+                .uri("/ansible/galaxy/api")
+                .header(AUTHORIZATION, header)
+                .body(axum::body::Body::empty())
+                .expect("build request");
+            try_resolve_auth_outcome(auth_service, extract_token(&request), true).await
+        }
+
+        let empty_outcome = resolve(&auth_service, "Token ").await;
+        let bad_outcome = resolve(&auth_service, "Token not-a-valid-credential").await;
+        let outcome = resolve(&auth_service, &format!("Token {token}")).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        // ---- Fail-closed assertions FIRST -------------------------------
+        // Asserted before the positive `match` below on purpose: a panic in
+        // the positive arm would otherwise mean a reverted/mutated tree never
+        // evaluates these at all (the mistake this ordering fixes).
+        //
+        // `Token ` with an EMPTY credential is the discriminating input. It
+        // must be `InvalidCredential` — *not* `NoCredential` and *not*
+        // `Resolved`. The `NoCredential` distinction is the one that matters
+        // operationally: `repo_visibility_middleware` 401s on
+        // `InvalidCredential` (auth.rs #1371 arm) but lets `NoCredential`
+        // through as an anonymous read on a public repository, so an
+        // implementation that mapped an empty `Token` credential to "no
+        // credential presented" would silently downgrade a broken client to
+        // anonymous instead of challenging it. Mirrors the pre-existing
+        // `"Bearer "` contract pinned by `test_extract_bearer_empty_token`.
+        match empty_outcome {
+            AuthOutcome::InvalidCredential => {}
+            other => panic!(
+                "`Token ` with an empty credential must fail closed as \
+                 InvalidCredential (not anonymous, not resolved), got {other:?}"
+            ),
+        }
+        // Forward-looking guard: a syntactically well-formed but unknown
+        // credential under the newly-recognized scheme must not fail open into
+        // a resolved identity. (Rejected on the pre-fix tree too, so this one
+        // does not discriminate the fix itself — it guards against a future
+        // "the `Token` scheme is trusted" change.)
+        match bad_outcome {
+            AuthOutcome::InvalidCredential => {}
+            other => panic!(
+                "an unknown credential under the Token scheme must stay \
+                 rejected, got {other:?}"
+            ),
+        }
+
+        // ---- Positive control -------------------------------------------
+        match outcome {
+            AuthOutcome::Resolved(ext) => assert!(
+                ext.is_api_token,
+                "Token-scheme credential must resolve to the API-token owner"
+            ),
+            other => panic!("expected Resolved for `Token <valid_api_key>`, got {other:?}"),
         }
     }
 
