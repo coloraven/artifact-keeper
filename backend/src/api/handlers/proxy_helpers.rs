@@ -1426,6 +1426,11 @@ pub(crate) async fn coordinated_retry_get(
 /// Fetch from upstream using `fetch_path` for the URL but `cache_path` for
 /// the proxy cache key. This lets callers store content under a predictable
 /// local path even when the upstream download URL varies between requests.
+///
+/// Returns `(body, content_type, content_encoding)` (#3211): an adopter that
+/// forwards the buffered body verbatim must declare the coding (RFC 9110
+/// §8.4); one that parses/rewrites the body must decode it and drop the
+/// coding.
 pub async fn proxy_fetch_with_cache_key(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -1433,7 +1438,7 @@ pub async fn proxy_fetch_with_cache_key(
     upstream_url: &str,
     fetch_path: &str,
     cache_path: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -1453,6 +1458,9 @@ pub async fn proxy_fetch_with_cache_key(
 /// the PEP 691 JSON representation while keying the cache on a format-qualified
 /// `cache_path`, so the JSON and HTML forms of the same index never collide in
 /// the proxy cache.
+///
+/// Returns `(body, content_type, content_encoding)` (#3211) — same contract
+/// as [`proxy_fetch_with_cache_key`].
 pub async fn proxy_fetch_with_cache_key_and_accept(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -1461,7 +1469,7 @@ pub async fn proxy_fetch_with_cache_key_and_accept(
     fetch_path: &str,
     cache_path: &str,
     accept: Option<&str>,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
