@@ -1565,6 +1565,32 @@ pub(crate) async fn run_curation_sync_cycle(
             .await
             .unwrap_or(None);
 
+        // pypi/npm have no enumerable global upstream index — they are ingested
+        // ON DEMAND by the proxy seam (#2955 Stage 2). There is nothing to walk
+        // here; instead evaluate the pending rows the proxy enqueued, exactly as
+        // rpm/debian rows are evaluated after upsert, running attestation
+        // verification off this tick first (never on the hot download path).
+        if matches!(format.as_str(), "pypi" | "npm") {
+            evaluate_ondemand_curation(
+                &curation,
+                *staging_id,
+                default_action,
+                format,
+                upstream_url,
+                &popularity_source,
+                &client,
+                &upstream_auth,
+            )
+            .await;
+            let _ = sqlx::query(
+                "UPDATE repositories SET curation_last_synced_at = NOW() WHERE id = $1",
+            )
+            .bind(staging_id)
+            .execute(db)
+            .await;
+            continue;
+        }
+
         let entries = match format.as_str() {
             "rpm" => {
                 let base = upstream_url.trim_end_matches('/');
@@ -1888,6 +1914,365 @@ pub(crate) async fn run_curation_sync_cycle(
     Ok(())
 }
 
+/// Max distribution-file size the off-hot-path verifier will fetch to bind an
+/// attestation subject (#2955). A wheel/sdist beyond this is treated as
+/// unverifiable (fail-safe: the row stays unverified and Flags), never OOM.
+const MAX_VERIFY_DIST_BYTES: usize = 128 * 1024 * 1024;
+
+/// Evaluate the pending on-demand-ingested pypi/npm curation rows for one
+/// staging repo (#2955 Stage 2/3). For each pending row: run attestation
+/// verification off the hot path (pypi only; npm records the unsupported
+/// reason), persist the result, inject a verified marker into the evaluation
+/// context on success, then run the typed rule dispatch exactly as rpm/debian.
+///
+/// Every step is fail-SAFE: any error yields at most today's behavior (the row
+/// stays unverified and the publisher-trust evaluator Flags it), never a false
+/// `verified=true` and never a dead sync loop.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_ondemand_curation(
+    curation: &crate::services::curation_service::CurationService,
+    staging_id: uuid::Uuid,
+    default_action: &str,
+    format: &str,
+    upstream_url: &str,
+    popularity_source: &dyn crate::services::curation::popularity_source::PopularitySource,
+    client: &reqwest::Client,
+    upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+) {
+    use crate::services::curation::{attestation_verify, publisher_source};
+    use crate::services::curation_service::CurationService;
+
+    const MAX_PENDING_PER_TICK: i64 = 500;
+    let pending = match curation
+        .list_pending_packages_by_format(staging_id, format, MAX_PENDING_PER_TICK)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                staging_repo_id = %staging_id,
+                format = %format,
+                error = %e,
+                "on-demand curation: failed to load pending packages"
+            );
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    // Fail-safe trust root: if the vendored root is somehow unusable, we simply
+    // never verify (rows stay unverified → Flag), never an outage.
+    let trust = attestation_verify::TrustRoot::vendored().ok();
+    let allowlist: Vec<String> = attestation_verify::DEFAULT_ISSUER_ALLOWLIST
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    for pkg in pending {
+        let mut eval_metadata = pkg.metadata.clone();
+        // The marker below is a trusted server-side assertion: `extract_publisher`
+        // short-circuits on it and returns `verified = true`. Clear whatever the
+        // stored row carried BEFORE deciding whether to inject one, so the only
+        // way to reach the verified arm is this tick's own `AttestationVerdict`.
+        // Without this the loop inserts on success but never removes, so on the
+        // failure and npm paths a stale or planted marker survives into the
+        // evaluation untouched.
+        if publisher_source::strip_verification_marker(&mut eval_metadata) {
+            tracing::warn!(
+                package = %pkg.package_name,
+                version = %pkg.version,
+                "curation eval: dropped a pre-existing attestation-verification marker from stored metadata"
+            );
+        }
+
+        match format {
+            "pypi" => {
+                let verdict = match &trust {
+                    Some(t) => {
+                        verify_pypi_curation_row(
+                            client,
+                            upstream_auth,
+                            upstream_url,
+                            &pkg,
+                            &allowlist,
+                            t,
+                        )
+                        .await
+                    }
+                    None => attestation_verify::AttestationVerdict::unverified(),
+                };
+                let _ = curation
+                    .record_attestation(
+                        pkg.id,
+                        verdict.state.as_str(),
+                        verdict.identity.as_deref(),
+                        verdict.issuer.as_deref(),
+                        verdict.owner.as_deref(),
+                        verdict.error.as_deref(),
+                    )
+                    .await;
+                if let Some(marker) = attestation_verify::verified_marker(&verdict) {
+                    if let Some(obj) = eval_metadata.as_object_mut() {
+                        obj.insert(publisher_source::VERIFICATION_MARKER.to_string(), marker);
+                    }
+                }
+            }
+            "npm" => {
+                // npm is ingested but unsupported (sha512-only subject binding);
+                // it never verifies and stays on the fail-safe Flag.
+                let verdict = attestation_verify::verify_npm_unsupported();
+                let _ = curation
+                    .record_attestation(
+                        pkg.id,
+                        verdict.state.as_str(),
+                        None,
+                        None,
+                        None,
+                        verdict.error.as_deref(),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+
+        if let Ok((decision, rule_id)) = curation
+            .evaluate_package_typed(
+                staging_id,
+                default_action,
+                format,
+                &pkg.package_name,
+                &pkg.version,
+                pkg.architecture.as_deref(),
+                &eval_metadata,
+                popularity_source,
+            )
+            .await
+        {
+            let (status, reason) = CurationService::decision_to_status_reason(&decision, rule_id);
+            let _ = curation
+                .set_package_status(pkg.id, status, &reason, None, rule_id)
+                .await;
+        }
+    }
+}
+
+/// Verify one pending pypi curation row's attestation, off the hot path.
+///
+/// The on-demand proxy seam enqueues pypi rows with only name+version+filename
+/// (it serves the simple index, not the JSON API), so this step best-effort
+/// ENRICHES the row from the upstream — fetching `{base}/pypi/{n}/{v}/json` for
+/// the distribution URL and the PEP 740 `{base}/integrity/.../provenance` — then
+/// downloads the exact distribution bytes and verifies. Every miss (no upstream
+/// JSON, no provenance, fetch/parse error, non-PyPI-shaped mirror) yields
+/// `unverified`/`failed` (fail-safe), never a false `verified`.
+async fn verify_pypi_curation_row(
+    client: &reqwest::Client,
+    upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    upstream_url: &str,
+    pkg: &crate::models::curation::CurationPackage,
+    allowlist: &[String],
+    trust: &crate::services::curation::attestation_verify::TrustRoot,
+) -> crate::services::curation::attestation_verify::AttestationVerdict {
+    use crate::services::curation::attestation_verify::{
+        verify_pypi_provenance, AttestationVerdict,
+    };
+    use crate::services::curation_sync::build_pypi_curation_entry;
+
+    // Resolve the distribution filename we are gating.
+    let filename = pkg
+        .metadata
+        .get("_ak_dist")
+        .and_then(|d| d.get("filename"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| pkg.upstream_path.clone());
+    if filename.is_empty() {
+        return AttestationVerdict::unverified();
+    }
+
+    // The package name, version and filename on this row are parsed straight out
+    // of a proxy request path (`normalize_pep503` / `version_from_pypi_filename`)
+    // and are interpolated below into URLs fetched WITH the repository's upstream
+    // credentials. `version_from_pypi_filename` returns whatever sits between the
+    // dashes, so without this gate a distribution named `foo-1.0?x-py3-none-any.whl`
+    // injects a query string and `foo-..-py3-none-any.whl` traverses a path
+    // segment (`Url::parse` normalises `..` away), turning the enrichment fetch
+    // into a credentialed request-forgery primitive against arbitrary paths on an
+    // internal mirror. Reject rather than encode: every value that can legitimately
+    // appear here is already within these character sets (PEP 503 §"Normalized
+    // Names" for the name, PEP 440 §"Appendix: Parsing version strings" for the
+    // version, PEP 427/625 for the distribution filename), so a value outside them
+    // is not a package we can verify anyway.
+    if !is_safe_upstream_path_segment(&pkg.package_name)
+        || !is_safe_upstream_path_segment(&pkg.version)
+        || !is_safe_upstream_path_segment(&filename)
+    {
+        return AttestationVerdict::failure(
+            "attestation lookup skipped: package name, version or filename contains characters that are not valid in a PyPI path segment".to_string(),
+        );
+    }
+
+    // The PyPI base (strip a trailing `/simple[/]` from a simple-index upstream).
+    let base = pypi_base_url(upstream_url);
+
+    // Enrich: fetch the PEP 740 provenance first — it is absent for the
+    // overwhelming majority of distributions, and returning early on that miss
+    // saves the JSON round-trip entirely.
+    let prov_url = format!(
+        "{base}/integrity/{}/{}/{}/provenance",
+        pkg.package_name, pkg.version, filename
+    );
+    let provenance = bounded_get_json(client, upstream_auth, &prov_url).await;
+    let Some(provenance) = provenance else {
+        // No provenance published upstream: exactly today's behavior.
+        return AttestationVerdict::unverified();
+    };
+
+    let json_url = format!("{base}/pypi/{}/{}/json", pkg.package_name, pkg.version);
+    let pypi_json = bounded_get_json(client, upstream_auth, &json_url).await;
+
+    // Build a full entry (dist URL + merged provenance) from whatever we fetched.
+    let entry = pypi_json.as_ref().and_then(|j| {
+        build_pypi_curation_entry(&pkg.package_name, &pkg.version, j, Some(&provenance))
+    });
+    let dist_url = entry
+        .as_ref()
+        .and_then(|e| e.metadata.get("_ak_dist"))
+        .and_then(|d| d.get("url"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let Some(dist_url) = dist_url else {
+        return AttestationVerdict::failure(
+            "could not resolve the distribution download URL for attestation verification"
+                .to_string(),
+        );
+    };
+
+    // `dist_url` is copied verbatim out of the upstream's own JSON document
+    // (`urls[].url`), so a hostile or compromised mirror chooses it. Send the
+    // repository's configured upstream credentials ONLY when it stays on the
+    // configured upstream's origin — same rule as the NuGet remote-search fix
+    // (#3130/#2925). Network-level SSRF is already refused at connect time by the
+    // shared DNS guard; this is specifically about not handing an operator's
+    // Basic/token header to whatever public host the mirror names.
+    let dist_auth = if same_upstream_origin(upstream_url, &dist_url) {
+        upstream_auth.clone()
+    } else {
+        None
+    };
+    let Some(bytes) = bounded_download(client, &dist_auth, &dist_url).await else {
+        return AttestationVerdict::failure(format!(
+            "could not fetch distribution `{filename}` for attestation verification"
+        ));
+    };
+
+    verify_pypi_provenance(&provenance, &bytes, &filename, allowlist, trust).await
+}
+
+/// Characters permitted in a PyPI path segment we build a credentialed upstream
+/// URL from. Covers PEP 503 normalized names (`[a-z0-9-]`), PEP 440 versions
+/// (which add `.`, `_`, `+`, `!`) and PEP 427/625 distribution filenames (which
+/// add nothing else). Everything that could change the shape of the request —
+/// `/`, `?`, `#`, `%`, `:`, `@`, whitespace, control characters — is refused.
+fn is_safe_upstream_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.len() <= 512
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '+' | '!'))
+}
+
+/// True when `resource_url` is on the same host and port as `upstream_url`.
+/// Anything unparseable is treated as a different origin (fail closed).
+fn same_upstream_origin(upstream_url: &str, resource_url: &str) -> bool {
+    match (
+        reqwest::Url::parse(upstream_url),
+        reqwest::Url::parse(resource_url),
+    ) {
+        (Ok(up), Ok(res)) => {
+            up.host_str().map(str::to_ascii_lowercase)
+                == res.host_str().map(str::to_ascii_lowercase)
+                && up.port_or_known_default() == res.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
+/// Normalize a pypi remote's upstream URL to the API base by trimming a trailing
+/// `/simple` (PEP 503 index) and slashes: `https://pypi.org/simple/` →
+/// `https://pypi.org`.
+fn pypi_base_url(upstream_url: &str) -> String {
+    let trimmed = upstream_url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/simple")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Bounded GET of a small JSON body (metadata / provenance). Returns `None` on
+/// any transport error, non-2xx, oversize body, or parse failure (fail-safe).
+async fn bounded_get_json(
+    client: &reqwest::Client,
+    upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    url: &str,
+) -> Option<serde_json::Value> {
+    const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+    let mut req = client.get(url);
+    if let Some(auth) = upstream_auth {
+        req = crate::services::upstream_auth::apply_upstream_auth(req, auth);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if buf.len().saturating_add(chunk.len()) > MAX_JSON_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).ok()
+}
+
+/// Bounded, streaming download of a distribution file for attestation
+/// verification. Returns `None` on any transport error, non-2xx status, or if
+/// the body exceeds [`MAX_VERIFY_DIST_BYTES`] (so a hostile/huge artifact cannot
+/// OOM the sync tick).
+async fn bounded_download(
+    client: &reqwest::Client,
+    upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    url: &str,
+) -> Option<Vec<u8>> {
+    use futures::StreamExt;
+
+    let mut req = client.get(url);
+    if let Some(auth) = upstream_auth {
+        req = crate::services::upstream_auth::apply_upstream_auth(req, auth);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if buf.len().saturating_add(chunk.len()) > MAX_VERIFY_DIST_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
+}
+
 /// Decompress a gzip-compressed upstream repo index (RPM `primary.xml.gz`,
 /// Debian `Packages.gz`) during proxy-sync, bounded by the shared total-byte
 /// budget (#2556) so a malicious/compromised upstream mirror cannot inflate the
@@ -1915,6 +2300,109 @@ fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #2955 — guards on the credentialed attestation-enrichment fetches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safe_path_segment_admits_real_pypi_identifiers() {
+        // Real PEP 503 names, PEP 440 versions and PEP 427/625 filenames must
+        // pass, or the guard silently switches attestation verification off for
+        // legitimate packages — a false negative is as bad as a false positive
+        // here, it just fails quietly instead of loudly.
+        for ok in [
+            "sigstore",
+            "zope-interface",
+            "ruamel-yaml-clib",
+            "4.5.0",
+            "1.0.0rc1",
+            "2!1.0.dev4",
+            "1.0.0+local.1",
+            "0.1.0.post1",
+            "sigstore-4.5.0-py3-none-any.whl",
+            "sigstore-4.5.0.tar.gz",
+            "ruamel.yaml.clib-0.2.8-cp312-cp312-manylinux_2_17_x86_64.whl",
+        ] {
+            assert!(is_safe_upstream_path_segment(ok), "must admit {ok:?}");
+        }
+    }
+
+    #[test]
+    fn safe_path_segment_refuses_anything_that_reshapes_the_request() {
+        // These are reachable: `version_from_pypi_filename` returns whatever sits
+        // between the dashes of a request-path filename, with no charset check,
+        // and the result is interpolated into a URL fetched with the repository's
+        // upstream credentials.
+        for bad in [
+            "",                    // empty segment collapses the path
+            ".",                   // no-op segment
+            "..",                  // `Url::parse` normalises this away — traversal
+            "1.0?x=y",             // query injection
+            "1.0#frag",            // fragment truncation
+            "1.0%2f..%2fadmin",    // encoded traversal
+            "a/b",                 // literal path separator
+            "user:pass@evil.test", // userinfo
+            "1.0 0",               // whitespace
+            "1.0\n",               // control character
+            "1.0\u{0}",            // NUL
+            "café",                // non-ASCII (IDNA/percent-encoding ambiguity)
+        ] {
+            assert!(!is_safe_upstream_path_segment(bad), "must refuse {bad:?}");
+        }
+        // Length bound.
+        assert!(!is_safe_upstream_path_segment(&"a".repeat(513)));
+        assert!(is_safe_upstream_path_segment(&"a".repeat(512)));
+    }
+
+    #[test]
+    fn same_upstream_origin_gates_credentials_to_the_configured_host() {
+        // On-origin: credentials travel (the common case — pypi.org serves its
+        // distributions from files.pythonhosted.org, which is NOT the same origin,
+        // so public PyPI simply gets an unauthenticated download; that is correct).
+        assert!(same_upstream_origin(
+            "https://mirror.internal/simple/",
+            "https://mirror.internal/packages/sigstore-4.5.0-py3-none-any.whl"
+        ));
+        // Scheme-default ports count as equal.
+        assert!(same_upstream_origin(
+            "https://mirror.internal:443/simple/",
+            "https://mirror.internal/x.whl"
+        ));
+        // Host case is not significant.
+        assert!(same_upstream_origin(
+            "https://Mirror.Internal/simple/",
+            "https://mirror.internal/x.whl"
+        ));
+
+        // Off-origin: a hostile mirror naming any other host must not receive the
+        // operator's configured upstream credentials.
+        assert!(!same_upstream_origin(
+            "https://mirror.internal/simple/",
+            "https://attacker.example/x.whl"
+        ));
+        assert!(!same_upstream_origin(
+            "https://mirror.internal/simple/",
+            "https://mirror.internal.attacker.example/x.whl"
+        ));
+        assert!(!same_upstream_origin(
+            "https://mirror.internal/simple/",
+            "https://mirror.internal:8443/x.whl"
+        ));
+        assert!(!same_upstream_origin(
+            "https://pypi.org/simple/",
+            "https://files.pythonhosted.org/packages/x.whl"
+        ));
+        // Unparseable on either side fails closed.
+        assert!(!same_upstream_origin(
+            "not a url",
+            "https://mirror.internal/x"
+        ));
+        assert!(!same_upstream_origin(
+            "https://mirror.internal/",
+            "not a url"
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // #2556 — bounded upstream-index decompression

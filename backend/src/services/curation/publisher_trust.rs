@@ -154,9 +154,16 @@ pub fn evaluate(
         ));
     }
 
-    let signal_label = match publisher.source {
-        PublisherSource::Attestation => "attestation (present, not cryptographically verified)",
-        PublisherSource::Metadata => "self-asserted metadata (unverified)",
+    // #2955: now that verification is real, do not tell an operator that a
+    // cryptographically verified attestation is unverified. Reachable via the
+    // watch-mode (`action: flag`) arm below, which reports the signal for a
+    // trusted publisher.
+    let signal_label = match (publisher.source, publisher.verified) {
+        (PublisherSource::Attestation, true) => "cryptographically verified attestation",
+        (PublisherSource::Attestation, false) => {
+            "attestation (present, not cryptographically verified)"
+        }
+        (PublisherSource::Metadata, _) => "self-asserted metadata (unverified)",
     };
 
     match (action, is_trusted) {
@@ -635,5 +642,80 @@ mod tests {
         let md = json!({"info": {"author": "NumFOCUS"}});
         let d = evaluate(&cfg, "pypi", "pkg", "1.0", &md);
         assert_eq!(d, CurationDecision::Allow);
+    }
+
+    // -- verified attestation path (#2955): the arm that was UNREACHABLE ------
+
+    /// A PyPI blob carrying a SUCCESSFUL verification record for a cert-bound
+    /// owner — the shape the evaluation loop injects after `attestation_verify`
+    /// returns verified. This is what finally makes `verified=true` reachable.
+    fn pypi_verified(owner: &str) -> Value {
+        json!({
+            "info": {"author": "whatever the blob claims"},
+            "_ak_attestation_verification": {
+                "state": "verified",
+                "owner": owner,
+                "issuer": "https://token.actions.githubusercontent.com"
+            }
+        })
+    }
+
+    #[test]
+    fn verified_listed_publisher_is_allowed_under_action_allow() {
+        // The #2955 payoff: a cryptographically verified, listed publisher is
+        // finally ALLOWED under match:attestation — no longer merely flagged.
+        let d = evaluate(
+            &config("attestation", "allow"),
+            "pypi",
+            "numpy",
+            "2.0.0",
+            &pypi_verified("NumFOCUS"),
+        );
+        assert_eq!(d, CurationDecision::Allow);
+    }
+
+    #[test]
+    fn verified_listed_publisher_is_allowed_under_action_block() {
+        let d = evaluate(
+            &config("attestation", "block"),
+            "pypi",
+            "numpy",
+            "2.0.0",
+            &pypi_verified("Microsoft"),
+        );
+        assert_eq!(d, CurationDecision::Allow);
+    }
+
+    #[test]
+    fn verified_but_unlisted_publisher_is_still_untrusted() {
+        // Verification does not launder an UNLISTED publisher onto the allowlist.
+        let d = evaluate(
+            &config("attestation", "block"),
+            "pypi",
+            "some-lib",
+            "1.0.0",
+            &pypi_verified("some-rando-org"),
+        );
+        assert!(
+            matches!(d, CurationDecision::Block(ref r) if r.contains("not in the trusted-publisher list")),
+            "got {d:?}"
+        );
+    }
+
+    #[test]
+    fn verified_listed_publisher_under_action_flag_is_watched() {
+        // Under watch mode a verified listed publisher is flagged (audit), not
+        // the pending-#2955 review reason.
+        let d = evaluate(
+            &config("attestation", "flag"),
+            "pypi",
+            "numpy",
+            "2.0.0",
+            &pypi_verified("NumFOCUS"),
+        );
+        match d {
+            CurationDecision::Flag(reason) => assert!(reason.contains("watch list"), "{reason}"),
+            other => panic!("expected watch Flag, got {other:?}"),
+        }
     }
 }
