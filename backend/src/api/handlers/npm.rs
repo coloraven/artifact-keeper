@@ -761,10 +761,17 @@ fn normalize_package_name(raw: &str) -> String {
 
 /// Validate a decoded npm package name.
 ///
-/// Rejects names with path traversal sequences, null bytes, and names that
-/// violate the npm naming rules (empty, too long, leading dot/underscore,
-/// non-lowercase for unscoped packages). Called after URL decoding to catch
-/// percent-encoded attacks like `%2e%2e%2f`.
+/// Rejects path traversal sequences, null bytes, and names that violate the
+/// handler's existing shape rules (empty, too long, leading dot/underscore).
+/// Called after URL decoding to catch percent-encoded attacks like `%2e%2e%2f`.
+///
+/// This is the shared validator for read *and* write routes, so it deliberately
+/// does **not** reject non-ASCII names: `download_tarball`, `get_metadata` and
+/// the `dist-tags` routes all run through here for local, virtual and remote
+/// repositories, and a name-shape rule applied here would make an already
+/// published package — or a legacy upstream package reached through a remote
+/// repo — permanently unreadable. The ASCII rule belongs to the publish
+/// boundary only; see [`assert_publishable_package_name`].
 #[allow(clippy::result_large_err)]
 fn validate_package_name(name: &str) -> Result<(), Response> {
     if name.is_empty() {
@@ -813,6 +820,46 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
         ));
     }
     Ok(())
+}
+
+/// Publish-only name rule: a *new* npm package name must be ASCII.
+///
+/// npm's own `validate-npm-package-name` rejects names containing characters
+/// outside its URL-safe set for new packages while grandfathering names that
+/// predate the rule, so this is applied at the write boundary and nowhere else.
+/// Enforcing it here — rather than inside [`validate_package_name`] — keeps
+/// homoglyph impersonation such as `nｕmpy` from being created without making
+/// existing or upstream-proxied packages unreadable (#3007).
+#[allow(clippy::result_large_err)]
+fn assert_publishable_package_name(name: &str) -> Result<(), Response> {
+    if !name.is_ascii() {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name must contain only ASCII characters",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_publish_package_name(raw: &str) -> Result<String, Response> {
+    let package = normalize_package_name(raw);
+    validate_package_name(&package)?;
+    assert_publishable_package_name(&package)?;
+    Ok(package)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_scoped_publish_package_name(
+    raw_scope: &str,
+    raw_package: &str,
+) -> Result<String, Response> {
+    let scope = normalize_package_name(raw_scope);
+    let package = normalize_package_name(raw_package);
+    let full_name = build_scoped_package_name(&scope, &package);
+    validate_package_name(&full_name)?;
+    assert_publishable_package_name(&full_name)?;
+    Ok(full_name)
 }
 
 fn map_status(status: StatusCode, msg: &str) -> Response {
@@ -3682,8 +3729,7 @@ async fn publish(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let package = normalize_package_name(&package);
-    validate_package_name(&package)?;
+    let package = validate_publish_package_name(&package)?;
     publish_package(&state, auth, &repo_key, &package, &headers, body).await
 }
 
@@ -3694,10 +3740,7 @@ async fn publish_scoped(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let scope = normalize_package_name(&scope);
-    let package = normalize_package_name(&package);
-    let full_name = build_scoped_package_name(&scope, &package);
-    validate_package_name(&full_name)?;
+    let full_name = validate_scoped_publish_package_name(&scope, &package)?;
     publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
 }
 
@@ -6210,9 +6253,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_npm_package_name_uppercase_rejected() {
-        // The handler-level validator does not enforce lowercase; callers
-        // normalise case before storage (see NPM_NAME_PATTERN docs).
+    fn test_validate_npm_package_name_uppercase_accepted() {
+        // Preserve the hosted publish handler's existing ASCII compatibility;
+        // the stricter proxy-path validator separately enforces lowercase.
         assert!(validate_package_name("MyPackage").is_ok());
     }
 
@@ -6225,6 +6268,93 @@ mod tests {
     fn test_validate_npm_package_name_max_length() {
         let name = "a".repeat(214);
         assert!(validate_package_name(&name).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_publish_unscoped_non_ascii_names_rejected() {
+        for raw_name in ["nｕmpy", "n%EF%BD%95mpy"] {
+            let response = validate_publish_package_name(raw_name).unwrap_err();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{raw_name}");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "error": "Package name must contain only ASCII characters"
+                }),
+                "{raw_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_scoped_non_ascii_names_rejected() {
+        for (raw_scope, raw_package) in [
+            ("ｓcope", "package"),
+            ("%EF%BD%93cope", "package"),
+            ("scope", "pａckage"),
+            ("scope", "p%EF%BD%81ckage"),
+        ] {
+            let response =
+                validate_scoped_publish_package_name(raw_scope, raw_package).unwrap_err();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{raw_scope}/{raw_package}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "error": "Package name must contain only ASCII characters"
+                }),
+                "{raw_scope}/{raw_package}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_publish_ascii_names_accepted() {
+        assert_eq!(
+            validate_publish_package_name("MyPackage").unwrap(),
+            "MyPackage"
+        );
+        assert_eq!(
+            validate_scoped_publish_package_name("Scope", "Package").unwrap(),
+            "@Scope/Package"
+        );
+    }
+
+    /// The ASCII rule is a *publish* rule. `validate_package_name` is the shared
+    /// validator behind `get_metadata`, `download_tarball` and the `dist-tags`
+    /// routes for local, virtual and remote repositories, so putting the rule
+    /// there would 400 every read of an already published package and every
+    /// proxied pull of a legacy upstream name. This is the guard against that
+    /// regression: if someone moves the `is_ascii` check back into the shared
+    /// validator, this test fails (#3007).
+    #[test]
+    fn test_non_ascii_names_remain_readable_on_the_shared_validator() {
+        for name in ["nｕmpy", "@ｓcope/package", "@scope/pａckage", "日本語"] {
+            assert!(
+                validate_package_name(name).is_ok(),
+                "read path must still resolve {name}; the ASCII rule is publish-only"
+            );
+        }
+    }
+
+    /// Positive control for the test above: the same names the read path
+    /// accepts must still be rejected at the publish boundary. Without this,
+    /// deleting the publish-side check would leave the pair passing.
+    #[test]
+    fn test_same_names_are_still_blocked_at_publish() {
+        assert!(validate_publish_package_name("nｕmpy").is_err());
+        assert!(validate_scoped_publish_package_name("ｓcope", "package").is_err());
+        assert!(validate_scoped_publish_package_name("scope", "pａckage").is_err());
     }
 
     // -----------------------------------------------------------------------
