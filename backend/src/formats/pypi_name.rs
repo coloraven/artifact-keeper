@@ -93,6 +93,19 @@ static PEP508_NAME_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("PEP 508 name pattern is a valid regex")
 });
 
+/// The PEP 508 *Names* pattern in the spec's own `^`/`$` spelling, for putting
+/// in an error message a publisher will read (#3198).
+///
+/// Spelled out separately from [`PEP508_NAME_RE`] rather than derived from it,
+/// because the two are answering different questions: the regex is anchored
+/// with `\A`/`\z` to close the trailing-newline hole Rust's `$` opens, which is
+/// an implementation detail of *this* engine and would only confuse someone
+/// comparing the message against PEP 508. The character class and the
+/// alternation -- the parts a publisher has to satisfy -- are identical, and
+/// `tests::message_pattern_matches_the_enforced_regex` asserts they stay that
+/// way, so the message cannot drift from what is actually enforced.
+pub const PEP508_NAME_PATTERN: &str = r"^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$";
+
 /// Does `name` satisfy the PEP 508 project-name pattern?
 ///
 /// This is the *unnormalized* check: `Django`, `zope.interface` and
@@ -414,6 +427,94 @@ mod tests {
             let parsed = NormalizedProjectName::parse(name)
                 .unwrap_or_else(|| panic!("single character {name:?} must be valid"));
             assert_eq!(parsed.as_str(), name.to_ascii_lowercase());
+        }
+    }
+
+    /// Scopes the migration question #3198 raises: which names can a
+    /// deployment that ran the *unvalidated* upload path already be holding?
+    ///
+    /// The answer is narrower than it looks, and this pins it. Whatever
+    /// `PypiHandler::normalize_name` is handed, its output draws only on
+    /// `[a-z0-9-]`, it cannot begin with `-` (separators before the first
+    /// alphanumeric are skipped), and it cannot end with one (runs collapse and
+    /// the single trailing hyphen is popped). So every name it ever stored is
+    /// either a valid PEP 508 name or the EMPTY string.
+    ///
+    /// Two consequences, both stated in the PR:
+    ///
+    /// * The rows that are genuinely unreachable after #3196 are exactly the
+    ///   empty-named ones, so an operator's audit query is a cheap `name = ''`
+    ///   rather than a regex scan.
+    /// * The other invalid uploads are not unreachable, they are *misfiled* --
+    ///   sitting in some other, valid project's namespace. That is the case
+    ///   this change actually prevents, and it is why the fix is not a rename:
+    ///   a server-side rename would have to guess which project those bytes
+    ///   were meant for.
+    #[test]
+    fn legacy_upload_coercion_only_ever_produced_valid_or_empty_names() {
+        let mut saw_empty = false;
+        for name in invalid_names().into_iter().chain(valid_names()) {
+            let coerced = PypiHandler::normalize_name(name);
+            if coerced.is_empty() {
+                saw_empty = true;
+                continue;
+            }
+            assert!(
+                is_valid_project_name(&coerced),
+                "the legacy upload coercion turned {name:?} into {coerced:?}, which is \
+                 neither empty nor a valid PEP 508 name -- the migration scope in #3198 \
+                 is wider than documented"
+            );
+        }
+        assert!(
+            saw_empty,
+            "no input coerced to the empty string, so the empty case above was never \
+             exercised and the 'valid or empty' claim is only half tested"
+        );
+    }
+
+    /// The pattern shown to a rejected publisher (#3198) must be the pattern
+    /// actually enforced, differing only in the anchors.
+    ///
+    /// An error message that tells someone how to spell a name is useless --
+    /// worse than useless -- if it drifts from the check. Comparing the two
+    /// with the anchors normalized away catches a change to one that is not
+    /// made to the other, which is the realistic failure.
+    #[test]
+    fn message_pattern_matches_the_enforced_regex() {
+        let enforced = PEP508_NAME_RE
+            .as_str()
+            .trim_start_matches(r"\A")
+            .trim_end_matches(r"\z");
+        let advertised = PEP508_NAME_PATTERN
+            .trim_start_matches('^')
+            .trim_end_matches('$');
+        assert_eq!(
+            enforced, advertised,
+            "the PEP 508 pattern in the error message has drifted from the one enforced"
+        );
+
+        // And the advertised spelling must itself be a regex that accepts and
+        // rejects the same names, so the message is something a publisher can
+        // actually test their name against.
+        let advertised_re = Regex::new(PEP508_NAME_PATTERN).expect("advertised pattern compiles");
+        for name in valid_names() {
+            assert!(
+                advertised_re.is_match(name),
+                "advertised pattern rejects the valid name {name:?}"
+            );
+        }
+        for name in invalid_names() {
+            // `$` in Rust's regex also matches before a trailing newline, which
+            // is the one case where the advertised spelling is deliberately
+            // laxer than the enforced one. Everything else must agree.
+            if name.ends_with('\n') {
+                continue;
+            }
+            assert!(
+                !advertised_re.is_match(name),
+                "advertised pattern accepts the invalid name {name:?}"
+            );
         }
     }
 }
