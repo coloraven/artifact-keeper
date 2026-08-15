@@ -1815,12 +1815,21 @@ fn is_write_method(method: &Method) -> bool {
 ///   a Basic→JWT credential exchange, not a write. The handler requires a valid
 ///   credential and mints a scope-ceilinged token; no repository `write` is
 ///   needed or implied.
+/// * **VS Code gallery query** — `POST /vscode/<repo_key>/gallery/extensionquery`
+///   is a metadata search protocol request. It neither uploads nor changes AK
+///   state, and a public gallery must permit it anonymously for VSCodium and
+///   code-server to search extensions.
 ///
-/// The `#508` write-auth requirement (writes require authentication; anonymous
-/// callers get 401) still applies to these paths independently, so this
-/// exemption never loosens the anonymous contract — it only routes the
-/// *authenticated* caller through the read/visibility path instead of the
-/// deny-by-default write choke-point.
+/// These paths are classified as reads for the *permission* check only. The
+/// `#508` write-auth requirement (writes require authentication; anonymous
+/// callers get 401) still applies to them independently, so this exemption
+/// never loosens the anonymous contract — it only routes the *authenticated*
+/// caller through the read/visibility path instead of the deny-by-default
+/// write choke-point.
+///
+/// The narrower question "may an ANONYMOUS caller issue this POST against a
+/// public repository?" is answered by [`is_anonymous_readable_format_post`],
+/// which is deliberately a strict subset.
 fn is_non_mutating_format_post(path: &str) -> bool {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
@@ -1838,6 +1847,44 @@ fn is_non_mutating_format_post(path: &str) -> bool {
                 && segments.next() == Some("v2")
                 && segments.next() == Some("users")
                 && segments.next() == Some("authenticate")
+                && segments.next().is_none()
+        }
+        // /vscode/<repo_key>/gallery/extensionquery
+        Some("vscode") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("gallery")
+                && segments.next() == Some("extensionquery")
+                && segments.next().is_none()
+        }
+        _ => false,
+    }
+}
+
+/// The strict subset of [`is_non_mutating_format_post`] that a **public**
+/// repository must also serve to an **anonymous** caller, i.e. the paths that
+/// are exempt from the `#508` anonymous-write 401.
+///
+/// * **VS Code gallery query** — `POST /vscode/<repo_key>/gallery/extensionquery`
+///   is the gallery protocol's *search* verb. VSCodium and code-server issue it
+///   with no credential (the client has no way to configure one for a gallery),
+///   so a public Remote gallery is unusable without this. It neither uploads nor
+///   changes AK state, and the handler is public-Remote-only regardless.
+///
+/// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
+/// here. `batch` is an upload *and* download negotiation whose upload arm mints
+/// object hrefs, and `authenticate` is a credential exchange that requires a
+/// credential to be useful; both keep the `#508` contract of answering 401 to an
+/// anonymous caller. Widening that is a separate decision from shipping a
+/// gallery, and would need its own tests.
+fn is_anonymous_readable_format_post(path: &str) -> bool {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    let mut segments = trimmed.split('/');
+    match segments.next() {
+        // /vscode/<repo_key>/gallery/extensionquery
+        Some("vscode") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("gallery")
+                && segments.next() == Some("extensionquery")
                 && segments.next().is_none()
         }
         _ => false,
@@ -2161,7 +2208,16 @@ pub async fn repo_visibility_middleware(
     };
 
     let is_public = repo.is_public;
-    let is_write = is_write_method(request.method());
+    // The VS Code gallery query is a protocol-mandated POST that is purely a
+    // metadata search, so it must be reachable anonymously on a public repo.
+    // Only that strict subset skips the #508 anonymous-write gate: git-lfs
+    // batch and conan authenticate stay write-gated for anonymous callers
+    // exactly as before, and are exempted only from the *permission* check
+    // further down (`non_mutating_post`).
+    let non_mutating_post = is_non_mutating_format_post(&path);
+    let anonymous_readable_post =
+        request.method() == Method::POST && is_anonymous_readable_format_post(&path);
+    let is_write = is_write_method(request.method()) && !anonymous_readable_post;
 
     // Perform optional auth (shared with optional_auth_middleware). Conda
     // token channels carry the credential in the URL path, so fall back to it
@@ -2250,7 +2306,6 @@ pub async fn repo_visibility_middleware(
             // download negotiation / token exchange. The #508 write-auth gate
             // above (401 for anonymous) is unaffected, and actual LFS uploads
             // remain write-gated by the batch handler and the object-PUT path.
-            let non_mutating_post = is_non_mutating_format_post(&path);
             let action = if non_mutating_post {
                 "read"
             } else {
@@ -3825,6 +3880,19 @@ mod tests {
     #[test]
     fn test_non_mutating_lfs_batch_is_exempt() {
         assert!(is_non_mutating_format_post("/lfs/myrepo/objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_vscode_gallery_query_is_exempt() {
+        assert!(is_non_mutating_format_post(
+            "/vscode/openvsx/gallery/extensionquery"
+        ));
+        assert!(!is_non_mutating_format_post(
+            "/vscode/openvsx/api/extensions"
+        ));
+        assert!(!is_non_mutating_format_post(
+            "/vscode/openvsx/gallery/extensionquery/trailing"
+        ));
     }
 
     #[test]
@@ -6505,6 +6573,135 @@ mod tests {
         let req = axum::http::Request::builder()
             .method(Method::POST)
             .uri("/pypi/myrepo/upload")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_vscode_gallery_query_no_auth_passes() {
+        // The VS Code gallery protocol requires a POST search. It is metadata
+        // only, so a public Remote must expose it anonymously just like a GET
+        // index endpoint; real uploads and publish routes remain write-gated.
+        let key = "openvsx";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/vscode/openvsx/gallery/extensionquery")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_private_vscode_gallery_query_no_auth_returns_401() {
+        let key = "private-openvsx";
+        let cached = make_cached_repo(/* is_public */ false);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/vscode/private-openvsx/gallery/extensionquery")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_lfs_batch_no_auth_still_returns_401() {
+        // Regression guard for the #508 anonymous-write contract. The gallery
+        // exemption must be a strict subset of `is_non_mutating_format_post`:
+        // widening `is_write` by that whole predicate would ALSO let an
+        // anonymous caller reach the git-lfs batch negotiation (whose upload
+        // arm mints object hrefs) on any public repository. `batch` is exempt
+        // from the *permission* check only, never from the anonymous 401.
+        let key = "publfs";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/lfs/publfs/objects/batch")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_conan_authenticate_no_auth_still_returns_401() {
+        // Same contract for the other `is_non_mutating_format_post` member: a
+        // credential exchange presented with no credential is a 401 from the
+        // middleware, not a pass-through to the handler.
+        let key = "pubconan";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/conan/pubconan/v2/users/authenticate")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_anonymous_readable_format_post_is_a_strict_subset() {
+        // Positive: the gallery query is anonymously readable AND non-mutating.
+        assert!(is_anonymous_readable_format_post(
+            "/vscode/openvsx/gallery/extensionquery"
+        ));
+        assert!(is_non_mutating_format_post(
+            "/vscode/openvsx/gallery/extensionquery"
+        ));
+        // Strict subset: these are non-mutating for the permission check but
+        // NOT anonymously readable.
+        for path in [
+            "/lfs/myrepo/objects/batch",
+            "/conan/myrepo/v2/users/authenticate",
+        ] {
+            assert!(is_non_mutating_format_post(path), "{path}");
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+        }
+        // Neither, for the publish route and near-miss shapes.
+        for path in [
+            "/vscode/openvsx/api/extensions",
+            "/vscode/openvsx/gallery/extensionquery/trailing",
+            "/vscode//gallery/extensionquery",
+            "//vscode/openvsx/gallery/extensionquery",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_vscode_gallery_non_post_writes_require_auth() {
+        let key = "openvsx";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        for method in [Method::PUT, Method::PATCH, Method::DELETE] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri("/vscode/openvsx/gallery/extensionquery")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_vscode_publish_no_auth_returns_401() {
+        // Keep the narrow metadata-search exception from becoming a broad
+        // `/vscode/...` POST exception as publish support is added later.
+        let key = "openvsx";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/vscode/openvsx/api/extensions")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_visibility(state, req).await;

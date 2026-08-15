@@ -740,6 +740,69 @@ pub async fn proxy_fetch_capped_budgeted(
     Ok((content, content_type, permit))
 }
 
+/// POST a JSON metadata request without using the proxy cache, while reserving
+/// the caller-declared whole-request working set against the shared
+/// buffered-metadata budget. Protocols such as the VS Code gallery key
+/// discovery and paging in a POST body, so caching them under a URL-only key
+/// would be incorrect.
+#[derive(Clone, Copy)]
+pub struct MetadataWorkingSetLimits {
+    pub max_bytes: usize,
+    pub reservation_bytes: usize,
+}
+
+/// Outcome of a capped buffered-metadata POST, keeping the byte-ceiling abort
+/// distinguishable from every other upstream failure.
+///
+/// The ceiling abort is a statement about the *shape* of what upstream would
+/// have sent, not a fault: a caller that can re-ask for a bounded projection of
+/// the same query must be able to act on it. Handing that caller an
+/// already-rendered error `Response` forces it to re-derive the cause by
+/// inspecting a status code or body, which silently reclassifies a genuine
+/// upstream 404/503 as "too large". Every other failure therefore stays a
+/// rendered `Response` so those semantics cannot drift.
+pub enum CappedMetadataPost {
+    Buffered {
+        content: Bytes,
+        content_type: Option<String>,
+        budget_permit: OwnedSemaphorePermit,
+    },
+    /// Upstream exceeded `limits.max_bytes`; nothing past the ceiling was ever
+    /// buffered, and no truncated body is returned.
+    OverCap,
+}
+
+pub async fn proxy_post_json_uncached_capped_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    body: Bytes,
+    limits: MetadataWorkingSetLimits,
+) -> Result<CappedMetadataPost, Response> {
+    // Some callers parse and reserialize the buffered response before sending
+    // it on. Reserve their declared whole-request working-set allowance, not
+    // merely the wire cap, so the shared budget remains a real resident-memory
+    // bound under concurrent adversarial requests.
+    let budget_permit = proxy_metadata_budget()
+        .reserve(limits.reservation_bytes.max(limits.max_bytes))
+        .await;
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    match proxy_service
+        .post_json_uncached_capped(&repo, path, body, limits.max_bytes)
+        .await
+    {
+        Ok((content, content_type)) => Ok(CappedMetadataPost::Buffered {
+            content,
+            content_type,
+            budget_permit,
+        }),
+        Err(error) if is_over_cap_error(&error) => Ok(CappedMetadataPost::OverCap),
+        Err(error) => Err(map_proxy_error(repo_key, path, error)),
+    }
+}
+
 /// As [`proxy_fetch_capped_budgeted`], but also reports the upstream
 /// `Content-Encoding` for handlers that forward the buffered bytes to the client
 /// and must declare the coding — see
@@ -5706,8 +5769,8 @@ pub(crate) fn age_gate_repo_type_from_str(
 
 /// Map a `repositories.format` string onto the age-gate format alias space:
 /// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
-/// Go gates as Go, and everything else as `Generic` (not in the enforceable
-/// matrix).
+/// Go gates as Go, VS Code gates as VS Code, and everything else as `Generic`
+/// (not in the enforceable matrix).
 pub(crate) fn age_gate_format_from_str(
     format: &str,
 ) -> crate::models::repository::RepositoryFormat {
@@ -5716,6 +5779,7 @@ pub(crate) fn age_gate_format_from_str(
         "npm" => RepositoryFormat::Npm,
         "pypi" => RepositoryFormat::Pypi,
         "go" => RepositoryFormat::Go,
+        "vscode" => RepositoryFormat::Vscode,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
@@ -14114,6 +14178,7 @@ mod tests {
 
         assert_eq!(age_gate_format_from_str("go"), RepositoryFormat::Go);
         assert_eq!(age_gate_format_from_str("GO"), RepositoryFormat::Go);
+        assert_eq!(age_gate_format_from_str("vscode"), RepositoryFormat::Vscode);
         assert_eq!(
             age_gate_format_from_str("unsupported"),
             RepositoryFormat::Generic
