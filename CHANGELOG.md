@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Unrecognised scanner severity tokens now classify as `high` instead of `info`, so ungraded findings fail closed at severity gates (#3306). This applies to every scanner adapter (Trivy/Grype/Harbor image reports, filesystem scans, OpenSCAP), covering tokens such as Trivy's `UNKNOWN`, XCCDF's `unknown`, and any vendor-specific grade the classifier does not recognise. Explicitly graded tokens are unchanged, `negligible` (a recognised distro triage grade) stays at `info`, and the OSV/GHSA advisory-ingestion fallback remains independently at `medium`. Note this is deliberately stronger than the `medium` originally proposed on #3306: a `max_severity='high'` policy blocks only `critical` and `high`, so a `medium`-bucketed ungraded finding would still have been served under the default posture.
+
 ### Added
 
 - **`auth.admin_break_glass_enabled` in `GET /api/v1/system/config`** (#2571). The public system-config endpoint now advertises whether the verified-admin break-glass local login is available, mirroring `local_login_gate` for an admin caller: `true` unless an SSO provider is enabled *and* the operator opted into strict SSO-only via `SSO_DISABLE_ADMIN_BREAK_GLASS` (#2018). This is the backend flag the login UI needs to render a discoverable "Sign in with admin" button next to the SSO buttons instead of hiding break-glass behind the undocumented `?fallback=local` parameter. Display-only: the login endpoint keeps enforcing the same policy server-side, so the flag never widens access. The existing `local_login_enabled` flag is unchanged and still only advertises the full local form on explicit `ALLOW_LOCAL_ADMIN_LOGIN=true` opt-in.
@@ -32,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Remote NuGet/Chocolatey metadata caching survives large OData queries** (#3291). A Chocolatey `choco search` sends OData queries whose sanitized cache segment exceeded the 255-byte filesystem component limit, so every sidecar write failed with `File name too long (os error 36)`, the entry was treated as a permanent cache miss, and each search/list re-queried upstream. Segments over 200 bytes are now truncated and suffixed with a SHA-256 prefix of the raw query — deterministic, collision-safe, and inside every filesystem's component limit — while shorter segments keep their exact historical keys so existing cache entries stay hits.
 
 - **Artifactory source connections ping deployments fronted by the JFrog Platform router** (#2847). The migration connection test probed only the classic `{base}/api/system/ping`, which JFrog Cloud and self-hosted platform installs answer with `404 page not found`; those instances expose the Access service's ping at `{platform_root}/access/api/v1/system/ping` instead. The ping now falls back through the Access-service shapes (with a trailing `/artifactory` context stripped for the platform-root candidate) and reports reachable on the first success, so dry-run imports no longer fail at the connection test.
+
+### Upgrade note — security grades drop and severity gates tighten in volume on the next rescan
+
+Ungraded findings previously landed at `info`, which is in no `max_severity` block set, carries zero penalty weight, and is invisible to promotion severity counts — so they affected nothing. After this change each ungraded finding is filed at `high`: it now counts against `scan_policies.max_severity` thresholds of `high`, `medium`, and `low`, contributes `high`-level weight to repository security scores, and is counted by promotion rules that read high-severity counts.
+
+Expect this to move **in volume** on the first rescan, not at the margin. In particular, OpenSCAP: XCCDF's default rule severity is `unknown`, and the bundled wrapper emits the literal `unknown` for any rule that declares no severity — on a typical SCAP profile that is **most reported rules**. Repositories with OpenSCAP findings should expect their security grade to drop by one or more bands and, if a `max_severity` policy of `high` or stricter is enabled, downloads/promotions of affected artifacts to start being blocked. Trivy image scans with `UNKNOWN`-severity CVEs move the same way at smaller volume. To triage, acknowledge individual findings (acknowledged findings are excluded from the gate) or grade the rules in your SCAP content; do not widen the policy threshold past `high` unless you intend to stop blocking known-high findings too.
 
 ## [1.7.5] - 2026-08-14
 
