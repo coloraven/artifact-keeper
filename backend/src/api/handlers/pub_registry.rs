@@ -87,6 +87,7 @@ async fn resolve_pub_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 
 async fn package_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name)): Path<(String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -137,7 +138,11 @@ async fn package_info(
 
         // Virtual repo: resolve through members in priority order
         if repo.repo_type == RepositoryType::Virtual {
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            // Caller-authorized member walk (#3323): versions, sha256 digests
+            // and the pubspec are content.
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await?;
             for member in &members {
                 match member.repo_type {
                     RepositoryType::Local | RepositoryType::Staging => {
@@ -258,6 +263,7 @@ async fn package_info(
 
 async fn version_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -308,7 +314,10 @@ async fn version_info(
 
             // Virtual repo: resolve through members in priority order
             if repo.repo_type == RepositoryType::Virtual {
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                // Caller-authorized member walk (#3323).
+                let members =
+                    proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                        .await?;
                 for member in &members {
                     match member.repo_type {
                         RepositoryType::Local | RepositoryType::Staging => {
@@ -1849,6 +1858,11 @@ dev_dependencies:
         .execute(&fx.pool)
         .await
         .expect("add member");
+        // The member is PRIVATE and this fixture probes ANONYMOUSLY, so publish
+        // it (#3323): a virtual repo now resolves only the members the caller
+        // may read directly, and the subject here is member resolution, not
+        // authorization.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
 
         // Also grant access to virtual repo for the fixture user
         tdh::grant_repo_access(&fx.pool, virtual_id, fx.user_id).await;
@@ -1948,6 +1962,11 @@ dev_dependencies:
         .execute(&fx.pool)
         .await
         .expect("add member");
+        // The member is PRIVATE and this fixture probes ANONYMOUSLY, so publish
+        // it (#3323): a virtual repo now resolves only the members the caller
+        // may read directly, and the subject here is member resolution, not
+        // authorization.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
 
         tdh::grant_repo_access(&fx.pool, virtual_id, fx.user_id).await;
 
