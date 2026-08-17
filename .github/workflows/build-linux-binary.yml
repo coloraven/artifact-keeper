@@ -44,10 +44,11 @@ jobs:
       - name: Install build dependencies
         run: |
           set -eux
+          # UBI ships curl-minimal; do not install full `curl` (conflicts).
           dnf install -y --nodocs \
             gcc gcc-c++ make pkg-config perl-core \
             openssl-devel zlib-devel xz-devel bzip2-devel \
-            unzip curl ca-certificates git
+            unzip ca-certificates git
           ARCH=$(uname -m)
           case "$ARCH" in
             x86_64) PROTOC_ARCH="linux-x86_64" ;;
