@@ -1,20 +1,32 @@
-# Ad-hoc Linux amd64 binary for ferry-ingest deploy / 联调.
-# Trigger via workflow_dispatch (or push to feat/ferry-ingest).
+# Build release binaries for deploy into UBI9 backend containers (deploy-host).
+#
+# IMPORTANT: Do NOT build on bare ubuntu-latest — that links against glibc 2.39+
+# and will fail at runtime on RHEL/UBI 9 (glibc ~2.34) with:
+#   /lib64/libc.so.6: version `GLIBC_2.38' not found
+# Build inside ubi9/ubi:9.8 to match docker/Dockerfile.backend runtime.
+#
+# Triggers: manual dispatch, or push to feat/** / fix/** branches.
+# Download artifacts via local proxy: HTTPS_PROXY=http://127.0.0.1:10811
 
-name: Build Linux Binary (ferry)
+name: Build Release Binaries
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - feat/ferry-ingest
+      - "feat/**"
+      - "fix/**"
+    paths-ignore:
+      - "**/*.md"
+      - "site/**"
+      - ".beads/**"
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: build-linux-binary-${{ github.ref }}
+  group: build-binaries-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -23,37 +35,61 @@ env:
 
 jobs:
   build-linux-amd64:
-    name: artifact-keeper linux-amd64
+    name: artifact-keeper linux-amd64 (ubi9)
     runs-on: ubuntu-latest
+    container:
+      image: registry.access.redhat.com/ubi9/ubi:9.8
     timeout-minutes: 120
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+          set -eux
+          dnf install -y --nodocs \
+            gcc gcc-c++ make pkg-config perl-core \
+            openssl-devel zlib-devel xz-devel bzip2-devel \
+            unzip curl ca-certificates git
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) PROTOC_ARCH="linux-x86_64" ;;
+            aarch64) PROTOC_ARCH="linux-aarch_64" ;;
+            *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+          esac
+          curl -fsSL \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip" \
+            -o /tmp/protoc.zip
+          unzip -q /tmp/protoc.zip -d /usr/local
+          rm /tmp/protoc.zip
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ferry-linux-amd64
+          key: linux-amd64-ubi9
 
       - name: Build release binary
-        run: cargo build --release -p artifact-keeper-backend --bin artifact-keeper --features vendored-openssl
+        run: |
+          set -eux
+          source "$HOME/.cargo/env"
+          # Match docker/Dockerfile.backend (system OpenSSL on UBI9).
+          cargo build --release -p artifact-keeper-backend --bin artifact-keeper
 
       - name: Package
         run: |
+          set -eux
           mkdir -p dist
           cp target/release/artifact-keeper dist/artifact-keeper-linux-amd64
           chmod +x dist/artifact-keeper-linux-amd64
           cd dist
           tar -czvf artifact-keeper-linux-amd64.tar.gz artifact-keeper-linux-amd64
-          sha256sum artifact-keeper-linux-amd64.tar.gz > artifact-keeper-linux-amd64.tar.gz.sha256
+          sha256sum artifact-keeper-linux-amd64.tar.gz \
+            > artifact-keeper-linux-amd64.tar.gz.sha256
+          sha256sum artifact-keeper-linux-amd64 \
+            > artifact-keeper-linux-amd64.sha256
           ls -lh
 
       - name: Upload artifact
@@ -64,5 +100,6 @@ jobs:
             dist/artifact-keeper-linux-amd64
             dist/artifact-keeper-linux-amd64.tar.gz
             dist/artifact-keeper-linux-amd64.tar.gz.sha256
+            dist/artifact-keeper-linux-amd64.sha256
           if-no-files-found: error
           retention-days: 14
