@@ -755,6 +755,8 @@ pub fn router() -> Router<SharedState> {
         // Email subscription routes nested under repository (#920 replacement
         // for the deleted /notifications email channel)
         .merge(super::email_subscriptions::router())
+        // Air-gap ferry zip ingest (ak artifact push --from-archive)
+        .merge(super::ferry::router())
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -7872,6 +7874,16 @@ async fn persist_generic_staged_upload(
         .map_err(|e| e.into_response())?;
     // Scratch file no longer needed once the service has consumed the stream.
     drop(staged);
+
+    // Air-gap ferry: unpack ak-ferry/*.zip into protocol artifacts asynchronously.
+    if crate::services::ferry_ingest_service::is_ferry_archive_path(&path) {
+        crate::services::ferry_ingest_service::spawn_ingest(
+            state.clone(),
+            repo.id,
+            artifact.id,
+            auth.user_id,
+        );
+    }
 
     let downloads = artifact_service
         .get_download_stats(artifact.id)

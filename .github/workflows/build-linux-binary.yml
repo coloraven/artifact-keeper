@@ -1,0 +1,68 @@
+# Ad-hoc Linux amd64 binary for ferry-ingest deploy / 联调.
+# Trigger via workflow_dispatch (or push to feat/ferry-ingest).
+
+name: Build Linux Binary (ferry)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/ferry-ingest
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: build-linux-binary-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+jobs:
+  build-linux-amd64:
+    name: artifact-keeper linux-amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ferry-linux-amd64
+
+      - name: Build release binary
+        run: cargo build --release -p artifact-keeper-backend --bin artifact-keeper --features vendored-openssl
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/artifact-keeper dist/artifact-keeper-linux-amd64
+          chmod +x dist/artifact-keeper-linux-amd64
+          cd dist
+          tar -czvf artifact-keeper-linux-amd64.tar.gz artifact-keeper-linux-amd64
+          sha256sum artifact-keeper-linux-amd64.tar.gz > artifact-keeper-linux-amd64.tar.gz.sha256
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-keeper-linux-amd64
+          path: |
+            dist/artifact-keeper-linux-amd64
+            dist/artifact-keeper-linux-amd64.tar.gz
+            dist/artifact-keeper-linux-amd64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14

@@ -1446,6 +1446,20 @@ async fn upload_zip(
     .execute(&state.db)
     .await;
 
+    // Populate packages / package_versions for catalog export (ak download catalog).
+    let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
+    pkg_svc
+        .try_create_or_update_from_artifact(
+            repo.id,
+            module,
+            version,
+            size_bytes,
+            &checksum,
+            None,
+            Some(serde_json::json!({ "format": "go" })),
+        )
+        .await;
+
     info!("Go module upload: {}@{} (zip)", module, version);
 
     Ok(Response::builder()

@@ -233,6 +233,7 @@ pub mod debian;
 pub mod dependency_track;
 pub mod email_subscriptions;
 pub mod events;
+pub mod ferry;
 pub mod general;
 pub mod gitlfs;
 pub mod goproxy;
