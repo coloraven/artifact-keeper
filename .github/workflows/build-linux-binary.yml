@@ -67,11 +67,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: linux-amd64-ubi9
-
       - name: Build release binary
         run: |
           set -eux
