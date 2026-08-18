@@ -1132,6 +1132,59 @@ enum StoreOutcome {
     Skipped,
 }
 
+/// Live artifact at a coordinate: same checksum → skip (resume); different → 409.
+fn live_checksum_store_outcome(
+    existing_checksum: Option<&str>,
+    new_checksum: &str,
+) -> Result<Option<StoreOutcome>> {
+    match existing_checksum {
+        None => Ok(None),
+        Some(checksum) if checksum.eq_ignore_ascii_case(new_checksum) => {
+            Ok(Some(StoreOutcome::Skipped))
+        }
+        Some(_) => Err(AppError::Conflict(
+            "Artifact version already exists and is immutable".to_string(),
+        )),
+    }
+}
+
+async fn live_artifact_checksum(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    path: &str,
+) -> Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
+async fn live_go_file_checksum(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    module: &str,
+    version: &str,
+    path_like: &str,
+) -> Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 AND name = $2 AND version = $3 \
+           AND path LIKE $4 AND is_deleted = false",
+    )
+    .bind(repository_id)
+    .bind(module)
+    .bind(version)
+    .bind(path_like)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
 fn pick_go_zip_file<'a>(module: &'a ModuleEntry, ca_layout: bool) -> Result<&'a FileEntry> {
     if let Some(f) = module
         .files
@@ -1221,25 +1274,27 @@ async fn store_go_zip(
     path: &Path,
     user_id: Uuid,
 ) -> Result<StoreOutcome> {
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE '%.zip' AND is_deleted = false",
-    )
-    .bind(repo.id)
-    .bind(module)
-    .bind(version)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    if existing.is_some() {
-        return Ok(StoreOutcome::Skipped);
-    }
-
     let artifact_path = build_go_zip_artifact_path(module, version);
-    let storage_key = build_go_zip_storage_key(module, version);
-    crate::api::handlers::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
     let (digests, size_bytes) = hash_file(path)?;
     let checksum = digests.sha256.clone();
+    if let Some(outcome) = live_checksum_store_outcome(
+        live_go_file_checksum(&state.db, repo.id, module, version, "%.zip")
+            .await?
+            .as_deref(),
+        &checksum,
+    )? {
+        return Ok(outcome);
+    }
+
+    let storage_key = build_go_zip_storage_key(module, version);
+    crate::api::handlers::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &RepositoryFormat::Go,
+        repo.id,
+        &artifact_path,
+        &checksum,
+    )
+    .await?;
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await
         .map_err(response_to_app_error)?;
@@ -1318,25 +1373,27 @@ async fn store_go_mod(
     path: &Path,
     user_id: Uuid,
 ) -> Result<StoreOutcome> {
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE '%.mod' AND is_deleted = false",
-    )
-    .bind(repo.id)
-    .bind(module)
-    .bind(version)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    if existing.is_some() {
-        return Ok(StoreOutcome::Skipped);
-    }
-
     let artifact_path = build_go_mod_artifact_path(module, version);
-    let storage_key = build_go_mod_storage_key(module, version);
-    crate::api::handlers::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
     let (digests, size_bytes) = hash_file(path)?;
     let checksum = digests.sha256.clone();
+    if let Some(outcome) = live_checksum_store_outcome(
+        live_go_file_checksum(&state.db, repo.id, module, version, "%.mod")
+            .await?
+            .as_deref(),
+        &checksum,
+    )? {
+        return Ok(outcome);
+    }
+
+    let storage_key = build_go_mod_storage_key(module, version);
+    crate::api::handlers::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &RepositoryFormat::Go,
+        repo.id,
+        &artifact_path,
+        &checksum,
+    )
+    .await?;
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await
         .map_err(response_to_app_error)?;
@@ -1531,20 +1588,16 @@ async fn store_npm_module(
         .to_string();
     let artifact_path = format!("{claimed_name}/{claimed_version}/{filename}");
 
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-    )
-    .bind(repo.id)
-    .bind(&artifact_path)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    if existing.is_some() {
-        return Ok(StoreOutcome::Skipped);
-    }
-
     let (digests, size_bytes) = hash_file(&tgz_path)?;
     let checksum = digests.sha256.clone();
+    if let Some(outcome) = live_checksum_store_outcome(
+        live_artifact_checksum(&state.db, repo.id, &artifact_path)
+            .await?
+            .as_deref(),
+        &checksum,
+    )? {
+        return Ok(outcome);
+    }
     crate::api::handlers::cleanup_soft_deleted_artifact_checked(
         &state.db,
         &RepositoryFormat::Npm,
@@ -1717,19 +1770,15 @@ async fn store_pypi_file(
     let normalized = PypiHandler::normalize_name(&module.name);
     let artifact_path = format!("{normalized}/{}/{filename}", module.version);
 
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-    )
-    .bind(repo.id)
-    .bind(&artifact_path)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    if existing.is_some() {
-        return Ok(StoreOutcome::Skipped);
-    }
-
     let (digests, size_bytes) = hash_file(file_path)?;
+    if let Some(outcome) = live_checksum_store_outcome(
+        live_artifact_checksum(&state.db, repo.id, &artifact_path)
+            .await?
+            .as_deref(),
+        &digests.sha256,
+    )? {
+        return Ok(outcome);
+    }
     crate::api::handlers::cleanup_soft_deleted_artifact_checked(
         &state.db,
         &RepositoryFormat::Pypi,
@@ -1886,20 +1935,16 @@ async fn store_cargo_module(
     let filename = format!("{}-{}.crate", name_lower, module.version);
     let artifact_path = format!("{name_lower}/{}/{filename}", module.version);
 
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-    )
-    .bind(repo.id)
-    .bind(&artifact_path)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    if existing.is_some() {
-        return Ok(StoreOutcome::Skipped);
-    }
-
     let (digests, size_bytes) = hash_file(&crate_path)?;
     let checksum = digests.sha256.clone();
+    if let Some(outcome) = live_checksum_store_outcome(
+        live_artifact_checksum(&state.db, repo.id, &artifact_path)
+            .await?
+            .as_deref(),
+        &checksum,
+    )? {
+        return Ok(outcome);
+    }
     crate::api::handlers::cleanup_soft_deleted_artifact_checked(
         &state.db,
         &RepositoryFormat::Cargo,
@@ -2179,5 +2224,19 @@ mod tests {
         let archive = ZipArchive::new(cursor).unwrap();
         assert_eq!(find_zip_index(&archive, "x.bin"), Some(1));
         assert!(find_zip_index(&archive, "missing").is_none());
+    }
+
+    #[test]
+    fn live_checksum_skips_identical_and_conflicts_on_swap() {
+        assert_eq!(live_checksum_store_outcome(None, "aaaa").unwrap(), None);
+        assert_eq!(
+            live_checksum_store_outcome(Some("AaAa"), "aaaa").unwrap(),
+            Some(StoreOutcome::Skipped)
+        );
+        let err = live_checksum_store_outcome(Some("aaaa"), "bbbb").unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(msg) if msg.contains("immutable")),
+            "different bytes at a live coordinate must conflict, got {err:?}"
+        );
     }
 }

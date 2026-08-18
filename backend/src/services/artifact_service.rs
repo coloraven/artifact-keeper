@@ -131,6 +131,86 @@ pub(crate) fn versioning_applies(format: &RepositoryFormat, versioning_enabled: 
         )
 }
 
+/// Prior artifact coordinates used by [`immutable_reupload_conflict`].
+pub(crate) struct PriorArtifactCoords {
+    pub checksum_sha256: String,
+    pub version: Option<String>,
+}
+
+/// Whether re-uploading `new_checksum` at this coordinate must 409.
+///
+/// Same-checksum republish is never a conflict (idempotent resume / undelete).
+/// Versioning-enabled Generic/Mlmodel repos append revisions instead of
+/// conflicting. Explicitly mutable index files (packuments, maven-metadata)
+/// are always replaceable. Unversioned, non-structural generic blobs remain
+/// freely overwritable.
+pub(crate) fn immutable_reupload_conflict(
+    versioning_active: bool,
+    is_explicitly_mutable_index: bool,
+    path_is_structurally_immutable: bool,
+    prior: Option<&PriorArtifactCoords>,
+    new_checksum: &str,
+) -> bool {
+    if versioning_active || is_explicitly_mutable_index {
+        return false;
+    }
+    let Some(prior) = prior else {
+        return false;
+    };
+    if prior.checksum_sha256.eq_ignore_ascii_case(new_checksum) {
+        return false;
+    }
+    prior.version.is_some() || path_is_structurally_immutable
+}
+
+/// Load any live or tombstoned row at `(repository_id, path)` and reject a
+/// released-coordinate swap of different bytes. Used by the chunked-complete
+/// path so it matches [`ArtifactService`] / CLI skip-dupe 409 semantics.
+pub(crate) async fn reject_immutable_reupload(
+    db: &PgPool,
+    format: &RepositoryFormat,
+    versioning_enabled: bool,
+    repository_id: Uuid,
+    path: &str,
+    new_checksum_sha256: &str,
+) -> Result<()> {
+    let versioning_active = versioning_applies(format, versioning_enabled);
+    let mutable_index =
+        crate::services::cache_classifier::is_explicitly_mutable_index(format, path);
+    if versioning_active || mutable_index {
+        return Ok(());
+    }
+
+    let prior: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT checksum_sha256, version FROM artifacts \
+         WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let prior = prior.map(|(checksum_sha256, version)| PriorArtifactCoords {
+        checksum_sha256,
+        version,
+    });
+    let structurally_immutable =
+        crate::services::cache_classifier::classify(format, path).is_immutable();
+    if immutable_reupload_conflict(
+        versioning_active,
+        mutable_index,
+        structurally_immutable,
+        prior.as_ref(),
+        new_checksum_sha256,
+    ) {
+        return Err(AppError::Conflict(
+            "Artifact version already exists and is immutable".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Next auto-increment revision for a (repository_id, path) coordinate given
 /// the current maximum stored revision (`None` when no revisions exist yet).
 pub(crate) fn next_revision(current_max: Option<i32>) -> i32 {
@@ -3913,6 +3993,76 @@ mod tests {
         assert!(!versioning_applies(&RepositoryFormat::Npm, true));
         assert!(!versioning_applies(&RepositoryFormat::Debian, true));
         assert!(!versioning_applies(&RepositoryFormat::Docker, true));
+    }
+
+    #[test]
+    fn test_immutable_reupload_conflict_same_checksum_is_not_conflict() {
+        let prior = PriorArtifactCoords {
+            checksum_sha256: "aabb".into(),
+            version: Some("1.0.0".into()),
+        };
+        assert!(!immutable_reupload_conflict(
+            false,
+            false,
+            true,
+            Some(&prior),
+            "AABB",
+        ));
+    }
+
+    #[test]
+    fn test_immutable_reupload_conflict_released_different_bytes() {
+        let prior = PriorArtifactCoords {
+            checksum_sha256: "aaaa".into(),
+            version: Some("1.0.0".into()),
+        };
+        assert!(immutable_reupload_conflict(
+            false,
+            false,
+            false,
+            Some(&prior),
+            "bbbb",
+        ));
+    }
+
+    #[test]
+    fn test_immutable_reupload_conflict_unversioned_generic_is_replaceable() {
+        let prior = PriorArtifactCoords {
+            checksum_sha256: "aaaa".into(),
+            version: None,
+        };
+        assert!(!immutable_reupload_conflict(
+            false,
+            false,
+            false,
+            Some(&prior),
+            "bbbb",
+        ));
+    }
+
+    #[test]
+    fn test_immutable_reupload_conflict_skips_versioning_and_mutable_index() {
+        let prior = PriorArtifactCoords {
+            checksum_sha256: "aaaa".into(),
+            version: Some("1.0.0".into()),
+        };
+        assert!(!immutable_reupload_conflict(
+            true,
+            false,
+            true,
+            Some(&prior),
+            "bbbb",
+        ));
+        assert!(!immutable_reupload_conflict(
+            false,
+            true,
+            true,
+            Some(&prior),
+            "bbbb",
+        ));
+        assert!(!immutable_reupload_conflict(
+            false, false, true, None, "bbbb"
+        ));
     }
 
     #[test]

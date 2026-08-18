@@ -114,6 +114,8 @@ pub struct SessionStatusResponse {
     pub artifact_path: String,
     pub created_at: String,
     pub expires_at: String,
+    /// Last terminal/retryable failure recorded on the session, if any.
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -467,6 +469,7 @@ async fn get_session_status(
         artifact_path: session.artifact_path,
         created_at: session.created_at.to_rfc3339(),
         expires_at: session.expires_at.to_rfc3339(),
+        error_message: session.error_message,
     })
     .into_response())
 }
@@ -486,7 +489,7 @@ async fn get_session_status(
         (status = 200, description = "Upload finalized, artifact created", body = CompleteResponse),
         (status = 400, description = "Incomplete chunks or invalid state", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
-        (status = 409, description = "Checksum mismatch", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Checksum mismatch or immutable artifact already exists", body = crate::api::openapi::ErrorResponse),
         (status = 410, description = "Session expired", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -576,6 +579,50 @@ async fn complete(
 
     let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
+    // Create artifact record coordinates before storage so an immutable
+    // conflict can 409 without writing a blob the client will skip.
+    let artifact_name = completed_artifact_name(&session);
+    // #1975 (stopgap for #1846): chunked uploads to FORMAT repositories must
+    // carry a non-empty `version`, otherwise format index generators that key on
+    // `version` silently drop the artifact (e.g. incus `streams_images` skips any
+    // row with `version IS NULL`, so a chunked-uploaded image never appears in
+    // `images.json`). Single-shot/format-native uploads always set a version; the
+    // generic chunked path only set it from the optional create-session field.
+    // For a format repo with no explicit version, derive one from the artifact
+    // path so the artifact remains retrievable with correct coordinates. Generic
+    // repositories keep their existing behaviour (version may be NULL).
+    let derived_version = completed_format_artifact_version(&session, &repo.format);
+    let artifact_version = derived_version.as_deref();
+
+    // Align with ArtifactService / CLI skip-dupe: released coordinates with
+    // different bytes are 409; same-checksum republish is allowed so a retry
+    // of PUT /complete after a post-INSERT failure can finish the session.
+    if let Err(e) = crate::services::artifact_service::reject_immutable_reupload(
+        &state.db,
+        &repo.format,
+        repo.versioning_enabled,
+        session.repository_id,
+        &session.artifact_path,
+        &session.checksum_sha256,
+    )
+    .await
+    {
+        UploadService::release_commit_lease(&state.db, &session).await;
+        return Err(e.into_response());
+    }
+    if let Err(e) = crate::api::handlers::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &repo.format,
+        session.repository_id,
+        &session.artifact_path,
+        &session.checksum_sha256,
+    )
+    .await
+    {
+        UploadService::release_commit_lease(&state.db, &session).await;
+        return Err(e.into_response());
+    }
+
     // C1: Use put_file to stream from disk instead of reading the entire file
     // into memory. The default implementation still reads into memory, but
     // backends can override for true streaming (S3 multipart, etc.).
@@ -603,22 +650,8 @@ async fn complete(
         None
     };
 
-    // Clean up temp file
-    let _ = tokio::fs::remove_file(&temp_path).await;
-
-    // Create artifact record
-    let artifact_name = completed_artifact_name(&session);
-    // #1975 (stopgap for #1846): chunked uploads to FORMAT repositories must
-    // carry a non-empty `version`, otherwise format index generators that key on
-    // `version` silently drop the artifact (e.g. incus `streams_images` skips any
-    // row with `version IS NULL`, so a chunked-uploaded image never appears in
-    // `images.json`). Single-shot/format-native uploads always set a version; the
-    // generic chunked path only set it from the optional create-session field.
-    // For a format repo with no explicit version, derive one from the artifact
-    // path so the artifact remains retrievable with correct coordinates. Generic
-    // repositories keep their existing behaviour (version may be NULL).
-    let derived_version = completed_format_artifact_version(&session, &repo.format);
-    let artifact_version = derived_version.as_deref();
+    // Keep the temp file until the session is marked completed so a failed
+    // artifact transaction / metadata write can retry PUT /complete.
 
     // #2516 S2: atomic quota admission for the chunked path, in the same
     // transaction as the artifact INSERT. The session-create quota check is
@@ -633,20 +666,14 @@ async fn complete(
     // that legitimately predate a quota change must still replicate; the
     // background reconciler folds their bytes into the ledger).
     //
-    // Every failure from here on is terminal for the commit lease: the temp
-    // file was already removed after the storage copy, so a retry could not
-    // re-verify the payload. Fail the session under its token rather than
-    // leaving it wedged in `committing` for the whole staleness window.
+    // Failures from here on are retryable while the temp file remains: release
+    // the commit lease instead of marking the session `failed`. Content-
+    // addressed blobs written by put_file above may orphan until storage GC;
+    // a retry re-puts the same key.
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(e) => {
-            UploadService::fail_committing(
-                &state.db,
-                &session,
-                &format!("could not open the artifact transaction: {e}"),
-            )
-            .await;
-            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+            return Err(abort_complete_retryable(&state.db, &session, e).await);
         }
     };
     if !is_replication_request {
@@ -663,25 +690,14 @@ async fn complete(
                 Ok(admission) => admission,
                 Err(e) => {
                     drop(tx);
-                    UploadService::fail_committing(
-                        &state.db,
-                        &session,
-                        &format!("quota admission failed: {e}"),
-                    )
-                    .await;
-                    return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+                    return Err(abort_complete_retryable(&state.db, &session, e).await);
                 }
             };
         if !admission.allowed {
             // Drop `tx` (rolls back). The stored blob is content-addressed;
             // if this upload orphaned it, storage GC reclaims it.
             drop(tx);
-            UploadService::fail_committing(
-                &state.db,
-                &session,
-                "repository storage quota exceeded",
-            )
-            .await;
+            UploadService::release_commit_lease(&state.db, &session).await;
             return Err(map_err(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "Repository storage quota exceeded",
@@ -715,23 +731,11 @@ async fn complete(
         Ok(id) => id,
         Err(e) => {
             drop(tx);
-            UploadService::fail_committing(
-                &state.db,
-                &session,
-                &format!("artifact upsert failed: {e}"),
-            )
-            .await;
-            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+            return Err(abort_complete_retryable(&state.db, &session, e).await);
         }
     };
     if let Err(e) = tx.commit().await {
-        UploadService::fail_committing(
-            &state.db,
-            &session,
-            &format!("artifact commit failed: {e}"),
-        )
-        .await;
-        return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        return Err(abort_complete_retryable(&state.db, &session, e).await);
     }
 
     if let (Some(format), Some(metadata)) = (
@@ -747,13 +751,7 @@ async fn complete(
             .set_metadata(artifact_id, format, metadata, properties)
             .await
         {
-            UploadService::fail_committing(
-                &state.db,
-                &session,
-                &format!("artifact metadata write failed: {e}"),
-            )
-            .await;
-            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+            return Err(abort_complete_retryable(&state.db, &session, e).await);
         }
     } else if let Some(prefix) = &format_header_prefix {
         // #2588: extract RPM header metadata for generically-pushed packages,
@@ -794,9 +792,12 @@ async fn complete(
     // reclaimed the session — the artifact upsert above is idempotent, so
     // the only consequence is that the newer owner also finalizes.
     let finalize_result = UploadService::finalize_completed(&state.db, &session).await;
-    settle_completed_session(&state.db, &session, finalize_result)
+    let marked_completed = settle_completed_session(&state.db, &session, finalize_result)
         .await
         .map_err(map_upload_err)?;
+    if marked_completed {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
     drop(commit_renewal);
 
     tracing::info!(
@@ -930,25 +931,38 @@ fn map_upload_err(e: UploadError) -> Response {
     )
 }
 
-/// Finish the post-artifact session transition without reporting success while
-/// the session still appears active. A database failure here happens after the
-/// artifact transaction committed and the temp file was removed, so replay is
-/// no longer safe: token-fence the session to `failed`, matching the existing
-/// post-commit metadata-failure policy, and propagate the database error.
+/// Release the commit lease and return a 5xx so the client can retry
+/// PUT /complete while the temp file is still on disk.
+async fn abort_complete_retryable(
+    db: &sqlx::PgPool,
+    session: &upload_service::UploadSession,
+    e: impl std::fmt::Display,
+) -> Response {
+    UploadService::release_commit_lease(db, session).await;
+    map_err(StatusCode::INTERNAL_SERVER_ERROR, e)
+}
+
+/// Finish the post-artifact session transition. The temp file is still on
+/// disk, so a failed terminal update is retryable: release the commit lease
+/// and let the client PUT complete again (artifact upsert is idempotent).
+///
+/// Returns `true` when this request marked the session `completed` and the
+/// caller should delete the temp file. `false` means a newer complete owns
+/// the lease — leave the temp file for that owner.
 async fn settle_completed_session(
     db: &sqlx::PgPool,
     session: &upload_service::UploadSession,
     finalize_result: Result<bool, UploadError>,
-) -> Result<(), UploadError> {
+) -> Result<bool, UploadError> {
     match finalize_result {
-        Ok(true) => Ok(()),
+        Ok(true) => Ok(true),
         Ok(false) => {
             tracing::warn!(
                 session = %session.id,
                 "chunked upload finalized but its completion lease was lost; \
                  a newer complete request owns the session"
             );
-            Ok(())
+            Ok(false)
         }
         Err(e) => {
             tracing::warn!(
@@ -956,12 +970,7 @@ async fn settle_completed_session(
                 error = %e,
                 "failed to mark upload session completed"
             );
-            UploadService::fail_committing(
-                db,
-                session,
-                &format!("artifact committed but session completion update failed: {e}"),
-            )
-            .await;
+            UploadService::release_commit_lease(db, session).await;
             Err(e)
         }
     }
@@ -2249,6 +2258,7 @@ mod tests {
             artifact_path: "images/app.tar.gz".into(),
             created_at: "2026-03-25T10:00:00Z".into(),
             expires_at: "2026-03-26T10:00:00Z".into(),
+            error_message: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["session_id"], "550e8400-e29b-41d4-a716-446655440000");
@@ -2274,6 +2284,7 @@ mod tests {
             artifact_path: String::new(),
             created_at: String::new(),
             expires_at: String::new(),
+            error_message: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         // Verify snake_case field names (API contract)
@@ -2287,6 +2298,26 @@ mod tests {
         assert!(json.contains("\"artifact_path\""));
         assert!(json.contains("\"created_at\""));
         assert!(json.contains("\"expires_at\""));
+        assert!(json.contains("\"error_message\""));
+    }
+
+    #[test]
+    fn test_session_status_response_includes_error_message() {
+        let resp = SessionStatusResponse {
+            session_id: Uuid::nil(),
+            status: "failed".into(),
+            total_size: 1,
+            bytes_received: 1,
+            chunks_completed: 1,
+            chunks_total: 1,
+            repository_key: "r".into(),
+            artifact_path: "a.bin".into(),
+            created_at: "t".into(),
+            expires_at: "t".into(),
+            error_message: Some("checksum mismatch".into()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["error_message"], "checksum mismatch");
     }
 
     #[test]
@@ -2302,6 +2333,7 @@ mod tests {
             artifact_path: "f.bin".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             expires_at: "2026-01-02T00:00:00Z".into(),
+            error_message: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "pending");
@@ -2559,6 +2591,7 @@ mod tests {
             artifact_path: String::new(),
             created_at: String::new(),
             expires_at: String::new(),
+            error_message: None,
         };
         let debug = format!("{:?}", resp);
         assert!(debug.contains("SessionStatusResponse"));
@@ -3471,11 +3504,11 @@ mod tests {
     }
 
     /// A database error from the final `committing -> completed` update happens
-    /// after the artifact is durable and the temp file is gone. It must produce
-    /// a non-success response and leave a terminal session instead of logging
-    /// the error and returning 200 with the row still `committing`.
+    /// after the artifact upsert, but the temp file is still on disk. Release
+    /// the lease so the client can retry PUT /complete instead of leaving a
+    /// terminal `failed` session.
     #[tokio::test]
-    async fn finalize_database_error_marks_committing_session_failed() {
+    async fn finalize_database_error_releases_commit_lease() {
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
@@ -3485,9 +3518,6 @@ mod tests {
             .await
             .expect("claim completion lease");
 
-        // Synthesize the error result from finalize_completed while keeping the
-        // fixture pool healthy so the token-fenced failure transition itself is
-        // observable.
         let err = settle_completed_session(
             &f.pool,
             &session,
@@ -3501,33 +3531,27 @@ mod tests {
             "the handler must not return 200 after losing the terminal update"
         );
 
-        let (status, token, deadline, message): (
+        let (status, token, deadline): (
             String,
             Option<Uuid>,
             Option<chrono::DateTime<chrono::Utc>>,
-            Option<String>,
         ) = sqlx::query_as(
-            "SELECT status, state_token, committing_expires_at, error_message \
+            "SELECT status, state_token, committing_expires_at \
              FROM upload_sessions WHERE id = $1",
         )
         .bind(session_id)
         .fetch_one(&f.pool)
         .await
-        .expect("read terminal session state");
-        assert_eq!(status, "failed");
-        assert!(
-            token.is_none(),
-            "terminal failure must clear the lease token"
-        );
+        .expect("read session state");
+        assert_eq!(status, "in_progress");
+        assert!(token.is_none(), "released lease must clear its token");
         assert!(
             deadline.is_none(),
-            "terminal failure must clear the lease deadline"
+            "released lease must clear the lease deadline"
         );
         assert!(
-            message
-                .as_deref()
-                .is_some_and(|m| m.contains("session completion update failed")),
-            "terminal failure must explain the post-artifact database error"
+            temp_path.exists(),
+            "temp file must survive a retryable finalize failure"
         );
 
         let _ = tokio::fs::remove_file(&temp_path).await;
@@ -3544,6 +3568,119 @@ mod tests {
             .uri(format!("/{}/complete", session_id))
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    async fn insert_live_artifact(
+        f: &tdh::Fixture,
+        path: &str,
+        checksum: &str,
+        version: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key, uploaded_by) \
+             VALUES ($1, $2, $3, $4, 1, $5, 'application/octet-stream', $6, $7)",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .bind(path)
+        .bind(version)
+        .bind(checksum)
+        .bind(format!("sk/{checksum}"))
+        .bind(f.user_id)
+        .execute(&f.pool)
+        .await
+        .expect("insert live artifact");
+    }
+
+    #[tokio::test]
+    async fn complete_conflict_on_immutable_different_bytes() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = "authz/staged.bin";
+        let original =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        insert_live_artifact(&f, path, original, Some("1.0.0")).await;
+
+        let payload: &[u8] = b"immutable-swap-payload";
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "different bytes at a released coordinate must 409; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let stored: String = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read original checksum");
+        assert_eq!(stored, original, "409 must not overwrite the live artifact");
+
+        let session_status: String =
+            sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read session status");
+        assert_eq!(session_status, "in_progress");
+        assert!(temp_path.exists(), "409 must keep the temp file");
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_idempotent_same_checksum_reupload() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"same-bytes-resume";
+        let checksum = sha256_hex(payload);
+        insert_live_artifact(&f, "authz/staged.bin", &checksum, Some("1.0.0")).await;
+
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "same-checksum republish must complete; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            !temp_path.exists(),
+            "successful complete must delete the temp file"
+        );
+
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
     }
 
     /// Access revoked between staging the chunks and finalizing must deny the
