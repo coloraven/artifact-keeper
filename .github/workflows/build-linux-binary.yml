@@ -87,12 +87,13 @@ jobs:
         id: cache-cargo-home
         uses: actions/cache@v4
         with:
+          # GHA container jobs use HOME=/github/home (not /root).
           path: |
-            /root/.rustup
-            /root/.cargo/bin
-            /root/.cargo/registry/index
-            /root/.cargo/registry/cache
-            /root/.cargo/git/db
+            ~/.rustup
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
           key: ubi9-cargo-home-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ubi9-cargo-home-${{ env.RUST_TOOLCHAIN }}-
@@ -101,17 +102,17 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -eux
-          export PATH="/root/.cargo/bin:$PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
           if command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
             echo "Rust already present (cargo-home cache hit)"
-            rustup default "${RUST_TOOLCHAIN}" || \
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal
+            rustup default "${RUST_TOOLCHAIN}" || true
           else
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
               | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal
           fi
-          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+          # shellcheck disable=SC1090
+          . "$HOME/.cargo/env"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustc -V
           cargo -V
 
@@ -120,7 +121,7 @@ jobs:
         with:
           workspaces: "."
           shared-key: release-backend-ubi9
-          prefix-key: ubi9-v1
+          prefix-key: ubi9-v2
           cache-targets: true
           cache-all-crates: true
           cache-on-failure: true
@@ -128,12 +129,14 @@ jobs:
       - name: Build release binary
         run: |
           set -eux
+          . "$HOME/.cargo/env"
           # Match docker/Dockerfile.backend (system OpenSSL on UBI9).
           cargo build --release -p artifact-keeper-backend --bin artifact-keeper
 
       - name: Package
         run: |
           set -eux
+          . "$HOME/.cargo/env"
           mkdir -p dist
           cp target/release/artifact-keeper dist/artifact-keeper-linux-amd64
           chmod +x dist/artifact-keeper-linux-amd64
