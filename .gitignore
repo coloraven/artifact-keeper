@@ -92,6 +92,9 @@ nginx.conf
 # Claude Code local config
 .claude/
 
+# Cursor SpecStory chat exports (may contain local hosts/secrets)
+.specstory/
+
 # Agent tooling (internal, not for public repo)
 .beads/
 .specify/
