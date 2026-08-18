@@ -79,18 +79,9 @@ async fn start_ingest(
         status: ferry_ingest_service::FerryIngestStatus::Queued,
         ..Default::default()
     };
-    let _ = sqlx::query(r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'ferry', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET
-            format = EXCLUDED.format,
-            metadata = COALESCE(artifact_metadata.metadata, '{}'::jsonb) || EXCLUDED.metadata
-        "#)
-    .bind(artifact_id)
-    .bind(serde_json::json!({ "ferry_ingest": queued }),
-    )
-    .execute(&state.db)
-    .await;
+    // Durable job row (best-effort if migration not yet applied) + metadata mirror.
+    let _ = ferry_ingest_service::ensure_queued_job(&state, repo.id, artifact_id, auth.user_id, &queued)
+        .await;
 
     ferry_ingest_service::spawn_ingest(state, repo.id, artifact_id, auth.user_id);
 
@@ -130,14 +121,27 @@ async fn get_ingest_status(
         .await
         .map_err(|e| e.into_response())?;
 
-    let exists = sqlx::query_scalar::<_, Uuid>("SELECT id FROM artifacts WHERE id = $1 AND repository_id = $2 AND is_deleted = false")
+    let job_exists: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM ferry_ingest_jobs WHERE ferry_artifact_id = $1 AND repository_id = $2",
+    )
     .bind(artifact_id)
     .bind(repo.id)
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
-    if exists.is_none() {
-        return Err(AppError::NotFound("Ferry artifact not found".into()).into_response());
+    .unwrap_or(None);
+
+    if job_exists.is_none() {
+        let exists: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE id = $1 AND repository_id = $2 AND is_deleted = false",
+        )
+        .bind(artifact_id)
+        .bind(repo.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+        if exists.is_none() {
+            return Err(AppError::NotFound("Ferry artifact not found".into()).into_response());
+        }
     }
 
     let progress = ferry_ingest_service::read_progress(&state, artifact_id)
@@ -160,9 +164,11 @@ async fn resolve_ferry_artifact(
     body: &StartFerryIngestRequest,
 ) -> Result<Uuid, AppError> {
     if let Some(id) = body.artifact_id {
-        let path = sqlx::query_scalar::<_, String>("SELECT path FROM artifacts WHERE id = $1 AND repository_id = $2 AND is_deleted = false")
-    .bind(id)
-    .bind(repository_id)
+        let path: String = sqlx::query_scalar(
+            "SELECT path FROM artifacts WHERE id = $1 AND repository_id = $2 AND is_deleted = false",
+        )
+        .bind(id)
+        .bind(repository_id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -188,11 +194,14 @@ async fn resolve_ferry_artifact(
         )));
     }
 
-    sqlx::query_scalar::<_, Uuid>("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false")
+    let id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
     .bind(repository_id)
     .bind(path)
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound(format!("Artifact '{path}' not found")))
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    id.ok_or_else(|| AppError::NotFound(format!("Artifact '{path}' not found")))
 }
+
