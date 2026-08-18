@@ -1,0 +1,12 @@
+---
+description: FORBIDDEN — never cargo/rustc compile on this machine or deploy-host; GitHub Actions only
+alwaysApply: true
+---
+
+# 禁止本机编译（第一优先级）
+
+本机磁盘不够。**禁止**在本机或 deploy-host 编译本仓库。
+
+禁止：`cargo build|test|clippy|run`、`rustc`、zig/cross、本机 Docker 编 Linux。无「小改动 / 只跑单测」例外。
+
+必须：commit + push `feat/**`/`fix/**` → GitHub Actions（UBI9 workflow）→ `HTTPS_PROXY=http://127.0.0.1:10811` 下载 `artifact-keeper-linux-amd64` 再部署。

@@ -39,5 +39,5 @@ ssh deploy-host 'docker cp /tmp/artifact-keeper artifact-keeper-backend:/usr/loc
 
 ## Agent 行为
 
-1. ferry / 需要联调的后端改动 → push `feat/**`，等 Actions，再代理下载部署。
-2. 不要在 Windows 上 `cargo zigbuild` 编 backend；不要在 deploy-host 上 `cargo build --release`。
+1. **禁止**本机 / deploy-host `cargo` / `rustc` / zig / cross（含 debug 与 test）。
+2. ferry / 需要联调的后端改动 → push `feat/**`，等 Actions，再代理下载部署。
