@@ -807,6 +807,19 @@ async fn complete(
         &session.checksum_sha256[..12.min(session.checksum_sha256.len())]
     );
 
+    // Air-gap ferry: same as the direct PUT path in repositories.rs — unpack
+    // ak-ferry/*.zip asynchronously after the artifact row exists. Chunked
+    // uploads are the normal path for large ferry zips, so omitting this
+    // left the zip stored with no ingest until a manual /ferry/ingest.
+    if crate::services::ferry_ingest_service::is_ferry_archive_path(&session.artifact_path) {
+        crate::services::ferry_ingest_service::spawn_ingest(
+            state.clone(),
+            session.repository_id,
+            artifact_id,
+            user_id,
+        );
+    }
+
     if is_replication_request || session.is_replication {
         cleanup_completed_upload_session(&state.db, session_id).await;
     }
