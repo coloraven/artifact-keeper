@@ -1,6 +1,6 @@
 # Fork release: attach cross-platform binaries + 中文说明（来源分支显著）。
 # Platform matrix matches upstream publish-binaries.yml / release.yml, except
-# linux-amd64 is built inside ubi9/ubi:9.8 (glibc match for deploy-host).
+# linux-amd64 is built inside ubi9/ubi:9.8 (glibc match for UBI9/RHEL9 runtime).
 #
 # 打 tag 并 push：
 #   git checkout feat/ferry-ingest

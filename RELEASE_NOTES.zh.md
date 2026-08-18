@@ -4,7 +4,7 @@
 
 - **来源分支（显著）：`feat/ferry-ingest`**
 - **对照基准：** fork 时与上游的 merge-base `b0507587`（`fix(security): build grype from source…`）
-- **目标环境：** deploy-host / UBI9 后端容器（Linux amd64 必须在 UBI9 内编译，避免 glibc 2.38+ 无法运行）
+- **目标运行时：** Linux AMD64 + UBI9 类容器（须在 UBI9 内编译，避免 glibc 2.38+ 无法运行）
 
 ---
 
@@ -32,7 +32,7 @@ CLI 已支持分片 session 本地缓存、下载 Range、skip-dupe。本分叉�
 ### 构建与部署
 
 - GitHub Actions：`feat/**` / `fix/**` push 时在 **UBI9** 容器内编译 `artifact-keeper-linux-amd64`。
-- 禁止在磁盘不足的本机 / deploy-host 上 `cargo` 编译。
+- 禁止在磁盘不足的本机或低配部署机上 `cargo` 编译；一律用 GitHub Actions 出包。
 
 ### 未包含（相对上游完整 release）
 

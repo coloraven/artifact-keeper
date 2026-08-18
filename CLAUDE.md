@@ -120,7 +120,7 @@ gh workflow run e2e.yml -f profile=all -f include_stress=true
 
 # Prefer CI for linux backend binaries (feat/** / fix/** push or workflow_dispatch):
 #   .github/workflows/build-linux-binary.yml → artifact-keeper-linux-amd64
-# Builds inside ubi9/ubi:9.8 (matches deploy-host backend container glibc).
+# Builds inside ubi9/ubi:9.8 (matches UBI9/RHEL9 backend container glibc).
 # Download via HTTPS_PROXY=http://127.0.0.1:10811 — see .cursor/rules/github-actions-build.mdc
 ```
 

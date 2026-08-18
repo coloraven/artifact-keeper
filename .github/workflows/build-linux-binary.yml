@@ -1,4 +1,4 @@
-# Build release binaries for deploy into UBI9 backend containers (deploy-host).
+# Build release binaries for deploy into UBI9/RHEL9 backend containers (linux-amd64).
 #
 # IMPORTANT: Do NOT build on bare ubuntu-latest — that links against glibc 2.39+
 # and will fail at runtime on RHEL/UBI 9 (glibc ~2.34) with:

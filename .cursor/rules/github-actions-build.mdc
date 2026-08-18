@@ -5,7 +5,7 @@ alwaysApply: true
 
 # GitHub Actions 编译与本机下载（server）
 
-本机交叉编译 Linux backend（openssl-sys / vendored OpenSSL + Windows Perl）易失败；deploy-host（~4GB RAM）也不适合 release 编译。**默认用 GitHub Actions 产出 `artifact-keeper-linux-amd64`。**
+本机交叉编译 Linux backend（openssl-sys / vendored OpenSSL + Windows Perl）易失败；低配 Linux AMD64 部署机也不适合 release 编译。**默认用 GitHub Actions 产出 `artifact-keeper-linux-amd64`。**
 
 ## Workflow
 
@@ -13,7 +13,7 @@ alwaysApply: true
 - 名称：`Build Release Binaries`
 - 触发：`workflow_dispatch`，或 push 到 `feat/**` / `fix/**`
 - 产物 artifact：`artifact-keeper-linux-amd64`（含裸二进制 + `.tar.gz` + sha256）
-- **必须在 `registry.access.redhat.com/ubi9/ubi:9.8` 容器内编译**（与 `docker/Dockerfile.backend` / deploy-host 运行时一致）。在裸 `ubuntu-latest` 上编出会链接 glibc 2.38+，容器内报 `GLIBC_2.38/2.39 not found`。
+- **必须在 `registry.access.redhat.com/ubi9/ubi:9.8` 容器内编译**（与 `docker/Dockerfile.backend` / UBI9·RHEL9 运行时一致）。在裸 `ubuntu-latest` 上编出会链接 glibc 2.38+，容器内报 `GLIBC_2.38/2.39 not found`。
 
 CLI 侧同源策略见 `artifact-keeper-cli` 的 `.cursor/rules/github-actions-build.mdc`。
 
@@ -27,17 +27,17 @@ export HTTP_PROXY=http://127.0.0.1:10811
 
 GitHub UI 上显示的 sha256 通常对应 **artifact zip**，不是解压后的 ELF。
 
-## 部署 deploy-host
+## 部署 Linux AMD64（UBI9 后端容器）
+
+SSH 目标以本机运维配置为准（勿把主机商品名写进 Release 说明）。示例：
 
 ```bash
-scp artifact-keeper-linux-amd64 deploy-host:/tmp/artifact-keeper
-ssh deploy-host 'docker cp /tmp/artifact-keeper artifact-keeper-backend:/usr/local/bin/artifact-keeper && docker restart artifact-keeper-backend'
+scp artifact-keeper-linux-amd64 <host>:/tmp/artifact-keeper
+ssh <host> 'docker cp /tmp/artifact-keeper artifact-keeper-backend:/usr/local/bin/artifact-keeper && docker restart artifact-keeper-backend'
 # 等 healthy：docker inspect --format "{{.State.Health.Status}}" artifact-keeper-backend
 ```
 
-入口：`http://127.0.0.1:30080`（账号见运维笔记，勿把密码写进规则）。
-
 ## Agent 行为
 
-1. **禁止**本机 / deploy-host `cargo` / `rustc` / zig / cross（含 debug 与 test）。
+1. **禁止**本机 / 部署机 `cargo` / `rustc` / zig / cross（含 debug 与 test）。
 2. ferry / 需要联调的后端改动 → push `feat/**`，等 Actions，再代理下载部署。
