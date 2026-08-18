@@ -32,6 +32,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
+  CARGO_INCREMENTAL: "0"
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # Cache keys include this label; bump (e.g. stable-2026-08) to force a cold toolchain.
+  RUST_TOOLCHAIN: "stable"
 
 jobs:
   build-linux-amd64:
@@ -41,7 +45,7 @@ jobs:
       image: registry.access.redhat.com/ubi9/ubi:9.8
     timeout-minutes: 120
     steps:
-      - name: Install build dependencies
+      - name: Install OS build dependencies
         run: |
           set -eux
           # UBI ships curl-minimal; do not install full `curl` (conflicts).
@@ -49,6 +53,23 @@ jobs:
             gcc gcc-c++ make pkg-config perl-core \
             openssl-devel zlib-devel xz-devel bzip2-devel \
             unzip ca-certificates git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache protoc
+        id: cache-protoc
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/protoc
+            /usr/local/include/google
+          key: ubi9-protoc-29.3-${{ runner.arch }}
+
+      - name: Install protoc
+        if: steps.cache-protoc.outputs.cache-hit != 'true'
+        run: |
+          set -eux
           ARCH=$(uname -m)
           case "$ARCH" in
             x86_64) PROTOC_ARCH="linux-x86_64" ;;
@@ -60,17 +81,53 @@ jobs:
             -o /tmp/protoc.zip
           unzip -q /tmp/protoc.zip -d /usr/local
           rm /tmp/protoc.zip
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          test -x /usr/local/bin/protoc
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Cache rustup + cargo registry
+        id: cache-cargo-home
+        uses: actions/cache@v4
+        with:
+          path: |
+            /root/.rustup
+            /root/.cargo/bin
+            /root/.cargo/registry/index
+            /root/.cargo/registry/cache
+            /root/.cargo/git/db
+          key: ubi9-cargo-home-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubi9-cargo-home-${{ env.RUST_TOOLCHAIN }}-
+            ubi9-cargo-home-
+
+      - name: Install Rust toolchain
+        run: |
+          set -eux
+          export PATH="/root/.cargo/bin:$PATH"
+          if command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+            echo "Rust already present (cargo-home cache hit)"
+            rustup default "${RUST_TOOLCHAIN}" || \
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal
+          fi
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+          rustc -V
+          cargo -V
+
+      - name: Cache cargo target (release)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          shared-key: release-backend-ubi9
+          prefix-key: ubi9-v1
+          cache-targets: true
+          cache-all-crates: true
+          cache-on-failure: true
 
       - name: Build release binary
         run: |
           set -eux
-          source "$HOME/.cargo/env"
           # Match docker/Dockerfile.backend (system OpenSSL on UBI9).
           cargo build --release -p artifact-keeper-backend --bin artifact-keeper
 
